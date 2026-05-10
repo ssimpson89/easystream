@@ -197,6 +197,9 @@ func (c Config) inputArgs() []string {
 	}
 }
 
+// captureArgs builds FFmpeg input arguments for a capture device.
+// No framerate or resolution is forced on the device — FFmpeg auto-negotiates
+// with the hardware. The output encoding flags (-r, -s) handle conversion.
 func captureArgs(input Input, preset quality.Preset) []string {
 	backend := defaultString(input.Backend, "avfoundation")
 	switch backend {
@@ -205,40 +208,19 @@ func captureArgs(input Input, preset quality.Preset) []string {
 		if input.AudioDevice != "" {
 			device = device + ":" + input.AudioDevice
 		}
-		return []string{
-			"-f", "avfoundation",
-			"-framerate", fmt.Sprintf("%d", preset.FPS),
-			"-video_size", preset.Resolution(),
-			"-i", device,
-		}
+		return []string{"-f", "avfoundation", "-i", device}
 	case "dshow":
 		device := "video=" + input.VideoDevice
 		if input.AudioDevice != "" {
 			device = device + ":audio=" + input.AudioDevice
 		}
-		return []string{
-			"-f", "dshow",
-			"-framerate", fmt.Sprintf("%d", preset.FPS),
-			"-video_size", preset.Resolution(),
-			"-i", device,
-		}
+		return []string{"-f", "dshow", "-i", device}
 	case "v4l2":
-		return []string{
-			"-f", "v4l2",
-			"-framerate", fmt.Sprintf("%d", preset.FPS),
-			"-video_size", preset.Resolution(),
-			"-i", input.VideoDevice,
-		}
+		return []string{"-f", "v4l2", "-i", input.VideoDevice}
 	case "decklink":
-		return []string{
-			"-f", "decklink",
-			"-i", input.VideoDevice,
-		}
+		return []string{"-f", "decklink", "-i", input.VideoDevice}
 	default:
-		return []string{
-			"-f", backend,
-			"-i", input.VideoDevice,
-		}
+		return []string{"-f", backend, "-i", input.VideoDevice}
 	}
 }
 

@@ -390,6 +390,16 @@ input:focus, select:focus, textarea:focus {
   min-height: 120px;
 }
 .preview-hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+.preview-error {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  background: rgba(210, 153, 34, 0.1);
+  color: var(--warn);
+  font-size: 13px;
+  line-height: 1.5;
+}
 
 /* --- HLS URL box --- */
 .hls-url-box {

@@ -646,19 +646,14 @@ setInterval(scanDevices, 5000);
 // --- Preview ---
 function restartPreview() {
   if (!previewActive) return;
-  // Kill current stream by clearing src, then start a new one.
   els.previewImg.src = "";
-  setTimeout(() => {
-    els.previewImg.src = "/api/preview?" + Date.now();
-  }, 100);
+  setTimeout(startPreview, 200);
 }
 
 async function saveAndRestartPreview() {
   if (!previewActive) return;
-  try {
-    await saveConfig();
-    restartPreview();
-  } catch (_) {}
+  els.previewImg.src = "";
+  setTimeout(startPreview, 200);
 }
 
 els.previewToggle?.addEventListener("click", () => {
@@ -666,14 +661,45 @@ els.previewToggle?.addEventListener("click", () => {
   els.previewContainer.hidden = !previewActive;
   els.previewToggle.textContent = previewActive ? "Hide Preview" : "Show Preview";
   if (previewActive) {
-    // Save current settings so preview uses the right source.
-    saveConfig().then(() => {
-      els.previewImg.src = "/api/preview?" + Date.now();
-    });
+    startPreview();
   } else {
     els.previewImg.src = "";
+    hidePreviewError();
   }
 });
+
+function startPreview() {
+  hidePreviewError();
+  saveConfig().then(() => {
+    const img = els.previewImg;
+    img.src = "/api/preview?" + Date.now();
+    // If the stream ends immediately (device error), the img will fire an error.
+    img.onerror = () => {
+      if (previewActive) {
+        showPreviewError("Could not open capture device. Check that camera permission is granted (System Settings > Privacy > Camera), the device isn't in use by another app, and the correct device is selected.");
+      }
+    };
+  });
+}
+
+function showPreviewError(msg) {
+  let el = document.querySelector("#preview-error");
+  if (!el) {
+    el = document.createElement("p");
+    el.id = "preview-error";
+    el.className = "preview-error";
+    els.previewContainer.appendChild(el);
+  }
+  el.textContent = msg;
+  el.hidden = false;
+  els.previewImg.style.display = "none";
+}
+
+function hidePreviewError() {
+  const el = document.querySelector("#preview-error");
+  if (el) el.hidden = true;
+  els.previewImg.style.display = "";
+}
 
 // Restart preview when capture source settings change.
 els.inputKind.addEventListener("change", () => {
