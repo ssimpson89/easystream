@@ -189,23 +189,19 @@ func previewArgs(config ffmpeg.Config) []string {
 			}
 			args = append(args,
 				"-f", "avfoundation",
-				"-framerate", "10",
-				"-video_size", "640x360",
+				"-framerate", "30",
+				"-pixel_format", "yuyv422",
 				"-i", device,
 			)
 		case "dshow":
 			device := "video=" + config.Input.VideoDevice
 			args = append(args,
 				"-f", "dshow",
-				"-framerate", "10",
-				"-video_size", "640x360",
 				"-i", device,
 			)
 		case "v4l2":
 			args = append(args,
 				"-f", "v4l2",
-				"-framerate", "10",
-				"-video_size", "640x360",
 				"-i", config.Input.VideoDevice,
 			)
 		case "decklink":

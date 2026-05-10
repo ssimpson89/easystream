@@ -169,7 +169,7 @@ function updateCaptureVisibility() {
   els.captureDetails.hidden = isTest;
 }
 
-els.inputKind.addEventListener("change", updateCaptureVisibility);
+// inputKind change is handled in the preview section below.
 
 // --- Presets ---
 function renderPresets(presets) {
@@ -644,16 +644,45 @@ scanDevices();
 setInterval(scanDevices, 5000);
 
 // --- Preview ---
+function restartPreview() {
+  if (!previewActive) return;
+  // Kill current stream by clearing src, then start a new one.
+  els.previewImg.src = "";
+  setTimeout(() => {
+    els.previewImg.src = "/api/preview?" + Date.now();
+  }, 100);
+}
+
+async function saveAndRestartPreview() {
+  if (!previewActive) return;
+  try {
+    await saveConfig();
+    restartPreview();
+  } catch (_) {}
+}
+
 els.previewToggle?.addEventListener("click", () => {
   previewActive = !previewActive;
   els.previewContainer.hidden = !previewActive;
   els.previewToggle.textContent = previewActive ? "Hide Preview" : "Show Preview";
   if (previewActive) {
-    els.previewImg.src = "/api/preview?" + Date.now();
+    // Save current settings so preview uses the right source.
+    saveConfig().then(() => {
+      els.previewImg.src = "/api/preview?" + Date.now();
+    });
   } else {
     els.previewImg.src = "";
   }
 });
+
+// Restart preview when capture source settings change.
+els.inputKind.addEventListener("change", () => {
+  updateCaptureVisibility();
+  saveAndRestartPreview();
+});
+els.videoDevice.addEventListener("change", saveAndRestartPreview);
+els.audioDevice.addEventListener("change", saveAndRestartPreview);
+els.inputBackend.addEventListener("change", saveAndRestartPreview);
 
 // --- Init ---
 refresh();
