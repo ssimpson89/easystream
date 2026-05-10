@@ -399,6 +399,20 @@ input:focus, select:focus, textarea:focus {
 }
 .device-status-row .hint { margin-top: 0; }
 
+.quick-fill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+.quick-fill-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
 .preview-hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
 .preview-error {
   margin-top: 12px;

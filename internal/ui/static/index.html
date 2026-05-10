@@ -225,13 +225,19 @@
             <label>
               Output type
               <select id="output-mode">
-                <option value="rtmp">RTMP/RTMPS (YouTube, Twitch, etc.)</option>
-                <option value="hls">HLS (m3u8 — for Cloudflare, CDN, or direct playback)</option>
+                <option value="rtmp">RTMP/RTMPS push (YouTube, Twitch, Cloudflare, etc.)</option>
+                <option value="hls">HLS (m3u8 — for CDN pull or direct playback)</option>
               </select>
             </label>
 
             <div id="rtmp-fields">
-              <p class="hint">Paste your stream key from YouTube Studio or another platform.</p>
+              <p class="hint">Paste the ingest URL and stream key from your destination platform.</p>
+              <div class="quick-fill">
+                <span class="quick-fill-label">Quick fill:</span>
+                <button class="button button-sm" data-preset="youtube">YouTube</button>
+                <button class="button button-sm" data-preset="cloudflare">Cloudflare</button>
+                <button class="button button-sm" data-preset="twitch">Twitch</button>
+              </div>
               <label>
                 Ingest URL
                 <input id="ingest-url" autocomplete="off" spellcheck="false">
@@ -243,14 +249,14 @@
             </div>
 
             <div id="hls-fields" hidden>
-              <p class="hint">EasyStream will output HLS segments locally and serve them over HTTP. Give the playlist URL below to Cloudflare, a CDN, or any HLS player.</p>
+              <p class="hint">EasyStream will output HLS segments locally and serve them over HTTP. Give the playlist URL below to a CDN or HLS player. For Cloudflare push, use RTMP/RTMPS mode above instead.</p>
               <div class="hls-url-box">
                 <label>Playlist URL</label>
                 <div class="hls-url-row">
                   <code id="hls-url">http://127.0.0.1:8080/hls/stream.m3u8</code>
                   <button id="copy-hls-url" class="button button-sm">Copy</button>
                 </div>
-                <p class="hint">For Cloudflare Stream: use "Pull" mode and paste this URL as the input source. Make sure your machine is reachable from the internet (port forwarding or tunnel).</p>
+                <p class="hint">Make sure your machine is reachable from the internet (port forwarding, Cloudflare Tunnel, or reverse proxy).</p>
               </div>
             </div>
           </div>
@@ -260,42 +266,22 @@
         <article class="panel">
           <p class="eyebrow">Step 3</p>
           <h2>Capture source</h2>
-          <p class="hint">Select your video input. Use "Test pattern" to verify without hardware.</p>
+          <p class="hint">Pick a video source and (optionally) an audio source.</p>
           <label>
-            Mode
-            <select id="input-kind">
-              <option value="test-video">Test pattern (no hardware needed)</option>
-              <option value="webcam">Webcam</option>
-              <option value="hdmi">HDMI capture card</option>
-              <option value="sdi">SDI capture (DeckLink)</option>
+            Video source
+            <select id="video-source">
+              <option value="">Scanning...</option>
             </select>
           </label>
-          <div id="capture-details">
-            <label>
-              Backend
-              <select id="input-backend">
-                <option value="avfoundation">macOS (avfoundation)</option>
-                <option value="dshow">Windows (dshow)</option>
-                <option value="v4l2">Linux (v4l2)</option>
-                <option value="decklink">Blackmagic DeckLink</option>
-              </select>
-            </label>
-            <label>
-              Video device
-              <select id="video-device">
-                <option value="">Scanning for devices...</option>
-              </select>
-            </label>
-            <label>
-              Audio device
-              <select id="audio-device">
-                <option value="">None (use default)</option>
-              </select>
-            </label>
-            <div class="device-status-row">
-              <p class="hint" id="device-status">Scanning for devices...</p>
-              <button id="refresh-devices" class="button button-sm">Refresh</button>
-            </div>
+          <label id="audio-source-label">
+            Audio source
+            <select id="audio-source">
+              <option value="">None</option>
+            </select>
+          </label>
+          <div class="device-status-row">
+            <p class="hint" id="device-status">Scanning for devices...</p>
+            <button id="refresh-devices" class="button button-sm">Refresh</button>
           </div>
         </article>
       </section>

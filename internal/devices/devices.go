@@ -11,19 +11,33 @@ import (
 	"time"
 )
 
+// DeviceType categorizes a device for UI grouping.
+type DeviceType string
+
+const (
+	TypeCamera      DeviceType = "camera"       // Webcams, FaceTime, iPhone Continuity
+	TypeCaptureCard DeviceType = "capture-card" // USB HDMI capture (Elgato, Cam Link, etc.)
+	TypeScreen      DeviceType = "screen"       // Screen capture
+	TypeSDI         DeviceType = "sdi"          // Blackmagic DeckLink
+	TypeMicrophone  DeviceType = "microphone"   // Built-in or USB microphones
+	TypeAudioInput  DeviceType = "audio-input"  // Generic audio (line-in, NDI, virtual)
+	TypeOther       DeviceType = "other"
+)
+
 // Device represents a detected capture device.
 type Device struct {
-	Index   string `json:"index"`
-	Name    string `json:"name"`
-	Kind    string `json:"kind"`    // "video" or "audio"
-	Backend string `json:"backend"` // "avfoundation", "dshow", "v4l2", "decklink"
+	Index   string     `json:"index"`
+	Name    string     `json:"name"`
+	Kind    string     `json:"kind"`    // "video" or "audio"
+	Type    DeviceType `json:"type"`    // category for UI grouping
+	Backend string     `json:"backend"` // FFmpeg backend: avfoundation, dshow, v4l2, decklink
 }
 
-// DeviceList is the result of a scan.
+// DeviceList is a unified categorized list of all available capture devices.
 type DeviceList struct {
 	Video     []Device  `json:"video"`
 	Audio     []Device  `json:"audio"`
-	Backend   string    `json:"backend"`
+	Platform  string    `json:"platform"` // platform backend (avfoundation/dshow/v4l2)
 	ScannedAt time.Time `json:"scannedAt"`
 }
 
@@ -31,13 +45,9 @@ type DeviceList struct {
 type Scanner struct {
 	binary string
 
-	mu    sync.Mutex
-	cache map[string]*cachedScan // keyed by backend
-}
-
-type cachedScan struct {
-	list DeviceList
-	at   time.Time
+	mu        sync.Mutex
+	cache     *DeviceList
+	cachedAt  time.Time
 }
 
 // NewScanner creates a device scanner.
@@ -45,31 +55,25 @@ func NewScanner(ffmpegBinary string) *Scanner {
 	if ffmpegBinary == "" {
 		ffmpegBinary = "ffmpeg"
 	}
-	return &Scanner{
-		binary: ffmpegBinary,
-		cache:  make(map[string]*cachedScan),
-	}
+	return &Scanner{binary: ffmpegBinary}
 }
 
-// Scan returns devices for the given backend. Uses a 5-second cache.
-// If backend is empty, it auto-detects based on the OS.
-func (s *Scanner) Scan(backend string) DeviceList {
-	if backend == "" {
-		backend = PlatformBackend()
-	}
-
+// Scan returns a unified, categorized list of all detected devices across
+// every supported backend. Cached for 5 seconds.
+func (s *Scanner) Scan() DeviceList {
 	s.mu.Lock()
-	if c, ok := s.cache[backend]; ok && time.Since(c.at) < 5*time.Second {
-		list := c.list
+	if s.cache != nil && time.Since(s.cachedAt) < 5*time.Second {
+		list := *s.cache
 		s.mu.Unlock()
 		return list
 	}
 	s.mu.Unlock()
 
-	list := s.scanBackend(backend)
+	list := s.scanAll()
 
 	s.mu.Lock()
-	s.cache[backend] = &cachedScan{list: list, at: time.Now()}
+	s.cache = &list
+	s.cachedAt = time.Now()
 	s.mu.Unlock()
 	return list
 }
@@ -77,7 +81,7 @@ func (s *Scanner) Scan(backend string) DeviceList {
 // Invalidate clears the cache so the next Scan does a fresh probe.
 func (s *Scanner) Invalidate() {
 	s.mu.Lock()
-	s.cache = make(map[string]*cachedScan)
+	s.cache = nil
 	s.mu.Unlock()
 }
 
@@ -93,20 +97,93 @@ func PlatformBackend() string {
 	}
 }
 
-func (s *Scanner) scanBackend(backend string) DeviceList {
-	switch backend {
-	case "avfoundation":
-		return s.scanAVFoundation()
-	case "dshow":
-		return s.scanDshow()
-	case "v4l2":
-		return s.scanV4L2()
-	case "decklink":
-		return s.scanDeckLink()
-	default:
-		return DeviceList{Backend: backend, ScannedAt: time.Now().UTC()}
+// scanAll runs every supported backend probe and merges the results into
+// one categorized list.
+func (s *Scanner) scanAll() DeviceList {
+	list := DeviceList{
+		Platform:  PlatformBackend(),
+		ScannedAt: time.Now().UTC(),
 	}
+
+	// Platform devices.
+	switch runtime.GOOS {
+	case "darwin":
+		platform := s.scanAVFoundation()
+		list.Video = append(list.Video, platform.Video...)
+		list.Audio = append(list.Audio, platform.Audio...)
+	case "windows":
+		platform := s.scanDshow()
+		list.Video = append(list.Video, platform.Video...)
+		list.Audio = append(list.Audio, platform.Audio...)
+	default:
+		platform := s.scanV4L2()
+		list.Video = append(list.Video, platform.Video...)
+		list.Audio = append(list.Audio, platform.Audio...)
+	}
+
+	// DeckLink devices (cross-platform). Only include if found.
+	dl := s.scanDeckLink()
+	list.Video = append(list.Video, dl.Video...)
+	list.Audio = append(list.Audio, dl.Audio...)
+
+	// Categorize each device.
+	for i := range list.Video {
+		list.Video[i].Type = classifyVideoDevice(list.Video[i])
+	}
+	for i := range list.Audio {
+		list.Audio[i].Type = classifyAudioDevice(list.Audio[i])
+	}
+
+	return list
 }
+
+// classifyVideoDevice categorizes a video device based on backend and name.
+func classifyVideoDevice(d Device) DeviceType {
+	if d.Backend == "decklink" {
+		return TypeSDI
+	}
+	name := strings.ToLower(d.Name)
+
+	// Screen capture detection (must come before camera since "screen" is unambiguous).
+	if strings.Contains(name, "screen") || strings.Contains(name, "display") {
+		return TypeScreen
+	}
+
+	// USB HDMI capture cards — known vendor/product names.
+	captureKeywords := []string{
+		"cam link", "camlink",
+		"elgato",
+		"hd60", "hd 60",
+		"avermedia", "live gamer",
+		"magewell",
+		"epiphan",
+		"capture", // generic "capture" devices (not "screen capture")
+		"hdmi",
+		"usb video",
+	}
+	for _, kw := range captureKeywords {
+		if strings.Contains(name, kw) {
+			return TypeCaptureCard
+		}
+	}
+
+	// Default to camera (covers FaceTime, webcams, iPhone Continuity, "Desk View", etc.)
+	return TypeCamera
+}
+
+// classifyAudioDevice categorizes an audio device.
+func classifyAudioDevice(d Device) DeviceType {
+	if d.Backend == "decklink" {
+		return TypeSDI
+	}
+	name := strings.ToLower(d.Name)
+	if strings.Contains(name, "microphone") || strings.Contains(name, "mic ") || strings.HasSuffix(name, " mic") {
+		return TypeMicrophone
+	}
+	return TypeAudioInput
+}
+
+// --- Backend scanners ---
 
 func (s *Scanner) scanAVFoundation() DeviceList {
 	output := s.runFFmpeg("-f", "avfoundation", "-list_devices", "true", "-i", "")
@@ -119,7 +196,7 @@ func (s *Scanner) scanDshow() DeviceList {
 }
 
 func (s *Scanner) scanV4L2() DeviceList {
-	list := DeviceList{Backend: "v4l2", ScannedAt: time.Now().UTC()}
+	list := DeviceList{Platform: "v4l2", ScannedAt: time.Now().UTC()}
 	list.Video = probeV4L2Devices()
 	return list
 }
@@ -140,7 +217,7 @@ func (s *Scanner) runFFmpeg(args ...string) string {
 var avfDeviceRe = regexp.MustCompile(`\[(\d+)\]\s+(.+)`)
 
 func parseAVFoundation(output string) DeviceList {
-	list := DeviceList{Backend: "avfoundation", ScannedAt: time.Now().UTC()}
+	list := DeviceList{}
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	section := ""
 	for scanner.Scan() {
@@ -180,7 +257,7 @@ func parseAVFoundation(output string) DeviceList {
 var dshowDeviceRe = regexp.MustCompile(`"([^"]+)"\s+\((video|audio)\)`)
 
 func parseDshow(output string) DeviceList {
-	list := DeviceList{Backend: "dshow", ScannedAt: time.Now().UTC()}
+	list := DeviceList{}
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	for scanner.Scan() {
 		matches := dshowDeviceRe.FindStringSubmatch(scanner.Text())
@@ -203,13 +280,10 @@ func parseDshow(output string) DeviceList {
 }
 
 // --- decklink parser ---
-// FFmpeg outputs lines like:
-//   [decklink @ 0x...] 'DeckLink Mini Recorder 4K'
-//   [decklink @ 0x...] 'DeckLink SDI'
 var deckLinkDeviceRe = regexp.MustCompile(`\[decklink[^]]*\]\s+'([^']+)'`)
 
 func parseDeckLink(output string) DeviceList {
-	list := DeviceList{Backend: "decklink", ScannedAt: time.Now().UTC()}
+	list := DeviceList{}
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	for scanner.Scan() {
 		matches := deckLinkDeviceRe.FindStringSubmatch(scanner.Text())
@@ -217,17 +291,12 @@ func parseDeckLink(output string) DeviceList {
 			continue
 		}
 		name := strings.TrimSpace(matches[1])
+		// DeckLink devices appear once but provide both video and embedded audio.
+		// We expose them as a video device with embedded audio implicit.
 		list.Video = append(list.Video, Device{
 			Index:   name,
 			Name:    name,
 			Kind:    "video",
-			Backend: "decklink",
-		})
-		// DeckLink audio is embedded in the SDI signal.
-		list.Audio = append(list.Audio, Device{
-			Index:   name,
-			Name:    name + " (embedded audio)",
-			Kind:    "audio",
 			Backend: "decklink",
 		})
 	}

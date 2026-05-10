@@ -14,11 +14,9 @@ const els = {
   saveNotice: document.querySelector("#save-notice"),
   ingestURL: document.querySelector("#ingest-url"),
   streamName: document.querySelector("#stream-name"),
-  inputKind: document.querySelector("#input-kind"),
-  inputBackend: document.querySelector("#input-backend"),
-  videoDevice: document.querySelector("#video-device"),
-  audioDevice: document.querySelector("#audio-device"),
-  captureDetails: document.querySelector("#capture-details"),
+  videoSource: document.querySelector("#video-source"),
+  audioSource: document.querySelector("#audio-source"),
+  audioSourceLabel: document.querySelector("#audio-source-label"),
   // Output mode
   outputMode: document.querySelector("#output-mode"),
   rtmpFields: document.querySelector("#rtmp-fields"),
@@ -47,7 +45,7 @@ const els = {
 
 let selectedPreset = "recommended";
 let lastDeviceScan = null;
-let pendingVideoDevice = "";
+let pendingVideoValue = "test-video::";
 let pendingAudioDevice = "";
 let configLoaded = false;
 let lastStreamState = "idle";
@@ -112,14 +110,12 @@ function loadConfigIntoForm(config, presets) {
   els.streamName.placeholder = config.hasStreamKey
     ? "Stream key is set (enter a new one to replace)"
     : "Paste your stream key here";
-  els.inputKind.value = config.input.kind || "test-video";
-  els.inputBackend.value = config.input.backend || "avfoundation";
-  // Store pending device selections — will be applied when device dropdown populates.
-  pendingVideoDevice = config.input.videoDevice || "";
+
+  // Video source value is encoded as "kind:backend:device" so the scanner
+  // can match it back when populating the dropdown.
+  pendingVideoValue = encodeSourceValue(config.input);
   pendingAudioDevice = config.input.audioDevice || "";
-  els.videoDevice.value = pendingVideoDevice;
-  els.audioDevice.value = pendingAudioDevice;
-  // Output mode
+
   if (els.outputMode) {
     els.outputMode.value = config.outputMode || "rtmp";
     updateOutputModeVisibility();
@@ -127,16 +123,11 @@ function loadConfigIntoForm(config, presets) {
   if (config.hlsUrl && els.hlsUrl) {
     els.hlsUrl.textContent = config.hlsUrl;
   }
-  updateCaptureVisibility();
   renderPresets(presets);
 }
 
-function setPlatformDefault(platform) {
-  // If the backend is still the default lavfi (test video), set platform default
-  // so switching away from test-video picks the right one.
-  if (els.inputKind.value === "test-video") {
-    els.inputBackend.value = platform;
-  }
+function setPlatformDefault(_platform) {
+  // No-op: backend is now auto-determined from the selected device.
 }
 
 function updateButtonStates(state) {
@@ -164,30 +155,33 @@ els.copyHlsUrl?.addEventListener("click", () => {
 });
 
 // --- Capture source ---
-function updateCaptureVisibility() {
-  const kind = els.inputKind.value;
-  const isTest = kind === "test-video";
-  els.captureDetails.hidden = isTest;
+// Encode/decode source values for the unified picker.
+// Format: "kind:backend:device" (e.g., "webcam:avfoundation:0", "sdi:decklink:DeckLink Mini Recorder")
+// Special: "test-video::" for the test pattern.
+function encodeSourceValue(input) {
+  if (!input || input.kind === "test-video") return "test-video::";
+  const kind = input.kind || "webcam";
+  const backend = input.backend || "avfoundation";
+  const device = input.videoDevice || "";
+  return `${kind}:${backend}:${device}`;
+}
 
-  if (!isTest) {
-    // Show/hide the backend dropdown based on input kind.
-    // SDI always uses decklink. Webcam/HDMI use the platform backend.
-    const backendLabel = els.inputBackend.closest("label");
-    if (kind === "sdi") {
-      // SDI = DeckLink, no choice needed.
-      backendLabel.hidden = true;
-      els.inputBackend.value = "decklink";
-    } else if (kind === "hdmi") {
-      // HDMI could be DeckLink or platform USB capture — show dropdown
-      // but filter to relevant options.
-      backendLabel.hidden = false;
-    } else {
-      // Webcam — show platform backends, hide decklink.
-      backendLabel.hidden = false;
-      if (els.inputBackend.value === "decklink") {
-        els.inputBackend.value = lastDeviceScan?.backend || "avfoundation";
-      }
-    }
+function decodeSourceValue(value) {
+  if (!value || value === "test-video::") {
+    return { kind: "test-video", backend: "lavfi", videoDevice: "" };
+  }
+  const [kind, backend, ...rest] = value.split(":");
+  return { kind, backend, videoDevice: rest.join(":") };
+}
+
+// Map device type to an input kind for FFmpeg config.
+function kindForDeviceType(type) {
+  switch (type) {
+    case "sdi": return "sdi";
+    case "capture-card": return "hdmi";
+    case "screen": return "webcam"; // screen capture uses platform backend like a webcam
+    case "camera": return "webcam";
+    default: return "webcam";
   }
 }
 
@@ -233,15 +227,16 @@ function showNotice(message) {
 
 // --- Config save ---
 async function saveConfig() {
+  const decoded = decodeSourceValue(els.videoSource.value);
   const payload = {
     presetId: selectedPreset,
     ingestUrl: els.ingestURL.value.trim(),
     outputMode: els.outputMode?.value || "rtmp",
     input: {
-      kind: els.inputKind.value,
-      backend: els.inputKind.value === "test-video" ? "lavfi" : els.inputBackend.value,
-      videoDevice: els.videoDevice.value.trim(),
-      audioDevice: els.audioDevice.value.trim(),
+      kind: decoded.kind,
+      backend: decoded.backend,
+      videoDevice: decoded.videoDevice,
+      audioDevice: els.audioSource.value || "",
     },
   };
   const key = els.streamName.value.trim();
@@ -254,19 +249,12 @@ async function saveConfig() {
   els.streamName.placeholder = result.hasStreamKey
     ? "Stream key is set (enter a new one to replace)"
     : "Paste your stream key here";
-  els.inputKind.value = result.input.kind || "test-video";
-  if (result.input.kind !== "test-video") {
-    els.inputBackend.value = result.input.backend || "avfoundation";
-  }
-  // Set pending so next device scan picks up the values.
-  pendingVideoDevice = result.input.videoDevice || "";
+  pendingVideoValue = encodeSourceValue(result.input);
   pendingAudioDevice = result.input.audioDevice || "";
-  els.videoDevice.value = pendingVideoDevice;
-  els.audioDevice.value = pendingAudioDevice;
   if (els.outputMode) els.outputMode.value = result.outputMode || "rtmp";
   if (result.hlsUrl && els.hlsUrl) els.hlsUrl.textContent = result.hlsUrl;
   updateOutputModeVisibility();
-  updateCaptureVisibility();
+  applyPendingToDropdowns();
 }
 
 // --- Button handlers ---
@@ -594,80 +582,114 @@ document.querySelector("#ovr-save")?.addEventListener("click", async () => {
   }
 });
 
-// --- Device discovery ---
+// --- Device discovery (smart unified picker) ---
 
-// Map input kind to the correct backend.
-function backendForKind(kind) {
-  switch (kind) {
-    case "sdi": return "decklink";
-    case "test-video": return "lavfi";
-    default: return null; // use platform default
-  }
-}
+const DEVICE_GROUPS = [
+  { type: "camera",       label: "Cameras" },
+  { type: "capture-card", label: "Capture cards (USB HDMI)" },
+  { type: "screen",       label: "Screen capture" },
+  { type: "sdi",          label: "SDI (Blackmagic DeckLink)" },
+];
+
+const AUDIO_GROUPS = [
+  { type: "microphone",  label: "Microphones" },
+  { type: "audio-input", label: "Audio inputs" },
+];
 
 async function scanDevices(forceRefresh) {
   try {
-    const backend = els.inputBackend.value;
-    const url = `/api/devices?backend=${backend}${forceRefresh ? "&refresh=1" : ""}`;
+    const url = `/api/devices${forceRefresh ? "?refresh=1" : ""}`;
     const data = await api(url);
     lastDeviceScan = data;
-
-    // Populate video device dropdown.
-    const currentVideo = pendingVideoDevice || els.videoDevice.value;
-    els.videoDevice.innerHTML = "";
-    if (data.video && data.video.length > 0) {
-      for (const d of data.video) {
-        const opt = document.createElement("option");
-        opt.value = d.index;
-        opt.textContent = d.backend === "decklink" ? d.name : `[${d.index}] ${d.name}`;
-        els.videoDevice.appendChild(opt);
-      }
-      if (currentVideo && [...els.videoDevice.options].some((o) => o.value === currentVideo)) {
-        els.videoDevice.value = currentVideo;
-      }
-    } else {
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "No devices found";
-      els.videoDevice.appendChild(opt);
-    }
-
-    // Populate audio device dropdown.
-    const currentAudio = pendingAudioDevice || els.audioDevice.value;
-    els.audioDevice.innerHTML = "";
-    const noneOpt = document.createElement("option");
-    noneOpt.value = "";
-    noneOpt.textContent = backend === "decklink" ? "Embedded (SDI audio)" : "None (use default)";
-    els.audioDevice.appendChild(noneOpt);
-    if (data.audio && data.audio.length > 0) {
-      for (const d of data.audio) {
-        const opt = document.createElement("option");
-        opt.value = d.index;
-        opt.textContent = d.backend === "decklink" ? d.name : `[${d.index}] ${d.name}`;
-        els.audioDevice.appendChild(opt);
-      }
-      if (currentAudio && [...els.audioDevice.options].some((o) => o.value === currentAudio)) {
-        els.audioDevice.value = currentAudio;
-      }
-    }
-
-    pendingVideoDevice = "";
-    pendingAudioDevice = "";
-
-    const vidCount = data.video?.length || 0;
-    const audCount = data.audio?.length || 0;
-    if (els.deviceStatus) {
-      if (vidCount === 0 && audCount === 0) {
-        els.deviceStatus.textContent = `No ${backend} devices found. Connect a device and click Refresh.`;
-      } else {
-        els.deviceStatus.textContent = `${vidCount} video, ${audCount} audio (${backend}). Devices auto-refresh every 5s.`;
-      }
-    }
+    renderDevicePickers(data);
   } catch (_) {}
 }
 
-// syncBackendToKind is now handled inside updateCaptureVisibility.
-function syncBackendToKind() {}
+function renderDevicePickers(data) {
+  // --- Video picker with grouped categories ---
+  els.videoSource.innerHTML = "";
+
+  // Always-available test pattern at the top.
+  const testOpt = document.createElement("option");
+  testOpt.value = "test-video::";
+  testOpt.textContent = "Test pattern (no hardware)";
+  els.videoSource.appendChild(testOpt);
+
+  let videoCount = 0;
+  for (const group of DEVICE_GROUPS) {
+    const matches = (data.video || []).filter((d) => d.type === group.type);
+    if (matches.length === 0) continue;
+    const og = document.createElement("optgroup");
+    og.label = group.label;
+    for (const d of matches) {
+      const opt = document.createElement("option");
+      const kind = kindForDeviceType(d.type);
+      opt.value = `${kind}:${d.backend}:${d.index}`;
+      opt.textContent = d.backend === "decklink" ? d.name : `${d.name} [${d.index}]`;
+      og.appendChild(opt);
+      videoCount++;
+    }
+    els.videoSource.appendChild(og);
+  }
+
+  // Restore selection.
+  const wantedVideo = pendingVideoValue || els.videoSource.value;
+  if (wantedVideo && [...els.videoSource.options].some((o) => o.value === wantedVideo)) {
+    els.videoSource.value = wantedVideo;
+  }
+
+  // --- Audio picker ---
+  els.audioSource.innerHTML = "";
+  const noneOpt = document.createElement("option");
+  noneOpt.value = "";
+
+  // Detect if currently selected video is SDI; if so, default to embedded SDI audio.
+  const selectedKind = decodeSourceValue(els.videoSource.value).kind;
+  noneOpt.textContent = selectedKind === "sdi" ? "Embedded SDI audio" : "None / silent";
+  els.audioSource.appendChild(noneOpt);
+
+  let audioCount = 0;
+  for (const group of AUDIO_GROUPS) {
+    const matches = (data.audio || []).filter((d) => d.type === group.type);
+    if (matches.length === 0) continue;
+    const og = document.createElement("optgroup");
+    og.label = group.label;
+    for (const d of matches) {
+      const opt = document.createElement("option");
+      opt.value = d.index;
+      opt.textContent = `${d.name} [${d.index}]`;
+      og.appendChild(opt);
+      audioCount++;
+    }
+    els.audioSource.appendChild(og);
+  }
+
+  if (pendingAudioDevice && [...els.audioSource.options].some((o) => o.value === pendingAudioDevice)) {
+    els.audioSource.value = pendingAudioDevice;
+  }
+
+  // Hide audio picker for SDI sources (audio is always embedded).
+  if (els.audioSourceLabel) {
+    els.audioSourceLabel.hidden = selectedKind === "sdi";
+  }
+
+  // Clear pending values once applied.
+  if (els.videoSource.value === pendingVideoValue) pendingVideoValue = "";
+  if (els.audioSource.value === pendingAudioDevice) pendingAudioDevice = "";
+
+  // Status line.
+  if (els.deviceStatus) {
+    if (videoCount === 0) {
+      els.deviceStatus.textContent = `No video devices detected. Connect a camera or capture card and click Refresh.`;
+    } else {
+      els.deviceStatus.textContent = `${videoCount} video, ${audioCount} audio detected. Auto-refreshes every 5s.`;
+    }
+  }
+}
+
+function applyPendingToDropdowns() {
+  if (lastDeviceScan) renderDevicePickers(lastDeviceScan);
+}
 
 // Poll for devices every 5 seconds.
 scanDevices();
@@ -675,12 +697,6 @@ setInterval(() => scanDevices(), 5000);
 
 // Refresh button.
 document.querySelector("#refresh-devices")?.addEventListener("click", () => scanDevices(true));
-
-// When backend changes, rescan devices immediately.
-els.inputBackend.addEventListener("change", () => {
-  scanDevices(true);
-  saveAndRestartPreview();
-});
 
 // --- Preview ---
 let previewFailed = false;
@@ -773,14 +789,29 @@ function hidePreviewError() {
 }
 
 // Restart preview when capture source settings change.
-els.inputKind.addEventListener("change", () => {
-  updateCaptureVisibility();
-  syncBackendToKind();
-  scanDevices(true);
+els.videoSource.addEventListener("change", () => {
+  // Re-render audio dropdown so "Embedded SDI audio" label matches new kind.
+  if (lastDeviceScan) renderDevicePickers(lastDeviceScan);
   saveAndRestartPreview();
 });
-els.videoDevice.addEventListener("change", saveAndRestartPreview);
-els.audioDevice.addEventListener("change", saveAndRestartPreview);
+els.audioSource.addEventListener("change", saveAndRestartPreview);
+
+// --- Quick-fill destination presets ---
+const DEST_PRESETS = {
+  youtube: "rtmps://a.rtmps.youtube.com/live2",
+  cloudflare: "rtmps://live.cloudflare.com:443/live/",
+  twitch: "rtmp://live.twitch.tv/app",
+};
+document.querySelectorAll("[data-preset]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const url = DEST_PRESETS[btn.dataset.preset];
+    if (url) {
+      els.ingestURL.value = url;
+      els.streamName.focus();
+      showNotice(`${btn.textContent} URL filled — paste your stream key.`);
+    }
+  });
+});
 
 // --- Init ---
 refresh();

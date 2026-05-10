@@ -271,11 +271,10 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 // --- Device discovery handler ---
 
 func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
-	backend := r.URL.Query().Get("backend")
 	if r.URL.Query().Get("refresh") == "1" {
 		s.devScanner.Invalidate()
 	}
-	writeJSON(w, http.StatusOK, s.devScanner.Scan(backend))
+	writeJSON(w, http.StatusOK, s.devScanner.Scan())
 }
 
 // --- YouTube auth handlers ---
