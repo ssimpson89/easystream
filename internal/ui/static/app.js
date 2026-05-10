@@ -8,7 +8,9 @@ const els = {
   speed: document.querySelector("#speed"),
   lastMessage: document.querySelector("#last-message"),
   presetSelect: document.querySelector("#preset-select"),
-  presetDescription: document.querySelector("#preset-description"),
+  presetInfoTitle: document.querySelector("#preset-info-title"),
+  presetInfoDescription: document.querySelector("#preset-info-description"),
+  presetInfoUpload: document.querySelector("#preset-info-upload"),
   start: document.querySelector("#start"),
   stop: document.querySelector("#stop"),
   save: document.querySelector("#save-config"),
@@ -204,13 +206,19 @@ function renderPresets(presets) {
 }
 
 function updatePresetDescription(presets) {
-  if (!els.presetDescription) return;
   const preset = (presets || cachedPresets).find((p) => p.id === selectedPreset);
-  if (!preset) {
-    els.presetDescription.textContent = "";
-    return;
+  if (!preset) return;
+  const fps = preset.fps === 60 ? "60" : "";
+  if (els.presetInfoTitle) {
+    els.presetInfoTitle.textContent =
+      `${preset.name} · ${preset.height}p${fps} · ${preset.videoKbps / 1000} Mbps`;
   }
-  els.presetDescription.textContent = `${preset.description} Upload target: ${preset.uploadTarget}.`;
+  if (els.presetInfoDescription) {
+    els.presetInfoDescription.textContent = preset.description;
+  }
+  if (els.presetInfoUpload) {
+    els.presetInfoUpload.textContent = `Upload target: ${preset.uploadTarget}`;
+  }
 }
 
 document.querySelector("#preset-select")?.addEventListener("change", (e) => {

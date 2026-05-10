@@ -215,6 +215,19 @@ dd { margin: 4px 0 0; font-size: 24px; font-weight: 740; }
   overflow-wrap: anywhere;
 }
 
+/* --- Preset info card --- */
+.preset-info {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+}
+.preset-info strong { display: block; font-size: 15px; margin-bottom: 6px; }
+.preset-info span { display: block; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.preset-info .preset-upload { margin-top: 6px; font-weight: 600; color: var(--text); }
+
 /* --- Forms --- */
 label {
   display: block;
