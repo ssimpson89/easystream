@@ -575,15 +575,22 @@ document.querySelector("#ovr-save")?.addEventListener("click", async () => {
 });
 
 // --- Device discovery ---
-async function scanDevices() {
-  try {
-    const data = await api("/api/devices");
-    lastDeviceScan = data;
 
-    // Auto-set backend from detected devices.
-    if (data.backend && els.inputKind.value !== "test-video") {
-      els.inputBackend.value = data.backend;
-    }
+// Map input kind to the correct backend.
+function backendForKind(kind) {
+  switch (kind) {
+    case "sdi": return "decklink";
+    case "test-video": return "lavfi";
+    default: return null; // use platform default
+  }
+}
+
+async function scanDevices(forceRefresh) {
+  try {
+    const backend = els.inputBackend.value;
+    const url = `/api/devices?backend=${backend}${forceRefresh ? "&refresh=1" : ""}`;
+    const data = await api(url);
+    lastDeviceScan = data;
 
     // Populate video device dropdown.
     const currentVideo = pendingVideoDevice || els.videoDevice.value;
@@ -592,17 +599,16 @@ async function scanDevices() {
       for (const d of data.video) {
         const opt = document.createElement("option");
         opt.value = d.index;
-        opt.textContent = `[${d.index}] ${d.name}`;
+        opt.textContent = d.backend === "decklink" ? d.name : `[${d.index}] ${d.name}`;
         els.videoDevice.appendChild(opt);
       }
-      // Restore previous selection if still available.
       if (currentVideo && [...els.videoDevice.options].some((o) => o.value === currentVideo)) {
         els.videoDevice.value = currentVideo;
       }
     } else {
       const opt = document.createElement("option");
       opt.value = "";
-      opt.textContent = "No video devices found";
+      opt.textContent = "No devices found";
       els.videoDevice.appendChild(opt);
     }
 
@@ -611,13 +617,13 @@ async function scanDevices() {
     els.audioDevice.innerHTML = "";
     const noneOpt = document.createElement("option");
     noneOpt.value = "";
-    noneOpt.textContent = "None (use default)";
+    noneOpt.textContent = backend === "decklink" ? "Embedded (SDI audio)" : "None (use default)";
     els.audioDevice.appendChild(noneOpt);
     if (data.audio && data.audio.length > 0) {
       for (const d of data.audio) {
         const opt = document.createElement("option");
         opt.value = d.index;
-        opt.textContent = `[${d.index}] ${d.name}`;
+        opt.textContent = d.backend === "decklink" ? d.name : `[${d.index}] ${d.name}`;
         els.audioDevice.appendChild(opt);
       }
       if (currentAudio && [...els.audioDevice.options].some((o) => o.value === currentAudio)) {
@@ -625,35 +631,62 @@ async function scanDevices() {
       }
     }
 
-    // Clear pending values after applying.
     pendingVideoDevice = "";
     pendingAudioDevice = "";
 
-    // Update status text.
-    const total = (data.video?.length || 0) + (data.audio?.length || 0);
+    const vidCount = data.video?.length || 0;
+    const audCount = data.audio?.length || 0;
     if (els.deviceStatus) {
-      els.deviceStatus.textContent = `${total} device${total !== 1 ? "s" : ""} detected (${data.backend}). Plug in a new device and it will appear automatically.`;
+      if (vidCount === 0 && audCount === 0) {
+        els.deviceStatus.textContent = `No ${backend} devices found. Connect a device and click Refresh.`;
+      } else {
+        els.deviceStatus.textContent = `${vidCount} video, ${audCount} audio (${backend}). Devices auto-refresh every 5s.`;
+      }
     }
-  } catch (_) {
-    // Silent fail — device scanning is optional.
+  } catch (_) {}
+}
+
+// Auto-switch backend when input kind changes.
+function syncBackendToKind() {
+  const kind = els.inputKind.value;
+  if (kind === "sdi") {
+    els.inputBackend.value = "decklink";
+  } else if (kind !== "test-video" && els.inputBackend.value === "decklink") {
+    // Switching away from SDI — go back to platform default.
+    els.inputBackend.value = lastDeviceScan?.backend || "avfoundation";
   }
 }
 
-// Poll for devices every 5 seconds to detect hot-plug.
+// Poll for devices every 5 seconds.
 scanDevices();
-setInterval(scanDevices, 5000);
+setInterval(() => scanDevices(), 5000);
+
+// Refresh button.
+document.querySelector("#refresh-devices")?.addEventListener("click", () => scanDevices(true));
+
+// When backend changes, rescan devices immediately.
+els.inputBackend.addEventListener("change", () => {
+  scanDevices(true);
+  saveAndRestartPreview();
+});
 
 // --- Preview ---
+let previewFailed = false;
+
 function restartPreview() {
   if (!previewActive) return;
+  previewFailed = false;
   els.previewImg.src = "";
-  setTimeout(startPreview, 200);
+  hidePreviewError();
+  setTimeout(startPreview, 300);
 }
 
 async function saveAndRestartPreview() {
   if (!previewActive) return;
+  previewFailed = false;
   els.previewImg.src = "";
-  setTimeout(startPreview, 200);
+  hidePreviewError();
+  setTimeout(startPreview, 300);
 }
 
 els.previewToggle?.addEventListener("click", () => {
@@ -661,6 +694,8 @@ els.previewToggle?.addEventListener("click", () => {
   els.previewContainer.hidden = !previewActive;
   els.previewToggle.textContent = previewActive ? "Hide Preview" : "Show Preview";
   if (previewActive) {
+    previewFailed = false;
+    hidePreviewError();
     startPreview();
   } else {
     els.previewImg.src = "";
@@ -669,14 +704,15 @@ els.previewToggle?.addEventListener("click", () => {
 });
 
 function startPreview() {
-  hidePreviewError();
+  if (previewFailed) return; // Don't retry after failure until user changes something.
   saveConfig().then(() => {
     const img = els.previewImg;
+    img.style.display = "";
     img.src = "/api/preview?" + Date.now();
-    // If the stream ends immediately (device error), the img will fire an error.
     img.onerror = () => {
-      if (previewActive) {
-        showPreviewError("Could not open capture device. Check that camera permission is granted (System Settings > Privacy > Camera), the device isn't in use by another app, and the correct device is selected.");
+      if (previewActive && !previewFailed) {
+        previewFailed = true;
+        showPreviewError("Could not open capture device. Check that camera permission is granted (System Settings > Privacy & Security > Camera), the device isn't in use by another app, and the correct device is selected.");
       }
     };
   });
@@ -704,11 +740,12 @@ function hidePreviewError() {
 // Restart preview when capture source settings change.
 els.inputKind.addEventListener("change", () => {
   updateCaptureVisibility();
+  syncBackendToKind();
+  scanDevices(true);
   saveAndRestartPreview();
 });
 els.videoDevice.addEventListener("change", saveAndRestartPreview);
 els.audioDevice.addEventListener("change", saveAndRestartPreview);
-els.inputBackend.addEventListener("change", saveAndRestartPreview);
 
 // --- Init ---
 refresh();

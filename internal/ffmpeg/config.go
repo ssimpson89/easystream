@@ -130,10 +130,18 @@ func (c Config) Args() ([]string, error) {
 	}
 
 	args = append(args, c.inputArgs()...)
+
+	// Build video filter chain. SDI/DeckLink sources may be interlaced
+	// so we auto-deinterlace with yadif and scale to the target resolution.
+	vf := fmt.Sprintf("yadif=deint=interlaced,scale=%s:force_original_aspect_ratio=decrease,pad=%s:-1:-1:color=black",
+		c.Preset.Resolution(), c.Preset.Resolution())
+	// yadif deint=interlaced is a no-op on progressive sources.
+
 	args = append(args,
 		"-c:v", "libx264",
 		"-preset", "veryfast",
 		"-tune", "zerolatency",
+		"-vf", vf,
 		"-b:v", c.Preset.VideoBitrate(),
 		"-maxrate", c.Preset.VideoBitrate(),
 		"-bufsize", c.Preset.BufferSize(),
@@ -142,7 +150,6 @@ func (c Config) Args() ([]string, error) {
 		"-sc_threshold", "0",
 		"-pix_fmt", "yuv420p",
 		"-r", fmt.Sprintf("%d", c.Preset.FPS),
-		"-s", c.Preset.Resolution(),
 		"-c:a", "aac",
 		"-b:a", c.Preset.AudioBitrate(),
 		"-ar", "48000",
@@ -218,7 +225,9 @@ func captureArgs(input Input, preset quality.Preset) []string {
 	case "v4l2":
 		return []string{"-f", "v4l2", "-i", input.VideoDevice}
 	case "decklink":
-		return []string{"-f", "decklink", "-i", input.VideoDevice}
+		// DeckLink auto-detects the input signal format and framerate.
+		// Audio is embedded in the SDI signal. Device name comes from -list_devices.
+		return []string{"-f", "decklink", "-audio_input", "embedded", "-i", input.VideoDevice}
 	default:
 		return []string{"-f", backend, "-i", input.VideoDevice}
 	}

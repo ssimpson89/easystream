@@ -389,6 +389,15 @@ input:focus, select:focus, textarea:focus {
   background: #000;
   min-height: 120px;
 }
+.device-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+}
+.device-status-row .hint { margin-top: 0; }
+
 .preview-hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
 .preview-error {
   margin-top: 12px;

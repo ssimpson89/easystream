@@ -289,7 +289,10 @@
                 <option value="">None (use default)</option>
               </select>
             </label>
-            <p class="hint" id="device-status">Devices are auto-detected. Plug in a new device and it will appear here.</p>
+            <div class="device-status-row">
+              <p class="hint" id="device-status">Scanning for devices...</p>
+              <button id="refresh-devices" class="button button-sm">Refresh</button>
+            </div>
           </div>
         </article>
       </section>
