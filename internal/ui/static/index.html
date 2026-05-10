@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EasyStream</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Campus streaming</p>
+          <h1>EasyStream</h1>
+        </div>
+        <div class="hero-right">
+          <div id="yt-account" class="yt-account" hidden>
+            <span id="yt-channel-name"></span>
+            <button id="yt-logout" class="button button-sm">Disconnect</button>
+          </div>
+          <div class="state" id="state">Loading</div>
+        </div>
+      </section>
+
+      <!-- Live preview -->
+      <section class="panel preview-panel" id="preview-section">
+        <div class="preview-bar">
+          <p class="eyebrow">Source preview</p>
+          <button id="preview-toggle" class="button button-sm">Show Preview</button>
+        </div>
+        <div id="preview-container" class="preview-container" hidden>
+          <img id="preview-img" class="preview-img" alt="Live preview">
+          <p class="preview-hint">Preview uses minimal resources. It does not affect stream quality.</p>
+        </div>
+      </section>
+
+      <!-- Stream status -->
+      <section class="panel primary">
+        <div class="panel-header">
+          <div>
+            <p class="eyebrow">Stream status</p>
+            <h2 id="status-title">Checking status...</h2>
+          </div>
+          <div class="actions">
+            <button id="start" class="button go-button" disabled>Go Live</button>
+            <button id="stop" class="button stop-button" disabled>Stop</button>
+          </div>
+        </div>
+        <dl class="metrics">
+          <div>
+            <dt>Bitrate</dt>
+            <dd id="bitrate">-</dd>
+          </div>
+          <div>
+            <dt>Frames</dt>
+            <dd id="frames">-</dd>
+          </div>
+          <div>
+            <dt>Restarts</dt>
+            <dd id="restarts">-</dd>
+          </div>
+          <div>
+            <dt>Speed</dt>
+            <dd id="speed">-</dd>
+          </div>
+        </dl>
+        <p class="logline" id="last-message">No stream activity yet.</p>
+      </section>
+
+      <section class="grid">
+
+        <!-- Step 1: Quality -->
+        <article class="panel">
+          <p class="eyebrow">Step 1</p>
+          <h2>Quality tier</h2>
+          <p class="hint">Choose the quality that matches your upload speed.</p>
+          <div class="preset-list" id="presets"></div>
+        </article>
+
+        <!-- Step 2: Destination -->
+        <article class="panel">
+          <p class="eyebrow">Step 2</p>
+          <h2>Destination</h2>
+
+          <!-- Mode tabs -->
+          <div class="tab-bar" id="dest-tabs">
+            <button class="tab active" data-mode="scheduled">Scheduled</button>
+            <button class="tab" data-mode="now">Go Live Now</button>
+            <button class="tab" data-mode="manual">Manual</button>
+          </div>
+
+          <!-- Scheduled mode -->
+          <div id="mode-scheduled" class="mode-content">
+            <div id="yt-login-prompt" class="yt-login-box">
+              <p>Connect your YouTube account to enable scheduled streaming.</p>
+              <button id="yt-login" class="button yt-button">Connect YouTube</button>
+            </div>
+            <div id="schedule-ui" hidden>
+              <div class="section-header">
+                <h3>Upcoming events</h3>
+              </div>
+              <div id="events-list" class="events-list">
+                <p class="hint">No upcoming events.</p>
+              </div>
+
+              <div class="section-header">
+                <h3>Recurring schedules</h3>
+                <button id="add-schedule-btn" class="button button-sm">+ Add</button>
+              </div>
+              <div id="schedules-list" class="schedule-list"></div>
+
+              <!-- Add schedule form -->
+              <div id="schedule-form" class="sub-form" hidden>
+                <label>Name <input id="sched-name" placeholder="Sunday Morning Service"></label>
+                <label>Days
+                  <div class="day-picker" id="sched-days">
+                    <button type="button" class="day-btn" data-day="sunday">Sun</button>
+                    <button type="button" class="day-btn" data-day="monday">Mon</button>
+                    <button type="button" class="day-btn" data-day="tuesday">Tue</button>
+                    <button type="button" class="day-btn" data-day="wednesday">Wed</button>
+                    <button type="button" class="day-btn" data-day="thursday">Thu</button>
+                    <button type="button" class="day-btn" data-day="friday">Fri</button>
+                    <button type="button" class="day-btn" data-day="saturday">Sat</button>
+                  </div>
+                </label>
+                <div class="form-row">
+                  <label>Time <input id="sched-time" type="time" value="08:45"></label>
+                  <label>Timezone
+                    <select id="sched-tz">
+                      <option value="America/Chicago">Central (CST/CDT)</option>
+                      <option value="America/New_York">Eastern (EST/EDT)</option>
+                      <option value="America/Denver">Mountain (MST/MDT)</option>
+                      <option value="America/Los_Angeles">Pacific (PST/PDT)</option>
+                      <option value="America/Phoenix">Arizona (MST)</option>
+                      <option value="Pacific/Honolulu">Hawaii (HST)</option>
+                      <option value="America/Anchorage">Alaska (AKST/AKDT)</option>
+                      <option value="UTC">UTC</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="form-row">
+                  <label>Duration (min) <input id="sched-duration" type="number" value="120" min="15" max="480"></label>
+                  <label>Privacy
+                    <select id="sched-privacy">
+                      <option value="unlisted">Unlisted</option>
+                      <option value="public">Public</option>
+                      <option value="private">Private</option>
+                    </select>
+                  </label>
+                </div>
+                <label>YouTube title <input id="sched-title" placeholder="Sunday Morning Service - Live"></label>
+                <label>Description <textarea id="sched-desc" rows="2" placeholder="Join us for worship"></textarea></label>
+                <div class="form-actions">
+                  <button id="sched-save" class="button go-button">Save Schedule</button>
+                  <button id="sched-cancel" class="button">Cancel</button>
+                </div>
+              </div>
+
+              <div class="section-header">
+                <h3>Special events</h3>
+                <button id="add-override-btn" class="button button-sm">+ Add</button>
+              </div>
+              <div id="overrides-list" class="schedule-list"></div>
+
+              <!-- Add override form -->
+              <div id="override-form" class="sub-form" hidden>
+                <label>Name <input id="ovr-name" placeholder="Easter Service"></label>
+                <div class="form-row">
+                  <label>Date & time <input id="ovr-datetime" type="datetime-local"></label>
+                  <label>Duration (min) <input id="ovr-duration" type="number" value="120" min="15" max="480"></label>
+                </div>
+                <div class="form-row">
+                  <label>Timezone
+                    <select id="ovr-tz">
+                      <option value="America/Chicago">Central (CST/CDT)</option>
+                      <option value="America/New_York">Eastern (EST/EDT)</option>
+                      <option value="America/Denver">Mountain (MST/MDT)</option>
+                      <option value="America/Los_Angeles">Pacific (PST/PDT)</option>
+                      <option value="UTC">UTC</option>
+                    </select>
+                  </label>
+                  <label>Privacy
+                    <select id="ovr-privacy">
+                      <option value="unlisted">Unlisted</option>
+                      <option value="public">Public</option>
+                      <option value="private">Private</option>
+                    </select>
+                  </label>
+                </div>
+                <label>YouTube title <input id="ovr-title" placeholder="Easter Sunday Service - Live"></label>
+                <label>Description <textarea id="ovr-desc" rows="2"></textarea></label>
+                <div class="form-actions">
+                  <button id="ovr-save" class="button go-button">Save Event</button>
+                  <button id="ovr-cancel" class="button">Cancel</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Go Live Now mode -->
+          <div id="mode-now" class="mode-content" hidden>
+            <div id="now-yt-login" class="yt-login-box">
+              <p>Connect your YouTube account to go live instantly.</p>
+              <button class="button yt-button" onclick="loginYouTube()">Connect YouTube</button>
+            </div>
+            <div id="now-ui" hidden>
+              <label>Broadcast title <input id="now-title" value="Live Stream"></label>
+              <label>Privacy
+                <select id="now-privacy">
+                  <option value="unlisted">Unlisted</option>
+                  <option value="public">Public</option>
+                  <option value="private">Private</option>
+                </select>
+              </label>
+              <p class="hint">Creates a YouTube broadcast, sets up the stream, and goes live immediately.</p>
+              <button id="now-go-live" class="button go-button full">Go Live Now on YouTube</button>
+            </div>
+          </div>
+
+          <!-- Manual mode -->
+          <div id="mode-manual" class="mode-content" hidden>
+            <label>
+              Output type
+              <select id="output-mode">
+                <option value="rtmp">RTMP/RTMPS (YouTube, Twitch, etc.)</option>
+                <option value="hls">HLS (m3u8 — for Cloudflare, CDN, or direct playback)</option>
+              </select>
+            </label>
+
+            <div id="rtmp-fields">
+              <p class="hint">Paste your stream key from YouTube Studio or another platform.</p>
+              <label>
+                Ingest URL
+                <input id="ingest-url" autocomplete="off" spellcheck="false">
+              </label>
+              <label>
+                Stream key
+                <input id="stream-name" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your stream key here">
+              </label>
+            </div>
+
+            <div id="hls-fields" hidden>
+              <p class="hint">EasyStream will output HLS segments locally and serve them over HTTP. Give the playlist URL below to Cloudflare, a CDN, or any HLS player.</p>
+              <div class="hls-url-box">
+                <label>Playlist URL</label>
+                <div class="hls-url-row">
+                  <code id="hls-url">http://127.0.0.1:8080/hls/stream.m3u8</code>
+                  <button id="copy-hls-url" class="button button-sm">Copy</button>
+                </div>
+                <p class="hint">For Cloudflare Stream: use "Pull" mode and paste this URL as the input source. Make sure your machine is reachable from the internet (port forwarding or tunnel).</p>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <!-- Step 3: Capture source -->
+        <article class="panel">
+          <p class="eyebrow">Step 3</p>
+          <h2>Capture source</h2>
+          <p class="hint">Select your video input. Use "Test pattern" to verify without hardware.</p>
+          <label>
+            Mode
+            <select id="input-kind">
+              <option value="test-video">Test pattern (no hardware needed)</option>
+              <option value="webcam">Webcam</option>
+              <option value="hdmi">HDMI capture card</option>
+              <option value="sdi">SDI capture (DeckLink)</option>
+            </select>
+          </label>
+          <div id="capture-details">
+            <label>
+              Backend
+              <select id="input-backend">
+                <option value="avfoundation">macOS (avfoundation)</option>
+                <option value="dshow">Windows (dshow)</option>
+                <option value="v4l2">Linux (v4l2)</option>
+                <option value="decklink">Blackmagic DeckLink</option>
+              </select>
+            </label>
+            <label>
+              Video device
+              <input id="video-device" autocomplete="off" spellcheck="false" placeholder="e.g. 0, /dev/video0, or device name">
+            </label>
+            <label>
+              Audio device
+              <input id="audio-device" autocomplete="off" spellcheck="false" placeholder="Leave blank to use default">
+            </label>
+          </div>
+        </article>
+      </section>
+
+      <div class="save-bar">
+        <button id="save-config" class="button save-button">Save Settings</button>
+        <span id="save-notice" class="save-notice"></span>
+      </div>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
