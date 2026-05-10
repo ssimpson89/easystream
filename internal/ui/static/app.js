@@ -38,6 +38,7 @@ const els = {
   eventsList: document.querySelector("#events-list"),
   schedulesList: document.querySelector("#schedules-list"),
   overridesList: document.querySelector("#overrides-list"),
+  deviceStatus: document.querySelector("#device-status"),
   // Preview
   previewToggle: document.querySelector("#preview-toggle"),
   previewContainer: document.querySelector("#preview-container"),
@@ -45,6 +46,9 @@ const els = {
 };
 
 let selectedPreset = "recommended";
+let lastDeviceScan = null;
+let pendingVideoDevice = "";
+let pendingAudioDevice = "";
 let configLoaded = false;
 let lastStreamState = "idle";
 let currentDestMode = "scheduled";
@@ -110,8 +114,11 @@ function loadConfigIntoForm(config, presets) {
     : "Paste your stream key here";
   els.inputKind.value = config.input.kind || "test-video";
   els.inputBackend.value = config.input.backend || "avfoundation";
-  els.videoDevice.value = config.input.videoDevice || "";
-  els.audioDevice.value = config.input.audioDevice || "";
+  // Store pending device selections — will be applied when device dropdown populates.
+  pendingVideoDevice = config.input.videoDevice || "";
+  pendingAudioDevice = config.input.audioDevice || "";
+  els.videoDevice.value = pendingVideoDevice;
+  els.audioDevice.value = pendingAudioDevice;
   // Output mode
   if (els.outputMode) {
     els.outputMode.value = config.outputMode || "rtmp";
@@ -231,8 +238,11 @@ async function saveConfig() {
   if (result.input.kind !== "test-video") {
     els.inputBackend.value = result.input.backend || "avfoundation";
   }
-  els.videoDevice.value = result.input.videoDevice || "";
-  els.audioDevice.value = result.input.audioDevice || "";
+  // Set pending so next device scan picks up the values.
+  pendingVideoDevice = result.input.videoDevice || "";
+  pendingAudioDevice = result.input.audioDevice || "";
+  els.videoDevice.value = pendingVideoDevice;
+  els.audioDevice.value = pendingAudioDevice;
   if (els.outputMode) els.outputMode.value = result.outputMode || "rtmp";
   if (result.hlsUrl && els.hlsUrl) els.hlsUrl.textContent = result.hlsUrl;
   updateOutputModeVisibility();
@@ -563,6 +573,75 @@ document.querySelector("#ovr-save")?.addEventListener("click", async () => {
     alert(error.message);
   }
 });
+
+// --- Device discovery ---
+async function scanDevices() {
+  try {
+    const data = await api("/api/devices");
+    lastDeviceScan = data;
+
+    // Auto-set backend from detected devices.
+    if (data.backend && els.inputKind.value !== "test-video") {
+      els.inputBackend.value = data.backend;
+    }
+
+    // Populate video device dropdown.
+    const currentVideo = pendingVideoDevice || els.videoDevice.value;
+    els.videoDevice.innerHTML = "";
+    if (data.video && data.video.length > 0) {
+      for (const d of data.video) {
+        const opt = document.createElement("option");
+        opt.value = d.index;
+        opt.textContent = `[${d.index}] ${d.name}`;
+        els.videoDevice.appendChild(opt);
+      }
+      // Restore previous selection if still available.
+      if (currentVideo && [...els.videoDevice.options].some((o) => o.value === currentVideo)) {
+        els.videoDevice.value = currentVideo;
+      }
+    } else {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No video devices found";
+      els.videoDevice.appendChild(opt);
+    }
+
+    // Populate audio device dropdown.
+    const currentAudio = pendingAudioDevice || els.audioDevice.value;
+    els.audioDevice.innerHTML = "";
+    const noneOpt = document.createElement("option");
+    noneOpt.value = "";
+    noneOpt.textContent = "None (use default)";
+    els.audioDevice.appendChild(noneOpt);
+    if (data.audio && data.audio.length > 0) {
+      for (const d of data.audio) {
+        const opt = document.createElement("option");
+        opt.value = d.index;
+        opt.textContent = `[${d.index}] ${d.name}`;
+        els.audioDevice.appendChild(opt);
+      }
+      if (currentAudio && [...els.audioDevice.options].some((o) => o.value === currentAudio)) {
+        els.audioDevice.value = currentAudio;
+      }
+    }
+
+    // Clear pending values after applying.
+    pendingVideoDevice = "";
+    pendingAudioDevice = "";
+
+    // Update status text.
+    const total = (data.video?.length || 0) + (data.audio?.length || 0);
+    if (els.deviceStatus) {
+      els.deviceStatus.textContent = `${total} device${total !== 1 ? "s" : ""} detected (${data.backend}). Plug in a new device and it will appear automatically.`;
+    }
+  } catch (_) {
+    // Silent fail — device scanning is optional.
+  }
+}
+
+// Poll for devices every 5 seconds to detect hot-plug.
+scanDevices();
+setInterval(scanDevices, 5000);
 
 // --- Preview ---
 els.previewToggle?.addEventListener("click", () => {

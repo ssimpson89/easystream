@@ -279,12 +279,17 @@
             </label>
             <label>
               Video device
-              <input id="video-device" autocomplete="off" spellcheck="false" placeholder="e.g. 0, /dev/video0, or device name">
+              <select id="video-device">
+                <option value="">Scanning for devices...</option>
+              </select>
             </label>
             <label>
               Audio device
-              <input id="audio-device" autocomplete="off" spellcheck="false" placeholder="Leave blank to use default">
+              <select id="audio-device">
+                <option value="">None (use default)</option>
+              </select>
             </label>
+            <p class="hint" id="device-status">Devices are auto-detected. Plug in a new device and it will appear here.</p>
           </div>
         </article>
       </section>

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ssimpson89/easystream/internal/devices"
 	"github.com/ssimpson89/easystream/internal/ffmpeg"
 	"github.com/ssimpson89/easystream/internal/hls"
 	"github.com/ssimpson89/easystream/internal/preview"
@@ -34,6 +35,7 @@ type Server struct {
 	supervisor *ffmpeg.Supervisor
 	preview    *preview.Server
 	hlsServer  *hls.Server
+	devScanner *devices.Scanner
 	ytAuth     *youtube.Auth
 	ytClient   *youtube.Client
 	schedStore *schedule.Store
@@ -58,17 +60,23 @@ func NewServer(cfg ServerConfig) *Server {
 		defaultCfg.HLSDir = cfg.HLSServer.Dir()
 	}
 
+	devScanner := devices.NewScanner(defaultCfg.Binary)
+
 	server := &Server{
 		addr:       cfg.Addr,
 		supervisor: supervisor,
 		preview:    prev,
 		hlsServer:  cfg.HLSServer,
+		devScanner: devScanner,
 		ytAuth:     cfg.YTAuth,
 		ytClient:   ytClient,
 		schedStore: cfg.ScheduleStore,
 		logger:     cfg.Logger,
 		config:     defaultCfg,
 	}
+
+	// Initialize preview with the default config so it knows the input source.
+	prev.UpdateConfig(defaultCfg)
 
 	// Create scheduler if we have both YouTube and schedule store.
 	if cfg.ScheduleStore != nil {
@@ -95,6 +103,9 @@ func NewServer(cfg ServerConfig) *Server {
 	mux.HandleFunc("POST /api/config", server.handleConfigUpdate)
 	mux.HandleFunc("POST /api/start", server.handleStart)
 	mux.HandleFunc("POST /api/stop", server.handleStop)
+
+	// Devices.
+	mux.HandleFunc("GET /api/devices", server.handleDevices)
 
 	// Preview.
 	mux.Handle("GET /api/preview", prev)
@@ -255,6 +266,12 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 	s.supervisor.Stop()
 	writeJSON(w, http.StatusOK, s.supervisor.Status())
+}
+
+// --- Device discovery handler ---
+
+func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.devScanner.Scan())
 }
 
 // --- YouTube auth handlers ---
