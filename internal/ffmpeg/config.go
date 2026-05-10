@@ -137,10 +137,22 @@ func (c Config) Args() ([]string, error) {
 		c.Preset.Resolution(), c.Preset.Resolution())
 	// yadif deint=interlaced is a no-op on progressive sources.
 
+	// Encoder settings aligned with YouTube's H.264 recommendations:
+	//   - High profile (CABAC, 8-bit 4:2:0)
+	//   - 2 B-frames, 1 reference frame, progressive scan
+	//   - CBR via -b:v == -maxrate, 2x bufsize for ~2s buffer
+	//   - 2-second keyframe interval (GOP = FPS * 2)
+	//   - Rec.709 color primaries / transfer / matrix for SDR
+	//   - 128 kbps AAC stereo at 48 kHz
+	//
+	// No -tune zerolatency: it disables B-frames, which YouTube explicitly
+	// recommends keeping (2 B-frames). Latency doesn't matter for broadcast
+	// streaming — viewers always have a multi-second buffer.
 	args = append(args,
 		"-c:v", "libx264",
 		"-preset", "veryfast",
-		"-tune", "zerolatency",
+		"-profile:v", "high",
+		"-level:v", "4.1",
 		"-vf", vf,
 		"-b:v", c.Preset.VideoBitrate(),
 		"-maxrate", c.Preset.VideoBitrate(),
@@ -148,8 +160,13 @@ func (c Config) Args() ([]string, error) {
 		"-g", fmt.Sprintf("%d", c.Preset.GOP()),
 		"-keyint_min", fmt.Sprintf("%d", c.Preset.GOP()),
 		"-sc_threshold", "0",
+		"-bf", "2",
+		"-refs", "1",
 		"-pix_fmt", "yuv420p",
 		"-r", fmt.Sprintf("%d", c.Preset.FPS),
+		"-color_primaries", "bt709",
+		"-color_trc", "bt709",
+		"-colorspace", "bt709",
 		"-c:a", "aac",
 		"-b:a", c.Preset.AudioBitrate(),
 		"-ar", "48000",

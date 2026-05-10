@@ -22,10 +22,14 @@ func TestArgsIncludeBandwidthAndRecoveryOptions(t *testing.T) {
 
 	joined := strings.Join(args, " ")
 	for _, expected := range []string{
-		"-b:v 8000k",
-		"-maxrate 8000k",
-		"-bufsize 16000k",
-		"-g 60",
+		"-b:v 10000k",         // YT-recommended 1080p30
+		"-maxrate 10000k",     // CBR
+		"-bufsize 20000k",     // 2x bitrate
+		"-g 60",               // 2-second keyframe interval
+		"-bf 2",               // YT: 2 B-frames
+		"-refs 1",             // YT: 1 reference frame
+		"-profile:v high",     // YT requires High profile for CABAC
+		"-colorspace bt709",   // YT: Rec.709 SDR
 		"-tcp_keepalive 1",
 		"-rw_timeout 12000000",
 		"rtmps://a.rtmps.youtube.com/live2/abc-def-ghi",
