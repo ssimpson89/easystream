@@ -7,7 +7,9 @@ const els = {
   restarts: document.querySelector("#restarts"),
   speed: document.querySelector("#speed"),
   lastMessage: document.querySelector("#last-message"),
-  presetSelect: document.querySelector("#preset-select"),
+  presetTrigger: document.querySelector("#preset-trigger"),
+  presetMenu: document.querySelector("#preset-menu"),
+  presetDropdown: document.querySelector("#preset-dropdown"),
   presetInfoTitle: document.querySelector("#preset-info-title"),
   presetInfoDescription: document.querySelector("#preset-info-description"),
   presetInfoUpload: document.querySelector("#preset-info-upload"),
@@ -188,19 +190,36 @@ function kindForDeviceType(type) {
   }
 }
 
-// --- Presets ---
+// --- Presets (custom card-style dropdown) ---
+function presetTitle(preset) {
+  const fps = preset.fps === 60 ? "60" : "";
+  return `${preset.name} · ${preset.height}p${fps} · ${preset.videoKbps / 1000} Mbps`;
+}
+
 function renderPresets(presets) {
-  if (!els.presetSelect) return;
-  els.presetSelect.innerHTML = "";
+  if (!els.presetMenu) return;
+  els.presetMenu.innerHTML = "";
   for (const preset of presets) {
-    const opt = document.createElement("option");
-    opt.value = preset.id;
-    const fps = preset.fps === 60 ? "60" : "";
-    opt.textContent = `${preset.name} — ${preset.height}p${fps} — ${preset.videoKbps / 1000} Mbps`;
-    els.presetSelect.appendChild(opt);
-  }
-  if ([...els.presetSelect.options].some((o) => o.value === selectedPreset)) {
-    els.presetSelect.value = selectedPreset;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `preset-option ${preset.id === selectedPreset ? "active" : ""}`;
+    btn.dataset.presetId = preset.id;
+    btn.innerHTML = `
+      <strong></strong>
+      <span></span>
+      <span class="preset-upload"></span>
+    `;
+    btn.querySelector("strong").textContent = presetTitle(preset);
+    btn.querySelector("span").textContent = preset.description;
+    btn.querySelector(".preset-upload").textContent = `Upload target: ${preset.uploadTarget}`;
+    btn.addEventListener("click", () => {
+      selectedPreset = preset.id;
+      closePresetMenu();
+      updatePresetDescription(presets);
+      renderPresets(presets); // re-render to update active class
+      showNotice("Preset selected — click Save Settings to apply.");
+    });
+    els.presetMenu.appendChild(btn);
   }
   updatePresetDescription(presets);
 }
@@ -208,23 +227,30 @@ function renderPresets(presets) {
 function updatePresetDescription(presets) {
   const preset = (presets || cachedPresets).find((p) => p.id === selectedPreset);
   if (!preset) return;
-  const fps = preset.fps === 60 ? "60" : "";
-  if (els.presetInfoTitle) {
-    els.presetInfoTitle.textContent =
-      `${preset.name} · ${preset.height}p${fps} · ${preset.videoKbps / 1000} Mbps`;
-  }
-  if (els.presetInfoDescription) {
-    els.presetInfoDescription.textContent = preset.description;
-  }
-  if (els.presetInfoUpload) {
-    els.presetInfoUpload.textContent = `Upload target: ${preset.uploadTarget}`;
-  }
+  if (els.presetInfoTitle) els.presetInfoTitle.textContent = presetTitle(preset);
+  if (els.presetInfoDescription) els.presetInfoDescription.textContent = preset.description;
+  if (els.presetInfoUpload) els.presetInfoUpload.textContent = `Upload target: ${preset.uploadTarget}`;
 }
 
-document.querySelector("#preset-select")?.addEventListener("change", (e) => {
-  selectedPreset = e.target.value;
-  updatePresetDescription(cachedPresets);
-  showNotice("Preset selected — click Save Settings to apply.");
+function openPresetMenu() {
+  els.presetMenu.hidden = false;
+  els.presetTrigger.setAttribute("aria-expanded", "true");
+}
+function closePresetMenu() {
+  els.presetMenu.hidden = true;
+  els.presetTrigger.setAttribute("aria-expanded", "false");
+}
+
+els.presetTrigger?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (els.presetMenu.hidden) openPresetMenu();
+  else closePresetMenu();
+});
+document.addEventListener("click", (e) => {
+  if (!els.presetDropdown.contains(e.target)) closePresetMenu();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closePresetMenu();
 });
 
 // --- State labels ---

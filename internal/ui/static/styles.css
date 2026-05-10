@@ -215,18 +215,74 @@ dd { margin: 4px 0 0; font-size: 24px; font-weight: 740; }
   overflow-wrap: anywhere;
 }
 
-/* --- Preset info card --- */
-.preset-info {
+/* --- Preset dropdown (custom) --- */
+.preset-dropdown {
+  position: relative;
   margin-top: 14px;
+}
+.preset-trigger {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
   padding: 14px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel-2);
   color: var(--text);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s;
 }
-.preset-info strong { display: block; font-size: 15px; margin-bottom: 6px; }
-.preset-info span { display: block; color: var(--muted); font-size: 13px; line-height: 1.5; }
-.preset-info .preset-upload { margin-top: 6px; font-weight: 600; color: var(--text); }
+.preset-trigger:hover { border-color: #6e7681; }
+.preset-trigger[aria-expanded="true"] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.preset-trigger-content { flex: 1; min-width: 0; }
+.preset-trigger strong { display: block; font-size: 15px; margin-bottom: 6px; }
+.preset-trigger span { display: block; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.preset-trigger .preset-upload { margin-top: 6px; font-weight: 600; color: var(--text); }
+.preset-caret {
+  color: var(--muted);
+  font-size: 18px;
+  flex-shrink: 0;
+  transition: transform 0.15s;
+}
+.preset-trigger[aria-expanded="true"] .preset-caret { transform: rotate(180deg); }
+
+.preset-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  max-height: 420px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  padding: 4px;
+}
+.preset-option {
+  display: block;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.preset-option:hover { background: var(--panel-2); border-color: var(--line); }
+.preset-option.active { border-color: var(--accent); background: rgba(47, 129, 247, 0.08); }
+.preset-option strong { display: block; font-size: 15px; margin-bottom: 4px; }
+.preset-option span { display: block; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.preset-option .preset-upload { margin-top: 4px; font-weight: 600; color: var(--text); }
 
 /* --- Forms --- */
 label {

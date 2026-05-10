@@ -77,14 +77,16 @@
           <p class="eyebrow">Step 1</p>
           <h2>Quality tier</h2>
           <p class="hint">Choose the quality that matches your upload speed.</p>
-          <label>
-            Preset
-            <select id="preset-select"></select>
-          </label>
-          <div class="preset-info" id="preset-info">
-            <strong id="preset-info-title">-</strong>
-            <span id="preset-info-description">-</span>
-            <span class="preset-upload" id="preset-info-upload">-</span>
+          <div class="preset-dropdown" id="preset-dropdown">
+            <button type="button" class="preset-trigger" id="preset-trigger" aria-expanded="false">
+              <span class="preset-trigger-content">
+                <strong id="preset-info-title">-</strong>
+                <span id="preset-info-description">-</span>
+                <span class="preset-upload" id="preset-info-upload">-</span>
+              </span>
+              <span class="preset-caret">▾</span>
+            </button>
+            <div class="preset-menu" id="preset-menu" hidden></div>
           </div>
         </article>
 
