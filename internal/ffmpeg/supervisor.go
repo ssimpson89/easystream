@@ -56,6 +56,25 @@ type Supervisor struct {
 	done   chan struct{}
 	ffmpeg Config
 	status Status
+
+	// onRestart is called whenever FFmpeg exits non-cleanly and is about
+	// to be restarted by the supervisor. Used by the adaptive controller
+	// to detect restart storms.
+	onRestart func()
+}
+
+// SetOnRestart installs a callback invoked when FFmpeg restarts.
+func (s *Supervisor) SetOnRestart(fn func()) {
+	s.mu.Lock()
+	s.onRestart = fn
+	s.mu.Unlock()
+}
+
+// CurrentConfig returns a copy of the currently configured FFmpeg config.
+func (s *Supervisor) CurrentConfig() Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ffmpeg
 }
 
 func NewSupervisor(logger *log.Logger, cfg SupervisorConfig) *Supervisor {
@@ -176,7 +195,11 @@ func (s *Supervisor) run(ctx context.Context) {
 		s.status.RestartCount = restarts
 		s.status.LastExit = lastExit
 		s.status.UpdatedAt = time.Now().UTC()
+		onRestart := s.onRestart
 		s.mu.Unlock()
+		if onRestart != nil {
+			onRestart()
+		}
 
 		if restarts > s.cfg.MaxRestarts {
 			s.setExit(StateFailed, lastExit, "FFmpeg crashed too many times")

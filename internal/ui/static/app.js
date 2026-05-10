@@ -42,6 +42,10 @@ const els = {
   schedulesList: document.querySelector("#schedules-list"),
   overridesList: document.querySelector("#overrides-list"),
   deviceStatus: document.querySelector("#device-status"),
+  adaptiveBanner: document.querySelector("#adaptive-banner"),
+  adaptiveBannerTitle: document.querySelector("#adaptive-banner-title"),
+  adaptiveBannerDetail: document.querySelector("#adaptive-banner-detail"),
+  adaptiveEnabled: document.querySelector("#adaptive-enabled"),
   // Preview
   previewToggle: document.querySelector("#preview-toggle"),
   previewContainer: document.querySelector("#preview-container"),
@@ -82,6 +86,7 @@ async function refresh() {
     }
     if (data.youtube) renderYouTubeStatus(data.youtube);
     if (data.nextEvents) renderEvents(data.nextEvents);
+    if (data.adaptive) renderAdaptiveStatus(data.adaptive);
     cachedPresets = data.presets || [];
   } catch (error) {
     els.state.textContent = "Offline";
@@ -368,6 +373,43 @@ els.ytLogin?.addEventListener("click", loginYouTube);
 els.ytLogout?.addEventListener("click", async () => {
   await api("/api/youtube/auth/logout", { method: "POST" });
   await refresh();
+});
+
+// --- Adaptive quality status ---
+let adaptiveEnabledInitialized = false;
+
+function renderAdaptiveStatus(state) {
+  // One-time sync of the toggle to server state.
+  if (!adaptiveEnabledInitialized && els.adaptiveEnabled) {
+    els.adaptiveEnabled.checked = state.enabled;
+    adaptiveEnabledInitialized = true;
+  }
+
+  if (state.isFallback && state.activePreset && state.originalPreset) {
+    const orig = cachedPresets.find((p) => p.id === state.originalPreset) || { name: state.originalPreset };
+    const active = cachedPresets.find((p) => p.id === state.activePreset) || { name: state.activePreset };
+    if (els.adaptiveBanner) {
+      els.adaptiveBanner.hidden = false;
+      els.adaptiveBannerTitle.textContent = `Auto-reduced quality to ${active.name}`;
+      els.adaptiveBannerDetail.textContent =
+        `${state.reason || "Network conditions"} — original target was ${orig.name}. Will restore automatically when stable.`;
+    }
+  } else if (els.adaptiveBanner) {
+    els.adaptiveBanner.hidden = true;
+  }
+}
+
+els.adaptiveEnabled?.addEventListener("change", async (e) => {
+  try {
+    await api("/api/adaptive", {
+      method: "POST",
+      body: JSON.stringify({ enabled: e.target.checked }),
+    });
+    showNotice(e.target.checked ? "Auto-quality enabled" : "Auto-quality disabled");
+  } catch (err) {
+    els.lastMessage.textContent = err.message;
+    e.target.checked = !e.target.checked;
+  }
 });
 
 function renderYouTubeStatus(yt) {

@@ -12,6 +12,9 @@ type Preset struct {
 	VideoKbps    int    `json:"videoKbps"`
 	AudioKbps    int    `json:"audioKbps"`
 	UploadTarget string `json:"uploadTarget"`
+	// AutoOnly hides this preset from the user dropdown. It can still be
+	// selected internally by the adaptive quality controller.
+	AutoOnly bool `json:"autoOnly,omitempty"`
 }
 
 func (p Preset) Resolution() string {
@@ -45,6 +48,7 @@ var Presets = []Preset{
 		VideoKbps:    1500,
 		AudioKbps:    96,
 		UploadTarget: "2.5 Mbps or better",
+		AutoOnly:     true,
 	},
 	{
 		ID:           "low",
@@ -114,4 +118,49 @@ func ByID(id string) (Preset, bool) {
 		}
 	}
 	return Preset{}, false
+}
+
+// Selectable returns presets shown to the user (excludes auto-only fallbacks).
+func Selectable() []Preset {
+	out := make([]Preset, 0, len(Presets))
+	for _, p := range Presets {
+		if !p.AutoOnly {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// IndexOf returns the position of id in Presets, or -1 if not found.
+func IndexOf(id string) int {
+	for i, p := range Presets {
+		if p.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// LowerTier returns the next-lower-bitrate preset, or empty if at the bottom.
+func LowerTier(id string) (Preset, bool) {
+	idx := IndexOf(id)
+	if idx <= 0 {
+		return Preset{}, false
+	}
+	return Presets[idx-1], true
+}
+
+// HigherTier returns the next-higher-bitrate preset that is not AutoOnly,
+// or empty if already at the top. Capped at the original target tier.
+func HigherTier(currentID, capID string) (Preset, bool) {
+	idx := IndexOf(currentID)
+	cap := IndexOf(capID)
+	if idx < 0 || cap < 0 || idx >= cap {
+		return Preset{}, false
+	}
+	next := Presets[idx+1]
+	if next.AutoOnly {
+		return Preset{}, false
+	}
+	return next, true
 }

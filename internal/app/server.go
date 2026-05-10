@@ -33,6 +33,7 @@ type Server struct {
 	addr       string
 	httpServer *http.Server
 	supervisor *ffmpeg.Supervisor
+	adaptive   *ffmpeg.AdaptiveController
 	preview    *preview.Server
 	hlsServer  *hls.Server
 	devScanner *devices.Scanner
@@ -61,10 +62,12 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 
 	devScanner := devices.NewScanner(defaultCfg.Binary)
+	adaptive := ffmpeg.NewAdaptiveController(supervisor, ffmpeg.DefaultAdaptiveConfig(), cfg.Logger)
 
 	server := &Server{
 		addr:       cfg.Addr,
 		supervisor: supervisor,
+		adaptive:   adaptive,
 		preview:    prev,
 		hlsServer:  cfg.HLSServer,
 		devScanner: devScanner,
@@ -74,6 +77,8 @@ func NewServer(cfg ServerConfig) *Server {
 		logger:     cfg.Logger,
 		config:     defaultCfg,
 	}
+	supervisor.SetOnRestart(adaptive.OnRestart)
+	adaptive.Start()
 
 	// Initialize preview with the default config so it knows the input source.
 	prev.UpdateConfig(defaultCfg)
@@ -103,6 +108,7 @@ func NewServer(cfg ServerConfig) *Server {
 	mux.HandleFunc("POST /api/config", server.handleConfigUpdate)
 	mux.HandleFunc("POST /api/start", server.handleStart)
 	mux.HandleFunc("POST /api/stop", server.handleStop)
+	mux.HandleFunc("POST /api/adaptive", server.handleAdaptiveToggle)
 
 	// Devices.
 	mux.HandleFunc("GET /api/devices", server.handleDevices)
@@ -159,6 +165,9 @@ func (s *Server) Close() {
 	if s.scheduler != nil {
 		s.scheduler.Stop()
 	}
+	if s.adaptive != nil {
+		s.adaptive.Stop()
+	}
 }
 
 // --- Stream control handlers ---
@@ -171,8 +180,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	result := map[string]any{
 		"stream":   s.supervisor.Status(),
 		"config":   s.configResponse(config),
-		"presets":  quality.Presets,
+		"presets":  quality.Selectable(),
 		"platform": ffmpeg.PlatformBackend(),
+	}
+	if s.adaptive != nil {
+		result["adaptive"] = s.adaptive.State()
 	}
 	if s.ytAuth != nil {
 		result["youtube"] = s.ytAuth.AuthStatus()
@@ -187,7 +199,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, quality.Presets)
+	writeJSON(w, http.StatusOK, quality.Selectable())
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -257,6 +269,9 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if s.adaptive != nil {
+		s.adaptive.OnStreamStart(config.Preset.ID)
+	}
 	writeJSON(w, http.StatusAccepted, s.supervisor.Status())
 }
 
@@ -265,7 +280,26 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		s.scheduler.StopActive()
 	}
 	s.supervisor.Stop()
+	if s.adaptive != nil {
+		s.adaptive.OnStreamStop()
+	}
 	writeJSON(w, http.StatusOK, s.supervisor.Status())
+}
+
+func (s *Server) handleAdaptiveToggle(w http.ResponseWriter, r *http.Request) {
+	if s.adaptive == nil {
+		writeError(w, http.StatusBadRequest, "adaptive controller not available")
+		return
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.adaptive.SetEnabled(body.Enabled)
+	writeJSON(w, http.StatusOK, s.adaptive.State())
 }
 
 // --- Device discovery handler ---
