@@ -165,11 +165,31 @@ els.copyHlsUrl?.addEventListener("click", () => {
 
 // --- Capture source ---
 function updateCaptureVisibility() {
-  const isTest = els.inputKind.value === "test-video";
+  const kind = els.inputKind.value;
+  const isTest = kind === "test-video";
   els.captureDetails.hidden = isTest;
-}
 
-// inputKind change is handled in the preview section below.
+  if (!isTest) {
+    // Show/hide the backend dropdown based on input kind.
+    // SDI always uses decklink. Webcam/HDMI use the platform backend.
+    const backendLabel = els.inputBackend.closest("label");
+    if (kind === "sdi") {
+      // SDI = DeckLink, no choice needed.
+      backendLabel.hidden = true;
+      els.inputBackend.value = "decklink";
+    } else if (kind === "hdmi") {
+      // HDMI could be DeckLink or platform USB capture — show dropdown
+      // but filter to relevant options.
+      backendLabel.hidden = false;
+    } else {
+      // Webcam — show platform backends, hide decklink.
+      backendLabel.hidden = false;
+      if (els.inputBackend.value === "decklink") {
+        els.inputBackend.value = lastDeviceScan?.backend || "avfoundation";
+      }
+    }
+  }
+}
 
 // --- Presets ---
 function renderPresets(presets) {
@@ -646,16 +666,8 @@ async function scanDevices(forceRefresh) {
   } catch (_) {}
 }
 
-// Auto-switch backend when input kind changes.
-function syncBackendToKind() {
-  const kind = els.inputKind.value;
-  if (kind === "sdi") {
-    els.inputBackend.value = "decklink";
-  } else if (kind !== "test-video" && els.inputBackend.value === "decklink") {
-    // Switching away from SDI — go back to platform default.
-    els.inputBackend.value = lastDeviceScan?.backend || "avfoundation";
-  }
-}
+// syncBackendToKind is now handled inside updateCaptureVisibility.
+function syncBackendToKind() {}
 
 // Poll for devices every 5 seconds.
 scanDevices();
@@ -693,6 +705,8 @@ els.previewToggle?.addEventListener("click", () => {
   previewActive = !previewActive;
   els.previewContainer.hidden = !previewActive;
   els.previewToggle.textContent = previewActive ? "Hide Preview" : "Show Preview";
+  const refreshBtn = document.querySelector("#preview-refresh");
+  if (refreshBtn) refreshBtn.hidden = !previewActive;
   if (previewActive) {
     previewFailed = false;
     hidePreviewError();
@@ -703,18 +717,39 @@ els.previewToggle?.addEventListener("click", () => {
   }
 });
 
+document.querySelector("#preview-refresh")?.addEventListener("click", () => {
+  previewFailed = false;
+  els.previewImg.src = "";
+  hidePreviewError();
+  startPreview();
+});
+
 function startPreview() {
-  if (previewFailed) return; // Don't retry after failure until user changes something.
+  if (previewFailed) return;
   saveConfig().then(() => {
     const img = els.previewImg;
     img.style.display = "";
-    img.src = "/api/preview?" + Date.now();
-    img.onerror = () => {
-      if (previewActive && !previewFailed) {
+    let loaded = false;
+
+    // Set a timeout — if no frame loads within 4 seconds, assume failure.
+    clearTimeout(startPreview._timeout);
+    startPreview._timeout = setTimeout(() => {
+      if (!loaded && previewActive && !previewFailed) {
         previewFailed = true;
         showPreviewError("Could not open capture device. Check that camera permission is granted (System Settings > Privacy & Security > Camera), the device isn't in use by another app, and the correct device is selected.");
       }
+    }, 4000);
+
+    img.onload = () => { loaded = true; };
+    img.onerror = () => {
+      if (previewActive && !previewFailed) {
+        previewFailed = true;
+        clearTimeout(startPreview._timeout);
+        showPreviewError("Could not open capture device. Check that camera permission is granted (System Settings > Privacy & Security > Camera), the device isn't in use by another app, and the correct device is selected.");
+      }
     };
+
+    img.src = "/api/preview?" + Date.now();
   });
 }
 

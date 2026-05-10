@@ -380,6 +380,7 @@ input:focus, select:focus, textarea:focus {
 /* --- Preview --- */
 .preview-panel { margin-bottom: 16px; }
 .preview-bar { display: flex; justify-content: space-between; align-items: center; }
+.preview-buttons { display: flex; gap: 8px; }
 .preview-container { margin-top: 12px; text-align: center; }
 .preview-img {
   width: 100%;
