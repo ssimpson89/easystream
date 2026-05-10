@@ -46,18 +46,22 @@ type Server struct {
 	logger     *log.Logger
 	configPath string // disk persistence for stream config
 
-	mu     sync.Mutex
-	config ffmpeg.Config
+	mu              sync.Mutex
+	config          ffmpeg.Config
+	destinationMode string // UI hint: which destination tab is active
 }
 
-// persistedConfig is a subset of ffmpeg.Config we save across restarts.
-// HLSDir and Binary are recomputed at startup; Network is fixed.
+// persistedConfig is a subset of ffmpeg.Config we save across restarts,
+// plus a few UI-only fields (active destination tab) so the UI restores
+// exactly as the user left it. HLSDir and Binary are recomputed at
+// startup; Network is fixed.
 type persistedConfig struct {
-	PresetID    string             `json:"presetId"`
-	OutputMode  ffmpeg.OutputMode  `json:"outputMode"`
-	IngestURL   string             `json:"ingestUrl"`
-	StreamName  string             `json:"streamName"`
-	Input       ffmpeg.Input       `json:"input"`
+	PresetID        string            `json:"presetId"`
+	OutputMode      ffmpeg.OutputMode `json:"outputMode"`
+	IngestURL       string            `json:"ingestUrl"`
+	StreamName      string            `json:"streamName"`
+	Input           ffmpeg.Input      `json:"input"`
+	DestinationMode string            `json:"destinationMode,omitempty"` // "scheduled" | "now" | "manual"
 }
 
 func loadPersistedConfig(path string) (persistedConfig, error) {
@@ -102,9 +106,11 @@ func NewServer(cfg ServerConfig) *Server {
 		defaultCfg.HLSDir = cfg.HLSServer.Dir()
 	}
 
-	// Load persisted stream config (stream key, preset, input) from disk so
-	// it survives restarts. Falls back to defaults if missing/corrupt.
+	// Load persisted stream config (stream key, preset, input, destination
+	// tab) from disk so it survives restarts. Falls back to defaults if
+	// missing/corrupt.
 	configPath := ""
+	destinationMode := "scheduled" // default tab
 	if cfg.DataDir != "" {
 		configPath = filepath.Join(cfg.DataDir, "stream-config.json")
 		if persisted, err := loadPersistedConfig(configPath); err == nil {
@@ -125,6 +131,9 @@ func NewServer(cfg ServerConfig) *Server {
 			if persisted.Input.Kind != "" {
 				defaultCfg.Input = persisted.Input
 			}
+			if persisted.DestinationMode != "" {
+				destinationMode = persisted.DestinationMode
+			}
 			cfg.Logger.Printf("loaded persisted stream config from %s", configPath)
 		}
 	}
@@ -133,18 +142,19 @@ func NewServer(cfg ServerConfig) *Server {
 	adaptive := ffmpeg.NewAdaptiveController(supervisor, ffmpeg.DefaultAdaptiveConfig(), cfg.Logger)
 
 	server := &Server{
-		addr:       cfg.Addr,
-		supervisor: supervisor,
-		adaptive:   adaptive,
-		preview:    prev,
-		hlsServer:  cfg.HLSServer,
-		devScanner: devScanner,
-		ytAuth:     cfg.YTAuth,
-		ytClient:   ytClient,
-		schedStore: cfg.ScheduleStore,
-		logger:     cfg.Logger,
-		configPath: configPath,
-		config:     defaultCfg,
+		addr:            cfg.Addr,
+		supervisor:      supervisor,
+		adaptive:        adaptive,
+		preview:         prev,
+		hlsServer:       cfg.HLSServer,
+		devScanner:      devScanner,
+		ytAuth:          cfg.YTAuth,
+		ytClient:        ytClient,
+		schedStore:      cfg.ScheduleStore,
+		logger:          cfg.Logger,
+		configPath:      configPath,
+		config:          defaultCfg,
+		destinationMode: destinationMode,
 	}
 	supervisor.SetOnRestart(adaptive.OnRestart)
 	adaptive.Start()

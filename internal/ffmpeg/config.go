@@ -134,9 +134,16 @@ func (c Config) Args() ([]string, error) {
 	args = append(args, "-map", inputs.videoMap, "-map", inputs.audioMap)
 
 	// Build video filter chain. SDI/DeckLink sources may be interlaced
-	// so we auto-deinterlace with yadif and scale to the target resolution.
-	vf := fmt.Sprintf("yadif=deint=interlaced,scale=%s:force_original_aspect_ratio=decrease,pad=%s:-1:-1:color=black",
-		c.Preset.Resolution(), c.Preset.Resolution())
+	// so we auto-deinterlace with yadif, then scale + pad to the target
+	// resolution preserving aspect ratio.
+	//
+	// scale/pad accept W:H (colon-separated) — NOT W x H. The pad filter
+	// in particular doesn't recognise "1920x1080" as a dimension pair.
+	vf := fmt.Sprintf(
+		"yadif=deint=interlaced,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black",
+		c.Preset.Width, c.Preset.Height,
+		c.Preset.Width, c.Preset.Height,
+	)
 	// yadif deint=interlaced is a no-op on progressive sources.
 
 	// Encoder settings aligned with YouTube's H.264 recommendations:

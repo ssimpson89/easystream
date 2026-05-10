@@ -180,6 +180,9 @@ func (s *Supervisor) run(ctx context.Context) {
 	}()
 
 	restarts := 0
+	quickFailures := 0 // consecutive attempts that died within quickFailWindow
+	const quickFailWindow = 5 * time.Second
+	const quickFailLimit = 2 // 2 consecutive fast deaths = destination is rejecting us
 	delay := s.cfg.RestartInitialDelay
 	for {
 		started := time.Now()
@@ -190,7 +193,16 @@ func (s *Supervisor) run(ctx context.Context) {
 		}
 
 		restarts++
+		elapsed := time.Since(started)
 		lastExit := exitMessage(err)
+		// Detect rapid back-to-back failures: an auth/connection rejection
+		// (wrong stream key, ingest URL, disabled live input) makes FFmpeg
+		// die within seconds. Network/encoder issues take longer.
+		if elapsed < quickFailWindow {
+			quickFailures++
+		} else {
+			quickFailures = 0
+		}
 		s.mu.Lock()
 		s.status.RestartCount = restarts
 		s.status.LastExit = lastExit
@@ -201,12 +213,18 @@ func (s *Supervisor) run(ctx context.Context) {
 			onRestart()
 		}
 
+		if quickFailures >= quickFailLimit {
+			s.setExit(StateFailed, lastExit,
+				"Destination rejected the connection. Check your stream key and ingest URL — "+
+					"verify the live input is active in your dashboard, then click Go Live again.")
+			return
+		}
 		if restarts > s.cfg.MaxRestarts {
 			s.setExit(StateFailed, lastExit, "FFmpeg crashed too many times")
 			return
 		}
 
-		if time.Since(started) >= s.cfg.StableAfter {
+		if elapsed >= s.cfg.StableAfter {
 			delay = s.cfg.RestartInitialDelay
 		}
 
@@ -283,14 +301,46 @@ func (s *Supervisor) recordLogs(r io.Reader) {
 		if line == "" {
 			continue
 		}
+		hint := classifyFFmpegError(line)
 		s.mu.Lock()
 		s.status.LastLogLine = line
+		if hint != "" {
+			s.status.LastError = hint
+		}
 		s.status.UpdatedAt = time.Now().UTC()
 		s.mu.Unlock()
 		if s.logger != nil {
 			s.logger.Printf("ffmpeg: %s", line)
 		}
 	}
+}
+
+// classifyFFmpegError pattern-matches known fatal FFmpeg messages and returns
+// a volunteer-friendly explanation. Empty string means "no useful hint".
+func classifyFFmpegError(line string) string {
+	l := strings.ToLower(line)
+	switch {
+	case strings.Contains(l, "tls") && strings.Contains(l, "broken pipe"),
+		strings.Contains(l, "rtmp_sendpacket") && strings.Contains(l, "broken pipe"),
+		strings.Contains(l, "rtmp server sent error"),
+		strings.Contains(l, "rtmp_connect"):
+		return "Destination rejected the connection. Verify your stream key and ingest URL."
+	case strings.Contains(l, "no such file or directory") && strings.Contains(l, "input"):
+		return "Capture device not found. Plug it in or pick a different source."
+	case strings.Contains(l, "permission denied"),
+		strings.Contains(l, "operation not permitted"):
+		return "Permission denied. On macOS, grant camera/microphone access in System Settings > Privacy."
+	case strings.Contains(l, "device or resource busy"),
+		strings.Contains(l, "device i/o error"),
+		strings.Contains(l, "no av capture device"):
+		return "Capture device is busy or unavailable. Close other apps using it (FaceTime, Zoom, OBS)."
+	case strings.Contains(l, "connection refused"):
+		return "Could not reach the destination. Check the ingest URL and your internet connection."
+	case strings.Contains(l, "connection timed out"),
+		strings.Contains(l, "timeout"):
+		return "Connection to the destination timed out. Check your internet."
+	}
+	return ""
 }
 
 func (s *Supervisor) setRestarting(lastExit string, delay time.Duration) {
