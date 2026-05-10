@@ -7,7 +7,8 @@ const els = {
   restarts: document.querySelector("#restarts"),
   speed: document.querySelector("#speed"),
   lastMessage: document.querySelector("#last-message"),
-  presets: document.querySelector("#presets"),
+  presetSelect: document.querySelector("#preset-select"),
+  presetDescription: document.querySelector("#preset-description"),
   start: document.querySelector("#start"),
   stop: document.querySelector("#stop"),
   save: document.querySelector("#save-config"),
@@ -187,23 +188,36 @@ function kindForDeviceType(type) {
 
 // --- Presets ---
 function renderPresets(presets) {
-  els.presets.innerHTML = "";
+  if (!els.presetSelect) return;
+  els.presetSelect.innerHTML = "";
   for (const preset of presets) {
-    const button = document.createElement("button");
-    button.className = `preset ${preset.id === selectedPreset ? "active" : ""}`;
-    const fpsLabel = preset.fps === 60 ? "60" : "";
-    button.innerHTML = `
-      <strong>${preset.name} &middot; ${preset.height}p${fpsLabel} &middot; ${preset.videoKbps / 1000} Mbps</strong>
-      <span>${preset.description} Upload: ${preset.uploadTarget}.</span>
-    `;
-    button.addEventListener("click", () => {
-      selectedPreset = preset.id;
-      renderPresets(presets);
-      showNotice("Preset selected — click Save Settings to apply.");
-    });
-    els.presets.appendChild(button);
+    const opt = document.createElement("option");
+    opt.value = preset.id;
+    const fps = preset.fps === 60 ? "60" : "";
+    opt.textContent = `${preset.name} — ${preset.height}p${fps} — ${preset.videoKbps / 1000} Mbps`;
+    els.presetSelect.appendChild(opt);
   }
+  if ([...els.presetSelect.options].some((o) => o.value === selectedPreset)) {
+    els.presetSelect.value = selectedPreset;
+  }
+  updatePresetDescription(presets);
 }
+
+function updatePresetDescription(presets) {
+  if (!els.presetDescription) return;
+  const preset = (presets || cachedPresets).find((p) => p.id === selectedPreset);
+  if (!preset) {
+    els.presetDescription.textContent = "";
+    return;
+  }
+  els.presetDescription.textContent = `${preset.description} Upload target: ${preset.uploadTarget}.`;
+}
+
+document.querySelector("#preset-select")?.addEventListener("change", (e) => {
+  selectedPreset = e.target.value;
+  updatePresetDescription(cachedPresets);
+  showNotice("Preset selected — click Save Settings to apply.");
+});
 
 // --- State labels ---
 function labelState(state) {
