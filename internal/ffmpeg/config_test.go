@@ -30,6 +30,7 @@ func TestArgsIncludeBandwidthAndRecoveryOptions(t *testing.T) {
 		"-refs 1",             // YT: 1 reference frame
 		"-profile:v high",     // YT requires High profile for CABAC
 		"-colorspace bt709",   // YT: Rec.709 SDR
+		"open-gop=0",          // Cloudflare requires closed GOP
 		"-tcp_keepalive 1",
 		"-rw_timeout 12000000",
 		"rtmps://a.rtmps.youtube.com/live2/abc-def-ghi",

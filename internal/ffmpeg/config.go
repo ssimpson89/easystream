@@ -171,6 +171,10 @@ func (c Config) Args() ([]string, error) {
 		"-sc_threshold", "0",
 		"-bf", "2",
 		"-refs", "1",
+		// Closed GOP: every keyframe is IDR and no frame references across
+		// keyframe boundaries. x264 default but explicit is safer. Required
+		// by Cloudflare Stream; preferred by YouTube/Twitch/etc.
+		"-x264-params", "open-gop=0",
 		"-pix_fmt", "yuv420p",
 		"-r", fmt.Sprintf("%d", c.Preset.FPS),
 		"-color_primaries", "bt709",

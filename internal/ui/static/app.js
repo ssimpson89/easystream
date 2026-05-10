@@ -11,7 +11,6 @@ const els = {
   presetMenu: document.querySelector("#preset-menu"),
   presetDropdown: document.querySelector("#preset-dropdown"),
   presetInfoTitle: document.querySelector("#preset-info-title"),
-  presetInfoDescription: document.querySelector("#preset-info-description"),
   presetInfoUpload: document.querySelector("#preset-info-upload"),
   start: document.querySelector("#start"),
   stop: document.querySelector("#stop"),
@@ -294,12 +293,10 @@ function renderPresets(presets) {
     btn.dataset.presetId = preset.id;
     btn.innerHTML = `
       <strong></strong>
-      <span></span>
       <span class="preset-upload"></span>
     `;
     btn.querySelector("strong").textContent = presetTitle(preset);
-    btn.querySelector("span").textContent = preset.description;
-    btn.querySelector(".preset-upload").textContent = `Upload target: ${preset.uploadTarget}`;
+    btn.querySelector(".preset-upload").textContent = `Min upload speed: ${preset.uploadTarget}`;
     btn.addEventListener("click", () => {
       selectedPreset = preset.id;
       closePresetMenu();
@@ -316,8 +313,7 @@ function updatePresetDescription(presets) {
   const preset = (presets || cachedPresets).find((p) => p.id === selectedPreset);
   if (!preset) return;
   if (els.presetInfoTitle) els.presetInfoTitle.textContent = presetTitle(preset);
-  if (els.presetInfoDescription) els.presetInfoDescription.textContent = preset.description;
-  if (els.presetInfoUpload) els.presetInfoUpload.textContent = `Upload target: ${preset.uploadTarget}`;
+  if (els.presetInfoUpload) els.presetInfoUpload.textContent = `Min upload speed: ${preset.uploadTarget}`;
 }
 
 function openPresetMenu() {
