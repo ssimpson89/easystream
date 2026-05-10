@@ -2,6 +2,8 @@ package ffmpeg
 
 import (
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,15 +22,16 @@ import (
 //   - StableForRecovery: must be healthy for this long before stepping UP.
 //   - MaxDowngrades: hard cap to prevent endless flapping.
 type AdaptiveConfig struct {
-	Enabled            bool
-	DropRateThreshold  float64       // 0.03 = 3% of frames dropped
-	DropWindow         time.Duration // must sustain for this long
-	StartupGrace       time.Duration
-	DowngradeCooldown  time.Duration
-	StableForRecovery  time.Duration
-	MaxDowngrades      int
-	RestartRateWindow  time.Duration
-	RestartRateMax     int
+	Enabled           bool
+	DropRateThreshold float64       // 0.03 = 3% of frames dropped
+	DropWindow        time.Duration // must sustain for this long
+	SpeedThreshold    float64       // 0.92 = sustained below 92% real-time = network congestion
+	StartupGrace      time.Duration
+	DowngradeCooldown time.Duration
+	StableForRecovery time.Duration
+	MaxDowngrades     int
+	RestartRateWindow time.Duration
+	RestartRateMax    int
 }
 
 // DefaultAdaptiveConfig returns conservative defaults that match industry
@@ -38,6 +41,7 @@ func DefaultAdaptiveConfig() AdaptiveConfig {
 		Enabled:           true,
 		DropRateThreshold: 0.03,             // 3% — significantly above ideal (0%) and worrying (2%)
 		DropWindow:        60 * time.Second, // must be bad for a full minute
+		SpeedThreshold:    0.92,             // <92% real-time for 60s = TCP send buffer full
 		StartupGrace:      60 * time.Second,
 		DowngradeCooldown: 5 * time.Minute,
 		StableForRecovery: 10 * time.Minute,
@@ -92,9 +96,10 @@ type AdaptiveController struct {
 }
 
 type dropSample struct {
-	at       time.Time
-	frame    int
-	dropped  int
+	at      time.Time
+	frame   int
+	dropped int
+	speed   float64 // playback speed (1.0 = real-time)
 }
 
 // NewAdaptiveController creates a controller for the given supervisor.
@@ -249,10 +254,11 @@ func (a *AdaptiveController) tick() {
 	a.sampleProgress(status.LastProgress)
 
 	dropping := a.isPersistentDrop()
+	slow := a.isPersistentlySlow()
 	stalling := status.State == StateDegraded
 	restartStorm := a.hasRestartStorm()
 
-	if dropping || stalling || restartStorm {
+	if dropping || slow || stalling || restartStorm {
 		reason := ""
 		switch {
 		case stalling:
@@ -261,6 +267,8 @@ func (a *AdaptiveController) tick() {
 			reason = "Stream restarted repeatedly — network unstable"
 		case dropping:
 			reason = "Sustained dropped frames detected"
+		case slow:
+			reason = "Encoder falling behind real-time (upload bandwidth limited)"
 		}
 		a.handleDegradation(reason)
 		return
@@ -278,7 +286,6 @@ func (a *AdaptiveController) sampleProgress(p Progress) {
 	if p.UpdatedAt.IsZero() {
 		return
 	}
-	// Avoid duplicate samples.
 	if n := len(a.dropSamples); n > 0 && a.dropSamples[n-1].at.Equal(p.UpdatedAt) {
 		return
 	}
@@ -286,6 +293,7 @@ func (a *AdaptiveController) sampleProgress(p Progress) {
 		at:      p.UpdatedAt,
 		frame:   p.Frame,
 		dropped: p.Dropped,
+		speed:   parseSpeed(p.Speed),
 	})
 	cutoff := time.Now().Add(-a.cfg.DropWindow)
 	idx := 0
@@ -296,6 +304,45 @@ func (a *AdaptiveController) sampleProgress(p Progress) {
 		}
 	}
 	a.dropSamples = a.dropSamples[idx:]
+}
+
+// isPersistentlySlow returns true if the encoder has been running below
+// SpeedThreshold for the full DropWindow. For RTMP this signals that the
+// TCP send buffer is full because the network can't keep up.
+func (a *AdaptiveController) isPersistentlySlow() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if len(a.dropSamples) < 4 {
+		return false
+	}
+	first := a.dropSamples[0]
+	last := a.dropSamples[len(a.dropSamples)-1]
+	if last.at.Sub(first.at) < a.cfg.DropWindow-(5*time.Second) {
+		return false
+	}
+	// All samples must be below the threshold. A single recovery moment
+	// resets the timer — we want sustained, not flapping.
+	for _, s := range a.dropSamples {
+		if s.speed <= 0 || s.speed >= a.cfg.SpeedThreshold {
+			return false
+		}
+	}
+	return true
+}
+
+// parseSpeed parses FFmpeg's speed string ("1.05x", "0.92x", "N/A") into a float.
+// Returns 0 if unparseable.
+func parseSpeed(s string) float64 {
+	s = strings.TrimSpace(strings.TrimSuffix(s, "x"))
+	if s == "" || s == "N/A" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 // isPersistentDrop returns true if the drop rate has been above the

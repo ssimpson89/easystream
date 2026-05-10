@@ -21,10 +21,15 @@ var (
 )
 
 // Server streams a low-res MJPEG preview from the capture source.
+// macOS avfoundation locks a capture device to one process, so when the
+// main stream is running on a real capture (not the test pattern) the
+// preview must release the device. Block() / Unblock() control that.
 type Server struct {
-	mu     sync.Mutex
-	logger *log.Logger
-	config ffmpeg.Config
+	mu           sync.Mutex
+	logger       *log.Logger
+	config       ffmpeg.Config
+	blocked      bool
+	activeCancel context.CancelFunc // currently running preview, if any
 }
 
 func NewServer(logger *log.Logger) *Server {
@@ -37,13 +42,61 @@ func (s *Server) UpdateConfig(config ffmpeg.Config) {
 	s.mu.Unlock()
 }
 
+// Block prevents the preview from starting FFmpeg and cancels any in-flight
+// preview stream so the main stream can claim the capture device.
+func (s *Server) Block() {
+	s.mu.Lock()
+	s.blocked = true
+	c := s.activeCancel
+	s.activeCancel = nil
+	s.mu.Unlock()
+	if c != nil {
+		c()
+	}
+}
+
+// Unblock allows preview FFmpeg processes to start again.
+func (s *Server) Unblock() {
+	s.mu.Lock()
+	s.blocked = false
+	s.mu.Unlock()
+}
+
+// IsBlocked reports whether previews are currently disallowed.
+func (s *Server) IsBlocked() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.blocked
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	config := s.config
+	if s.blocked {
+		s.mu.Unlock()
+		http.Error(w, "preview paused while stream is live", http.StatusServiceUnavailable)
+		return
+	}
 	s.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+
+	// Register this preview so Block() can interrupt it. If another preview
+	// is already running, cancel that one first (we only allow one at a time).
+	s.mu.Lock()
+	if prev := s.activeCancel; prev != nil {
+		prev()
+	}
+	s.activeCancel = cancel
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.activeCancel != nil {
+			s.activeCancel = nil
+		}
+		s.mu.Unlock()
+	}()
 
 	binary := config.Binary
 	if binary == "" {

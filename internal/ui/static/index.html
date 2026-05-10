@@ -39,10 +39,15 @@
 
       <!-- Stream status -->
       <section class="panel primary">
+        <div id="problem-banner" class="problem-banner" hidden>
+          <strong id="problem-banner-title"></strong>
+          <span id="problem-banner-detail"></span>
+        </div>
         <div class="panel-header">
           <div>
             <p class="eyebrow">Stream status</p>
             <h2 id="status-title">Checking status...</h2>
+            <p id="start-reason" class="hint start-reason" hidden></p>
           </div>
           <div class="actions">
             <button id="start" class="button go-button" disabled>Go Live</button>
@@ -304,10 +309,7 @@
         </article>
       </section>
 
-      <div class="save-bar">
-        <button id="save-config" class="button save-button">Save Settings</button>
-        <span id="save-notice" class="save-notice"></span>
-      </div>
+      <div id="save-notice" class="save-toast"></div>
     </main>
     <script src="/app.js"></script>
   </body>

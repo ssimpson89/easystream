@@ -129,7 +129,9 @@ func (c Config) Args() ([]string, error) {
 		"-stats_period", "1",
 	}
 
-	args = append(args, c.inputArgs()...)
+	inputs := c.buildInputs()
+	args = append(args, inputs.args...)
+	args = append(args, "-map", inputs.videoMap, "-map", inputs.audioMap)
 
 	// Build video filter chain. SDI/DeckLink sources may be interlaced
 	// so we auto-deinterlace with yadif and scale to the target resolution.
@@ -196,57 +198,108 @@ func (c Config) Args() ([]string, error) {
 	return args, nil
 }
 
-func (c Config) inputArgs() []string {
-	switch c.Input.Kind {
-	case InputTestVideo:
-		return []string{
-			"-re",
-			"-f", "lavfi",
-			"-i", fmt.Sprintf("testsrc2=size=%s:rate=%d", c.Preset.Resolution(), c.Preset.FPS),
-			"-f", "lavfi",
-			"-i", "sine=frequency=1000:sample_rate=48000",
-			"-shortest",
-		}
-	case InputWebcam, InputHDMI:
-		return captureArgs(c.Input, c.Preset)
-	case InputSDI:
-		if c.Input.Backend == "" {
-			input := c.Input
-			input.Backend = "decklink"
-			return captureArgs(input, c.Preset)
-		}
-		return captureArgs(c.Input, c.Preset)
-	default:
-		return captureArgs(c.Input, c.Preset)
-	}
+// inputBuild describes the constructed FFmpeg inputs and how to map them.
+type inputBuild struct {
+	args     []string // -f / -i / etc. for each input
+	videoMap string   // e.g. "0:v" or "0:v:0"
+	audioMap string   // e.g. "0:a" or "1:a"
 }
 
-// captureArgs builds FFmpeg input arguments for a capture device.
-// No framerate or resolution is forced on the device — FFmpeg auto-negotiates
-// with the hardware. The output encoding flags (-r, -s) handle conversion.
-func captureArgs(input Input, preset quality.Preset) []string {
-	backend := defaultString(input.Backend, "avfoundation")
+const silentAudio = "anullsrc=channel_layout=stereo:sample_rate=48000"
+
+// buildInputs constructs FFmpeg input flags. When the capture source has no
+// audio (or audio isn't applicable), it adds a silent audio track as a
+// second input. RTMP streams require an audio track; YouTube rejects video-
+// only streams.
+func (c Config) buildInputs() inputBuild {
+	if c.Input.Kind == InputTestVideo {
+		return inputBuild{
+			args: []string{
+				"-re",
+				"-f", "lavfi",
+				"-i", fmt.Sprintf("testsrc2=size=%s:rate=%d", c.Preset.Resolution(), c.Preset.FPS),
+				"-f", "lavfi",
+				"-i", "sine=frequency=1000:sample_rate=48000",
+			},
+			videoMap: "0:v",
+			audioMap: "1:a",
+		}
+	}
+
+	backend := defaultString(c.Input.Backend, PlatformBackend())
+	if c.Input.Kind == InputSDI && backend != "decklink" {
+		backend = "decklink"
+	}
+
 	switch backend {
 	case "avfoundation":
-		device := input.VideoDevice
-		if input.AudioDevice != "" {
-			device = device + ":" + input.AudioDevice
+		device := c.Input.VideoDevice
+		if c.Input.AudioDevice != "" {
+			// Both video and audio in one avfoundation input.
+			return inputBuild{
+				args:     []string{"-f", "avfoundation", "-i", device + ":" + c.Input.AudioDevice},
+				videoMap: "0:v", audioMap: "0:a",
+			}
 		}
-		return []string{"-f", "avfoundation", "-i", device}
+		// Video only; mix in a silent audio track.
+		return inputBuild{
+			args: []string{
+				"-f", "avfoundation", "-i", device + ":none",
+				"-f", "lavfi", "-i", silentAudio,
+			},
+			videoMap: "0:v", audioMap: "1:a",
+		}
+
 	case "dshow":
-		device := "video=" + input.VideoDevice
-		if input.AudioDevice != "" {
-			device = device + ":audio=" + input.AudioDevice
+		device := "video=" + c.Input.VideoDevice
+		if c.Input.AudioDevice != "" {
+			return inputBuild{
+				args:     []string{"-f", "dshow", "-i", device + ":audio=" + c.Input.AudioDevice},
+				videoMap: "0:v", audioMap: "0:a",
+			}
 		}
-		return []string{"-f", "dshow", "-i", device}
+		return inputBuild{
+			args: []string{
+				"-f", "dshow", "-i", device,
+				"-f", "lavfi", "-i", silentAudio,
+			},
+			videoMap: "0:v", audioMap: "1:a",
+		}
+
 	case "v4l2":
-		return []string{"-f", "v4l2", "-i", input.VideoDevice}
+		// v4l2 is video-only. Audio comes from ALSA (separate input) or silent.
+		if c.Input.AudioDevice != "" {
+			return inputBuild{
+				args: []string{
+					"-f", "v4l2", "-i", c.Input.VideoDevice,
+					"-f", "alsa", "-i", c.Input.AudioDevice,
+				},
+				videoMap: "0:v", audioMap: "1:a",
+			}
+		}
+		return inputBuild{
+			args: []string{
+				"-f", "v4l2", "-i", c.Input.VideoDevice,
+				"-f", "lavfi", "-i", silentAudio,
+			},
+			videoMap: "0:v", audioMap: "1:a",
+		}
+
 	case "decklink":
-		// DeckLink auto-detects the input signal format and framerate.
-		// Audio is embedded in the SDI signal. Device name comes from -list_devices.
-		return []string{"-f", "decklink", "-audio_input", "embedded", "-i", input.VideoDevice}
+		// SDI carries embedded audio in the same signal.
+		return inputBuild{
+			args:     []string{"-f", "decklink", "-audio_input", "embedded", "-i", c.Input.VideoDevice},
+			videoMap: "0:v", audioMap: "0:a",
+		}
+
 	default:
-		return []string{"-f", backend, "-i", input.VideoDevice}
+		return inputBuild{
+			args: []string{
+				"-f", backend, "-i", c.Input.VideoDevice,
+				"-f", "lavfi", "-i", silentAudio,
+			},
+			videoMap: "0:v", audioMap: "1:a",
+		}
 	}
 }
 

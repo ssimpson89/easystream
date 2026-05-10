@@ -5,6 +5,8 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -42,9 +44,48 @@ type Server struct {
 	schedStore *schedule.Store
 	scheduler  *schedule.Scheduler
 	logger     *log.Logger
+	configPath string // disk persistence for stream config
 
 	mu     sync.Mutex
 	config ffmpeg.Config
+}
+
+// persistedConfig is a subset of ffmpeg.Config we save across restarts.
+// HLSDir and Binary are recomputed at startup; Network is fixed.
+type persistedConfig struct {
+	PresetID    string             `json:"presetId"`
+	OutputMode  ffmpeg.OutputMode  `json:"outputMode"`
+	IngestURL   string             `json:"ingestUrl"`
+	StreamName  string             `json:"streamName"`
+	Input       ffmpeg.Input       `json:"input"`
+}
+
+func loadPersistedConfig(path string) (persistedConfig, error) {
+	var p persistedConfig
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return p, err
+	}
+	err = json.Unmarshal(data, &p)
+	return p, err
+}
+
+func savePersistedConfig(path string, cfg ffmpeg.Config) error {
+	p := persistedConfig{
+		PresetID:   cfg.Preset.ID,
+		OutputMode: cfg.OutputMode,
+		IngestURL:  cfg.IngestURL,
+		StreamName: cfg.StreamName,
+		Input:      cfg.Input,
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -61,6 +102,33 @@ func NewServer(cfg ServerConfig) *Server {
 		defaultCfg.HLSDir = cfg.HLSServer.Dir()
 	}
 
+	// Load persisted stream config (stream key, preset, input) from disk so
+	// it survives restarts. Falls back to defaults if missing/corrupt.
+	configPath := ""
+	if cfg.DataDir != "" {
+		configPath = filepath.Join(cfg.DataDir, "stream-config.json")
+		if persisted, err := loadPersistedConfig(configPath); err == nil {
+			if persisted.PresetID != "" {
+				if preset, ok := quality.ByID(persisted.PresetID); ok {
+					defaultCfg.Preset = preset
+				}
+			}
+			if persisted.OutputMode != "" {
+				defaultCfg.OutputMode = persisted.OutputMode
+			}
+			if persisted.IngestURL != "" {
+				defaultCfg.IngestURL = persisted.IngestURL
+			}
+			if persisted.StreamName != "" {
+				defaultCfg.StreamName = persisted.StreamName
+			}
+			if persisted.Input.Kind != "" {
+				defaultCfg.Input = persisted.Input
+			}
+			cfg.Logger.Printf("loaded persisted stream config from %s", configPath)
+		}
+	}
+
 	devScanner := devices.NewScanner(defaultCfg.Binary)
 	adaptive := ffmpeg.NewAdaptiveController(supervisor, ffmpeg.DefaultAdaptiveConfig(), cfg.Logger)
 
@@ -75,6 +143,7 @@ func NewServer(cfg ServerConfig) *Server {
 		ytClient:   ytClient,
 		schedStore: cfg.ScheduleStore,
 		logger:     cfg.Logger,
+		configPath: configPath,
 		config:     defaultCfg,
 	}
 	supervisor.SetOnRestart(adaptive.OnRestart)
@@ -252,6 +321,11 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	s.preview.UpdateConfig(s.config)
 	config := s.config
 	s.mu.Unlock()
+	if s.configPath != "" {
+		if err := savePersistedConfig(s.configPath, config); err != nil {
+			s.logger.Printf("failed to persist stream config: %v", err)
+		}
+	}
 	writeJSON(w, http.StatusOK, s.configResponse(config))
 }
 
@@ -265,7 +339,17 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		_ = s.hlsServer.Clean()
 	}
 
+	// Release the capture device from the preview before the main stream
+	// claims it. On macOS, only one process can hold a camera at a time.
+	if s.preview != nil && config.Input.Kind != ffmpeg.InputTestVideo {
+		s.preview.Block()
+	}
+
 	if err := s.supervisor.Start(config); err != nil {
+		// Unblock so the preview can resume if start failed.
+		if s.preview != nil {
+			s.preview.Unblock()
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -282,6 +366,9 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	s.supervisor.Stop()
 	if s.adaptive != nil {
 		s.adaptive.OnStreamStop()
+	}
+	if s.preview != nil {
+		s.preview.Unblock()
 	}
 	writeJSON(w, http.StatusOK, s.supervisor.Status())
 }
@@ -433,7 +520,13 @@ func (s *Server) handleGoLiveNow(w http.ResponseWriter, r *http.Request) {
 	startConfig := s.config
 	s.mu.Unlock()
 
+	if s.preview != nil && startConfig.Input.Kind != ffmpeg.InputTestVideo {
+		s.preview.Block()
+	}
 	if err := s.supervisor.Start(startConfig); err != nil {
+		if s.preview != nil {
+			s.preview.Unblock()
+		}
 		writeError(w, http.StatusBadRequest, "start ffmpeg: "+err.Error())
 		return
 	}
@@ -484,6 +577,9 @@ func (s *Server) handleCompleteBroadcast(w http.ResponseWriter, r *http.Request)
 
 	// Stop FFmpeg first.
 	s.supervisor.Stop()
+	if s.preview != nil {
+		s.preview.Unblock()
+	}
 
 	if body.BroadcastID != "" {
 		if err := s.ytClient.TransitionBroadcast(body.BroadcastID, "complete"); err != nil {
@@ -647,11 +743,23 @@ func (a *streamControllerAdapter) StartWithIngest(presetID, ingestURL, streamKey
 	a.server.config.StreamName = streamKey
 	config := a.server.config
 	a.server.mu.Unlock()
-	return a.server.supervisor.Start(config)
+	if a.server.preview != nil && config.Input.Kind != ffmpeg.InputTestVideo {
+		a.server.preview.Block()
+	}
+	if err := a.server.supervisor.Start(config); err != nil {
+		if a.server.preview != nil {
+			a.server.preview.Unblock()
+		}
+		return err
+	}
+	return nil
 }
 
 func (a *streamControllerAdapter) StopStream() {
 	a.server.supervisor.Stop()
+	if a.server.preview != nil {
+		a.server.preview.Unblock()
+	}
 }
 
 func (a *streamControllerAdapter) IsStreaming() bool {

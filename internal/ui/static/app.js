@@ -15,8 +15,11 @@ const els = {
   presetInfoUpload: document.querySelector("#preset-info-upload"),
   start: document.querySelector("#start"),
   stop: document.querySelector("#stop"),
-  save: document.querySelector("#save-config"),
+  startReason: document.querySelector("#start-reason"),
   saveNotice: document.querySelector("#save-notice"),
+  problemBanner: document.querySelector("#problem-banner"),
+  problemBannerTitle: document.querySelector("#problem-banner-title"),
+  problemBannerDetail: document.querySelector("#problem-banner-detail"),
   ingestURL: document.querySelector("#ingest-url"),
   streamName: document.querySelector("#stream-name"),
   videoSource: document.querySelector("#video-source"),
@@ -111,7 +114,27 @@ function renderStatus(data) {
   els.lastMessage.textContent =
     stream.lastError || stream.lastExit || stream.lastLogLine || "No stream activity yet.";
 
+  renderProblemBanner(stream);
   updateButtonStates(stream.state);
+}
+
+function renderProblemBanner(stream) {
+  if (!els.problemBanner) return;
+  const problemStates = { degraded: true, restarting: true, failed: true };
+  if (!problemStates[stream.state]) {
+    els.problemBanner.hidden = true;
+    return;
+  }
+  els.problemBanner.hidden = false;
+  els.problemBanner.className = `problem-banner ${stream.state}`;
+  const titles = {
+    degraded: "Stream needs attention",
+    restarting: "Reconnecting to ingest...",
+    failed: "Stream failed",
+  };
+  els.problemBannerTitle.textContent = titles[stream.state] || "Stream issue";
+  els.problemBannerDetail.textContent =
+    stream.lastError || stream.lastExit || stream.lastLogLine || "Check your network and capture source.";
 }
 
 function loadConfigIntoForm(config, presets) {
@@ -140,11 +163,71 @@ function setPlatformDefault(_platform) {
   // No-op: backend is now auto-determined from the selected device.
 }
 
+// destinationReadiness inspects current UI state to decide whether Go Live
+// can fire. Returns {ready: bool, reason: string} where reason is shown
+// inline when ready is false.
+function destinationReadiness() {
+  const videoOK = els.videoSource?.value && els.videoSource.value !== "";
+  if (!videoOK) {
+    return { ready: false, reason: "Select a video source in Step 3" };
+  }
+  switch (currentDestMode) {
+    case "scheduled":
+      // Scheduled mode handles itself via the scheduler. Manual Go Live
+      // from this tab uses the last manually-configured destination,
+      // which we treat as Manual mode requirements.
+      if (!ytAuthed && !destinationHasManualURL()) {
+        return { ready: false, reason: "Connect YouTube or use the Manual tab" };
+      }
+      return { ready: true };
+    case "now":
+      if (!ytAuthed) {
+        return { ready: false, reason: "Connect YouTube to go live now" };
+      }
+      return { ready: true };
+    case "manual":
+      if (!destinationHasManualURL()) {
+        return { ready: false, reason: "Paste an ingest URL and stream key" };
+      }
+      return { ready: true };
+    default:
+      return { ready: true };
+  }
+}
+
+function destinationHasManualURL() {
+  const url = els.ingestURL?.value?.trim();
+  if (!url) return false;
+  // RTMP needs a key; HLS doesn't.
+  if (els.outputMode?.value === "hls") return true;
+  const keyTyped = els.streamName?.value?.trim().length > 0;
+  const keyAlreadySaved = els.streamName?.placeholder?.includes("Stream key is set");
+  return keyTyped || keyAlreadySaved;
+}
+
+let ytAuthed = false;
+
 function updateButtonStates(state) {
   const isActive = ["starting", "running", "degraded", "restarting"].includes(state);
   const isStopping = state === "stopping";
-  els.start.disabled = isActive || isStopping;
   els.stop.disabled = !isActive;
+
+  if (isActive || isStopping) {
+    els.start.disabled = true;
+    if (els.startReason) els.startReason.hidden = true;
+    return;
+  }
+
+  const readiness = destinationReadiness();
+  els.start.disabled = !readiness.ready;
+  if (els.startReason) {
+    if (readiness.ready) {
+      els.startReason.hidden = true;
+    } else {
+      els.startReason.hidden = false;
+      els.startReason.textContent = readiness.reason;
+    }
+  }
 }
 
 // --- Output mode ---
@@ -221,8 +304,8 @@ function renderPresets(presets) {
       selectedPreset = preset.id;
       closePresetMenu();
       updatePresetDescription(presets);
-      renderPresets(presets); // re-render to update active class
-      showNotice("Preset selected — click Save Settings to apply.");
+      renderPresets(presets);
+      autoSave(true);
     });
     els.presetMenu.appendChild(btn);
   }
@@ -336,18 +419,36 @@ els.stop.addEventListener("click", async () => {
   }
 });
 
-els.save.addEventListener("click", async () => {
-  try {
-    els.save.disabled = true;
-    await saveConfig();
-    showNotice("Settings saved.");
-    await refresh();
-  } catch (error) {
-    els.lastMessage.textContent = error.message;
-  } finally {
-    els.save.disabled = false;
+// --- Auto-save on field change ---
+// Replaces the old global "Save Settings" button. Each form change is
+// debounced and saved automatically.
+let autoSaveTimer = null;
+function autoSave(immediate = false) {
+  clearTimeout(autoSaveTimer);
+  const fire = async () => {
+    try {
+      await saveConfig();
+      showNotice("Settings saved");
+      // Refresh button states (destination might now be ready/unready).
+      updateButtonStates(lastStreamState);
+    } catch (error) {
+      els.lastMessage.textContent = error.message;
+    }
+  };
+  if (immediate) {
+    fire();
+  } else {
+    autoSaveTimer = setTimeout(fire, 600);
   }
-});
+}
+
+// Text fields save on blur. Update Go Live readiness live as user types.
+els.ingestURL?.addEventListener("blur", () => autoSave(true));
+els.ingestURL?.addEventListener("input", () => updateButtonStates(lastStreamState));
+els.streamName?.addEventListener("blur", () => autoSave(true));
+els.streamName?.addEventListener("input", () => updateButtonStates(lastStreamState));
+// Selects save immediately on change.
+els.outputMode?.addEventListener("change", () => autoSave(true));
 
 // --- Destination mode tabs ---
 document.querySelectorAll("#dest-tabs .tab").forEach((tab) => {
@@ -357,6 +458,7 @@ document.querySelectorAll("#dest-tabs .tab").forEach((tab) => {
     currentDestMode = tab.dataset.mode;
     document.querySelectorAll(".mode-content").forEach((el) => (el.hidden = true));
     document.querySelector(`#mode-${currentDestMode}`).hidden = false;
+    updateButtonStates(lastStreamState);
   });
 });
 
@@ -415,6 +517,7 @@ els.adaptiveEnabled?.addEventListener("change", async (e) => {
 function renderYouTubeStatus(yt) {
   const authed = yt.authenticated;
   const configured = yt.configured;
+  ytAuthed = authed;
 
   // Header account info
   if (authed && yt.channelName) {
@@ -643,14 +746,14 @@ document.querySelector("#ovr-save")?.addEventListener("click", async () => {
   }
   // Parse the datetime-local as the selected timezone
   const tz = document.querySelector("#ovr-tz").value;
-  // datetime-local gives us YYYY-MM-DDTHH:MM — we need to interpret in the selected tz
-  // Since we can't easily do timezone conversion in vanilla JS, send the raw value and timezone
-  // and let the server handle it. For now, treat as UTC offset approximation.
-  const dt = new Date(datetimeStr);
-
+  // datetime-local returns YYYY-MM-DDTHH:MM as a wall-clock with no timezone.
+  // Send it verbatim along with the selected timezone; the server converts
+  // to UTC correctly (browser Date() would have used the browser's tz, which
+  // is wrong when the user picks a different zone for the event).
   const override = {
     name: document.querySelector("#ovr-name").value.trim(),
-    startTime: dt.toISOString(),
+    wallClock: datetimeStr,
+    timezone: tz,
     durationMin: parseInt(document.querySelector("#ovr-duration").value) || 120,
     presetId: selectedPreset,
     title: document.querySelector("#ovr-title").value.trim() || document.querySelector("#ovr-name").value.trim(),

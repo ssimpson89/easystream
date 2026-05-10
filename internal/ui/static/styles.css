@@ -25,7 +25,7 @@ body {
 .shell {
   width: min(1180px, calc(100% - 32px));
   margin: 0 auto;
-  padding: 28px 0 100px;
+  padding: 28px 0 40px;
 }
 
 /* --- Hero --- */
@@ -153,38 +153,64 @@ section.panel.primary { margin-bottom: 0; }
 
 .full { width: 100%; margin-top: 12px; }
 
-/* --- Save bar --- */
-.save-bar {
+/* --- Save toast --- */
+.save-toast {
   position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  padding: 14px;
-  background: var(--panel);
-  border-top: 1px solid var(--line);
-  z-index: 10;
-}
-.save-button {
-  min-width: 200px;
-  border-color: #1f6feb;
-  background: var(--accent);
-  color: #fff;
-  font-size: 15px;
-  padding: 0 32px;
-}
-.save-button:hover:not(:disabled) { background: #388bfd; }
-.save-notice {
-  color: var(--good);
+  bottom: 20px;
+  right: 20px;
+  z-index: 30;
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: var(--good);
+  color: #0d1117;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 700;
   opacity: 0;
-  transition: opacity 0.3s;
+  transform: translateY(10px);
+  transition: opacity 0.2s, transform 0.2s;
+  pointer-events: none;
 }
-.save-notice.visible { opacity: 1; }
+.save-toast.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* --- Problem banner (full-width when stream is unhealthy) --- */
+.problem-banner {
+  margin-bottom: 14px;
+  padding: 14px 18px;
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+.problem-banner strong {
+  display: block;
+  font-size: 16px;
+  margin-bottom: 4px;
+}
+.problem-banner.degraded,
+.problem-banner.restarting {
+  background: rgba(210, 153, 34, 0.18);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+}
+.problem-banner.failed {
+  background: rgba(248, 81, 73, 0.18);
+  border: 1px solid var(--bad);
+  color: var(--bad);
+}
+.problem-banner span {
+  color: var(--text);
+  opacity: 0.85;
+}
+
+/* --- Start reason inline hint --- */
+.start-reason {
+  margin-top: 8px;
+  color: var(--warn);
+  font-size: 12px;
+  font-weight: 600;
+}
 
 /* --- Metrics --- */
 .metrics {

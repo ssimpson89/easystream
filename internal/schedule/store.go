@@ -30,10 +30,18 @@ type Schedule struct {
 }
 
 // Override defines a one-time special event.
+//
+// Client may send either:
+//   - StartTime (RFC3339 UTC, server uses as-is), or
+//   - WallClock ("2026-04-12T08:45") + Timezone ("America/Chicago"),
+//     which the server interprets in that timezone. This is needed because
+//     HTML datetime-local inputs return a wall-clock string without zone info.
 type Override struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
-	StartTime   time.Time `json:"startTime"`
+	StartTime   time.Time `json:"startTime,omitempty"`
+	WallClock   string    `json:"wallClock,omitempty"`
+	Timezone    string    `json:"timezone,omitempty"`
 	DurationMin int       `json:"durationMin"`
 	PresetID    string    `json:"presetId"`
 	Title       string    `json:"title"`
@@ -170,6 +178,28 @@ func (s *Store) Overrides() []Override {
 func (s *Store) CreateOverride(o Override) (Override, error) {
 	if o.Name == "" {
 		return Override{}, fmt.Errorf("name is required")
+	}
+	// If client provided a wall-clock + timezone, convert to UTC.
+	if o.WallClock != "" {
+		tz := o.Timezone
+		if tz == "" {
+			tz = "UTC"
+		}
+		loc, err := time.LoadLocation(tz)
+		if err != nil {
+			return Override{}, fmt.Errorf("invalid timezone %q: %w", tz, err)
+		}
+		// HTML datetime-local is "YYYY-MM-DDTHH:MM" (no seconds, no zone).
+		t, err := time.ParseInLocation("2006-01-02T15:04", o.WallClock, loc)
+		if err != nil {
+			// Try with seconds.
+			t, err = time.ParseInLocation("2006-01-02T15:04:05", o.WallClock, loc)
+			if err != nil {
+				return Override{}, fmt.Errorf("invalid wallClock %q: %w", o.WallClock, err)
+			}
+		}
+		o.StartTime = t.UTC()
+		o.WallClock = ""
 	}
 	if o.StartTime.IsZero() {
 		return Override{}, fmt.Errorf("start time is required")
