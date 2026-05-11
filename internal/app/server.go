@@ -218,8 +218,8 @@ func (s *Server) routes(webFS fs.FS) http.Handler {
 	// Devices.
 	mux.HandleFunc("GET /api/devices", s.handleDevices)
 
-	// Preview.
-	mux.Handle("GET /api/preview", s.preview)
+	// Preview (WebRTC SDP offer/answer).
+	mux.Handle("POST /api/preview/webrtc/offer", s.preview)
 
 	// HLS output.
 	if s.hlsServer != nil {

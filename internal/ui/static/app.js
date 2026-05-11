@@ -54,7 +54,7 @@ const els = {
   // Preview
   previewToggle: document.querySelector("#preview-toggle"),
   previewContainer: document.querySelector("#preview-container"),
-  previewImg: document.querySelector("#preview-img"),
+  previewVideo: document.querySelector("#preview-video"),
 };
 
 let selectedPreset = "recommended";
@@ -991,24 +991,33 @@ setInterval(() => scanDevices(), 5000);
 // Refresh button.
 document.querySelector("#refresh-devices")?.addEventListener("click", () => scanDevices(true));
 
-// --- Preview ---
+// --- Preview (WebRTC) ---
+// Browser establishes an RTCPeerConnection with the EasyStream server.
+// Server runs FFmpeg encoding H.264 RTP and bridges to the WebRTC track.
+// Sub-second latency, works in Safari/Chrome/Firefox alike.
 let previewFailed = false;
+let previewPC = null; // current RTCPeerConnection
 
-function restartPreview() {
-  if (!previewActive) return;
-  previewFailed = false;
-  els.previewImg.src = "";
-  hidePreviewError();
-  setTimeout(startPreview, 300);
+function stopPreviewPC() {
+  clearTimeout(startPreview._timeout);
+  if (previewPC) {
+    try { previewPC.close(); } catch (_) {}
+    previewPC = null;
+  }
+  if (els.previewVideo) {
+    els.previewVideo.srcObject = null;
+    els.previewVideo.style.display = "";
+  }
 }
 
 async function saveAndRestartPreview() {
   if (!previewActive) return;
   previewFailed = false;
-  els.previewImg.src = "";
+  stopPreviewPC();
   hidePreviewError();
   setTimeout(startPreview, 300);
 }
+const restartPreview = saveAndRestartPreview;
 
 els.previewToggle?.addEventListener("click", () => {
   previewActive = !previewActive;
@@ -1021,45 +1030,81 @@ els.previewToggle?.addEventListener("click", () => {
     hidePreviewError();
     startPreview();
   } else {
-    els.previewImg.src = "";
+    stopPreviewPC();
     hidePreviewError();
   }
 });
 
 document.querySelector("#preview-refresh")?.addEventListener("click", () => {
   previewFailed = false;
-  els.previewImg.src = "";
+  stopPreviewPC();
   hidePreviewError();
   startPreview();
 });
 
-function startPreview() {
+// Tear down the peer connection when the tab is closed so the server-side
+// FFmpeg / UDP listener / PC get reaped promptly.
+window.addEventListener("beforeunload", stopPreviewPC);
+
+async function startPreview() {
   if (previewFailed) return;
-  saveConfig().then(() => {
-    const img = els.previewImg;
-    img.style.display = "";
-    let loaded = false;
+  await saveConfig();
 
-    // Set a timeout — if no frame loads within 4 seconds, assume failure.
-    clearTimeout(startPreview._timeout);
-    startPreview._timeout = setTimeout(() => {
-      if (!loaded && previewActive && !previewFailed) {
-        previewFailed = true;
-        showPreviewError("Could not open capture device. Check that camera permission is granted (System Settings > Privacy & Security > Camera), the device isn't in use by another app, and the correct device is selected.");
+  stopPreviewPC();
+  const pc = new RTCPeerConnection();
+  previewPC = pc;
+  pc.addTransceiver("video", { direction: "recvonly" });
+
+  pc.ontrack = (e) => {
+    if (els.previewVideo && e.streams && e.streams[0]) {
+      els.previewVideo.srcObject = e.streams[0];
+    }
+  };
+
+  // 4-second timeout to detect "FFmpeg can't open the capture device."
+  clearTimeout(startPreview._timeout);
+  let connected = false;
+  startPreview._timeout = setTimeout(() => {
+    if (!connected && previewActive && !previewFailed && previewPC === pc) {
+      previewFailed = true;
+      showPreviewError("Could not open capture device. Check that camera permission is granted (System Settings > Privacy & Security > Camera), the device isn't in use by another app, and the correct device is selected.");
+      stopPreviewPC();
+    }
+  }, 4000);
+
+  pc.oniceconnectionstatechange = () => {
+    if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+      connected = true;
+      clearTimeout(startPreview._timeout);
+    } else if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
+      if (previewActive && previewPC === pc) {
+        // Try a single auto-reconnect.
+        setTimeout(() => {
+          if (previewActive && previewPC === pc) startPreview();
+        }, 1000);
       }
-    }, 4000);
+    }
+  };
 
-    img.onload = () => { loaded = true; };
-    img.onerror = () => {
-      if (previewActive && !previewFailed) {
-        previewFailed = true;
-        clearTimeout(startPreview._timeout);
-        showPreviewError("Could not open capture device. Check that camera permission is granted (System Settings > Privacy & Security > Camera), the device isn't in use by another app, and the correct device is selected.");
-      }
-    };
-
-    img.src = "/api/preview?" + Date.now();
-  });
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const resp = await fetch("/api/preview/webrtc/offer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(pc.localDescription),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(errText || `HTTP ${resp.status}`);
+    }
+    const answer = await resp.json();
+    await pc.setRemoteDescription(answer);
+  } catch (err) {
+    previewFailed = true;
+    showPreviewError(`Preview connection failed: ${err.message}`);
+    stopPreviewPC();
+  }
 }
 
 function showPreviewError(msg) {
@@ -1072,13 +1117,13 @@ function showPreviewError(msg) {
   }
   el.textContent = msg;
   el.hidden = false;
-  els.previewImg.style.display = "none";
+  if (els.previewVideo) els.previewVideo.style.display = "none";
 }
 
 function hidePreviewError() {
   const el = document.querySelector("#preview-error");
   if (el) el.hidden = true;
-  els.previewImg.style.display = "";
+  if (els.previewVideo) els.previewVideo.style.display = "";
 }
 
 // Restart preview when capture source settings change.
