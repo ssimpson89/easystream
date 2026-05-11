@@ -17,11 +17,13 @@ import (
 	"github.com/ssimpson89/easystream/internal/preview"
 	"github.com/ssimpson89/easystream/internal/schedule"
 	"github.com/ssimpson89/easystream/internal/ui"
+	"github.com/ssimpson89/easystream/internal/version"
 	"github.com/ssimpson89/easystream/internal/youtube"
 )
 
 func main() {
 	logger := log.New(os.Stdout, "easystream ", log.LstdFlags|log.LUTC)
+	logger.Printf("EasyStream %s", version.Version)
 
 	// Reap any leftover ffmpeg children from a previous EasyStream session.
 	// Without this, orphans accumulate on every restart (or crash) and all

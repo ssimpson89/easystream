@@ -1,0 +1,51 @@
+version: 2
+
+project_name: easystream
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: easystream
+    main: ./cmd/easystream
+    binary: easystream
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - >-
+        -s -w
+        -X github.com/ssimpson89/easystream/internal/version.Version={{ .Version }}
+        -X github.com/ssimpson89/easystream/internal/version.Commit={{ .Commit }}
+        -X github.com/ssimpson89/easystream/internal/version.Date={{ .Date }}
+
+archives:
+  - id: easystream
+    ids:
+      - easystream
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

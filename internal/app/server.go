@@ -285,11 +285,13 @@ func (s *Server) routes(webFS fs.FS) http.Handler {
 	// Schedules.
 	mux.HandleFunc("GET /api/schedules", s.handleListSchedules)
 	mux.HandleFunc("POST /api/schedules", s.handleCreateSchedule)
+	mux.HandleFunc("PUT /api/schedules/{id}", s.handleUpdateSchedule)
 	mux.HandleFunc("DELETE /api/schedules/{id}", s.handleDeleteSchedule)
 
 	// Overrides.
 	mux.HandleFunc("GET /api/overrides", s.handleListOverrides)
 	mux.HandleFunc("POST /api/overrides", s.handleCreateOverride)
+	mux.HandleFunc("PUT /api/overrides/{id}", s.handleUpdateOverride)
 	mux.HandleFunc("DELETE /api/overrides/{id}", s.handleDeleteOverride)
 
 	// Upcoming events.

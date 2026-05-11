@@ -8,6 +8,7 @@ import (
 
 	"github.com/ssimpson89/easystream/internal/ffmpeg"
 	"github.com/ssimpson89/easystream/internal/quality"
+	"github.com/ssimpson89/easystream/internal/version"
 )
 
 // --- Status ---
@@ -25,6 +26,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	result := map[string]any{
 		"stream":            streamStatus,
+		"app":               version.Current(),
 		"config":            s.configResponse(config),
 		"presets":           quality.Selectable(),
 		"platform":          ffmpeg.PlatformBackend(),

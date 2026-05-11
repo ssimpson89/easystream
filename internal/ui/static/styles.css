@@ -118,6 +118,7 @@ h3 { margin-top: 4px; font-size: 16px; font-weight: 640; }
   margin-bottom: 24px;
 }
 .brand { display: flex; align-items: center; gap: 12px; }
+.app-version { color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: 0.04em; }
 
 .topbar-right {
   display: flex;

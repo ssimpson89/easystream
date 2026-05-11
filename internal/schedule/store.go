@@ -68,10 +68,11 @@ type Event struct {
 
 // storeData is the JSON file format.
 type storeData struct {
-	Schedules  []Schedule        `json:"schedules"`
-	Overrides  []Override        `json:"overrides"`
-	Broadcasts map[string]string `json:"broadcasts"` // eventKey -> YouTube broadcast ID
-	Streams    map[string]string `json:"streams"`    // eventKey -> YouTube stream ID
+	Schedules  []Schedule           `json:"schedules"`
+	Overrides  []Override           `json:"overrides"`
+	Broadcasts map[string]string    `json:"broadcasts"`        // eventKey -> YouTube broadcast ID
+	Streams    map[string]string    `json:"streams"`           // eventKey -> YouTube stream ID
+	Skipped    map[string]time.Time `json:"skipped,omitempty"` // eventKey -> suppressed until
 }
 
 // Store manages schedules and overrides, persisted to a JSON file.
@@ -97,6 +98,9 @@ func NewStore(file string) (*Store, error) {
 	if s.data.Streams == nil {
 		s.data.Streams = make(map[string]string)
 	}
+	if s.data.Skipped == nil {
+		s.data.Skipped = make(map[string]time.Time)
+	}
 	return s, nil
 }
 
@@ -111,6 +115,19 @@ func (s *Store) Schedules() []Schedule {
 
 // CreateSchedule adds a new recurring schedule.
 func (s *Store) CreateSchedule(sched Schedule) (Schedule, error) {
+	sched, err := normalizeSchedule(sched)
+	if err != nil {
+		return Schedule{}, err
+	}
+	sched.ID = newID()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.Schedules = append(s.data.Schedules, sched)
+	return sched, s.save()
+}
+
+func normalizeSchedule(sched Schedule) (Schedule, error) {
 	if sched.Name == "" {
 		return Schedule{}, fmt.Errorf("name is required")
 	}
@@ -132,26 +149,26 @@ func (s *Store) CreateSchedule(sched Schedule) (Schedule, error) {
 	if sched.Privacy == "" {
 		sched.Privacy = "unlisted"
 	}
-	sched.ID = newID()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data.Schedules = append(s.data.Schedules, sched)
-	return sched, s.save()
+	return sched, nil
 }
 
 // UpdateSchedule replaces a schedule by ID.
-func (s *Store) UpdateSchedule(sched Schedule) error {
+func (s *Store) UpdateSchedule(sched Schedule) (Schedule, error) {
+	sched, err := normalizeSchedule(sched)
+	if err != nil {
+		return Schedule{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, existing := range s.data.Schedules {
 		if existing.ID == sched.ID {
 			sched.ID = existing.ID
 			s.data.Schedules[i] = sched
-			return s.save()
+			s.clearBroadcastsForIDLocked(sched.ID)
+			return sched, s.save()
 		}
 	}
-	return fmt.Errorf("schedule %s not found", sched.ID)
+	return Schedule{}, fmt.Errorf("schedule %s not found", sched.ID)
 }
 
 // DeleteSchedule removes a schedule by ID.
@@ -161,6 +178,7 @@ func (s *Store) DeleteSchedule(id string) error {
 	for i, sched := range s.data.Schedules {
 		if sched.ID == id {
 			s.data.Schedules = append(s.data.Schedules[:i], s.data.Schedules[i+1:]...)
+			s.clearBroadcastsForIDLocked(id)
 			return s.save()
 		}
 	}
@@ -178,6 +196,19 @@ func (s *Store) Overrides() []Override {
 
 // CreateOverride adds a one-time event.
 func (s *Store) CreateOverride(o Override) (Override, error) {
+	o, err := normalizeOverride(o)
+	if err != nil {
+		return Override{}, err
+	}
+	o.ID = newID()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.Overrides = append(s.data.Overrides, o)
+	return o, s.save()
+}
+
+func normalizeOverride(o Override) (Override, error) {
 	if o.Name == "" {
 		return Override{}, fmt.Errorf("name is required")
 	}
@@ -212,12 +243,26 @@ func (s *Store) CreateOverride(o Override) (Override, error) {
 	if o.Privacy == "" {
 		o.Privacy = "unlisted"
 	}
-	o.ID = newID()
+	return o, nil
+}
 
+// UpdateOverride replaces a one-time override by ID.
+func (s *Store) UpdateOverride(o Override) (Override, error) {
+	o, err := normalizeOverride(o)
+	if err != nil {
+		return Override{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data.Overrides = append(s.data.Overrides, o)
-	return o, s.save()
+	for i, existing := range s.data.Overrides {
+		if existing.ID == o.ID {
+			o.ID = existing.ID
+			s.data.Overrides[i] = o
+			s.clearBroadcastsForIDLocked(o.ID)
+			return o, s.save()
+		}
+	}
+	return Override{}, fmt.Errorf("override %s not found", o.ID)
 }
 
 // DeleteOverride removes an override by ID.
@@ -227,6 +272,7 @@ func (s *Store) DeleteOverride(id string) error {
 	for i, o := range s.data.Overrides {
 		if o.ID == id {
 			s.data.Overrides = append(s.data.Overrides[:i], s.data.Overrides[i+1:]...)
+			s.clearBroadcastsForIDLocked(id)
 			return s.save()
 		}
 	}
@@ -260,6 +306,21 @@ func (s *Store) ClearBroadcast(eventKey string) error {
 	return s.save()
 }
 
+// SkipEvent suppresses one computed event occurrence until its event window
+// ends. Used when an operator stops a scheduled stream early; without this,
+// the scheduler would see the still-due occurrence and restart it.
+func (s *Store) SkipEvent(eventKey string, until time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.Skipped == nil {
+		s.data.Skipped = make(map[string]time.Time)
+	}
+	s.data.Skipped[eventKey] = until.UTC()
+	delete(s.data.Broadcasts, eventKey)
+	delete(s.data.Streams, eventKey)
+	return s.save()
+}
+
 // NextEvents computes the next upcoming events from all schedules and overrides.
 func (s *Store) NextEvents(count int, after time.Time) []Event {
 	s.mu.Lock()
@@ -269,24 +330,38 @@ func (s *Store) NextEvents(count int, after time.Time) []Event {
 	copy(overrides, s.data.Overrides)
 	broadcasts := make(map[string]string)
 	streams := make(map[string]string)
+	skipped := make(map[string]time.Time)
 	for k, v := range s.data.Broadcasts {
 		broadcasts[k] = v
 	}
 	for k, v := range s.data.Streams {
 		streams[k] = v
 	}
+	for k, v := range s.data.Skipped {
+		skipped[k] = v
+	}
 	s.mu.Unlock()
 
 	var events []Event
 
-	// Add recurring schedule events for the next 14 days.
+	// Add recurring schedule events for the next 14 days. Start the recurrence
+	// search one duration in the past so a schedule that just became due stays
+	// visible to the scheduler until its event window ends.
 	horizon := after.Add(14 * 24 * time.Hour)
 	for _, sched := range schedules {
 		if !sched.Enabled {
 			continue
 		}
-		for _, t := range nextOccurrences(sched, after, horizon) {
+		duration := time.Duration(sched.DurationMin) * time.Minute
+		searchAfter := after.Add(-duration)
+		for _, t := range nextOccurrences(sched, searchAfter, horizon) {
+			if t.Add(duration).Before(after) {
+				continue
+			}
 			key := EventKey(sched.ID, t)
+			if until, ok := skipped[key]; ok && until.After(after) {
+				continue
+			}
 			ev := Event{
 				ScheduleID:  sched.ID,
 				Name:        sched.Name,
@@ -310,6 +385,9 @@ func (s *Store) NextEvents(count int, after time.Time) []Event {
 			continue
 		}
 		key := EventKey(o.ID, o.StartTime)
+		if until, ok := skipped[key]; ok && until.After(after) {
+			continue
+		}
 		events = append(events, Event{
 			OverrideID:  o.ID,
 			Name:        o.Name,
@@ -337,6 +415,25 @@ func (s *Store) NextEvents(count int, after time.Time) []Event {
 // EventKey returns a stable key for mapping events to YouTube broadcasts.
 func EventKey(id string, startTime time.Time) string {
 	return id + ":" + startTime.UTC().Format(time.RFC3339)
+}
+
+func (s *Store) clearBroadcastsForIDLocked(id string) {
+	prefix := id + ":"
+	for key := range s.data.Broadcasts {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.data.Broadcasts, key)
+		}
+	}
+	for key := range s.data.Streams {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.data.Streams, key)
+		}
+	}
+	for key := range s.data.Skipped {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.data.Skipped, key)
+		}
+	}
 }
 
 // nextOccurrences computes the next firings of a recurring schedule using

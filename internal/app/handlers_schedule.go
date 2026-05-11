@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ssimpson89/easystream/internal/schedule"
@@ -34,6 +35,29 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, result)
+}
+
+func (s *Server) handleUpdateSchedule(w http.ResponseWriter, r *http.Request) {
+	if s.schedStore == nil {
+		writeError(w, http.StatusBadRequest, "schedule storage not configured")
+		return
+	}
+	var sched schedule.Schedule
+	if err := json.NewDecoder(r.Body).Decode(&sched); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sched.ID = r.PathValue("id")
+	result, err := s.schedStore.UpdateSchedule(sched)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
@@ -75,6 +99,29 @@ func (s *Server) handleCreateOverride(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, result)
+}
+
+func (s *Server) handleUpdateOverride(w http.ResponseWriter, r *http.Request) {
+	if s.schedStore == nil {
+		writeError(w, http.StatusBadRequest, "schedule storage not configured")
+		return
+	}
+	var o schedule.Override
+	if err := json.NewDecoder(r.Body).Decode(&o); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	o.ID = r.PathValue("id")
+	result, err := s.schedStore.UpdateOverride(o)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleDeleteOverride(w http.ResponseWriter, r *http.Request) {

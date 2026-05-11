@@ -24,7 +24,18 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in your browser.
 
 ### Production deployment
 
-Run EasyStream under **launchd** (macOS) or **systemd** (Linux) with restart-on-crash enabled. EasyStream persists operator intent to disk, so if the supervisor crashes mid-broadcast and the service manager restarts it, the stream picks up where it left off — the platform sees a brief reconnect rather than a stream end. Installable releases via `goreleaser` are planned.
+Run EasyStream under **launchd** (macOS) or **systemd** (Linux) with restart-on-crash enabled. EasyStream persists operator intent to disk, so if the supervisor crashes mid-broadcast and the service manager restarts it, the stream picks up where it left off — the platform sees a brief reconnect rather than a stream end.
+
+### Releases
+
+Release builds for macOS and Linux are created by GoReleaser when a `v*` tag is pushed:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+GoReleaser injects the tag version, commit, and build date into the app. The current version appears in the EasyStream header and `/api/status` response.
 
 ## Features
 

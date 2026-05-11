@@ -15,6 +15,7 @@ document.addEventListener("alpine:init", () => {
     // SERVER-SOURCED STATE (refreshed every 2s)
     // ============================================================
     stream: { state: "idle", lastProgress: {}, restartCount: 0 },
+    app: { version: "dev", commit: "", date: "" },
     config: null,
     youtube: { authenticated: false, configured: false, channelName: "" },
     scheduler: null,
@@ -159,10 +160,15 @@ document.addEventListener("alpine:init", () => {
         }
 
         if (now && this.previewVisible && !this.previewSuppressed) {
-          // Going live — reconnect the audio meter to the existing WebRTC
-          // audio track so it picks up audio from the main stream's RTP feed.
+          // Going live — keep an existing preview connected if possible. If
+          // the preview was not connected, start a passive live preview session
+          // after the main stream has begun feeding RTP.
           setTimeout(() => {
-            if (!this.isLive || !this._previewPC) return;
+            if (!this.isLive || !this.previewVisible || this.previewSuppressed) return;
+            if (!this._previewPC) {
+              this.startPreview();
+              return;
+            }
             const pc = this._previewPC;
             const receivers = pc.getReceivers ? pc.getReceivers() : [];
             for (const r of receivers) {
@@ -190,9 +196,10 @@ document.addEventListener("alpine:init", () => {
       window.addEventListener("pointerdown", () => this.resumeAudioMeterContext(), { passive: true });
       window.addEventListener("keydown", () => this.resumeAudioMeterContext());
 
-      // Start preview on initial load (idle state) — unless user suppressed.
+      // Start preview on initial load — idle starts preview FFmpeg, live starts
+      // a passive WebRTC session fed by the main stream.
       this.$nextTick(() => {
-        if (!this.isLive) this.maybeStartPreview();
+        this.maybeStartPreview();
       });
     },
 
@@ -352,6 +359,7 @@ document.addEventListener("alpine:init", () => {
       try {
         const data = await this.api("/api/status");
         this.stream = data.stream || this.stream;
+        this.app = data.app || this.app;
         this.config = data.config;
         this.youtube = data.youtube || this.youtube;
         this.scheduler = data.scheduler || null;
@@ -1023,18 +1031,38 @@ document.addEventListener("alpine:init", () => {
     // ============================================================
     _blankSchedForm() {
       return {
+        id: "",
         name: "", days: [], time: "08:45", timezone: "America/Chicago",
-        durationMin: 120, title: "", description: "", privacy: "unlisted",
+        durationMin: 120, title: "", description: "", privacy: "unlisted", enabled: true,
       };
     },
     _blankOvrForm() {
       return {
+        id: "",
         name: "", wallClock: "", timezone: "America/Chicago", durationMin: 120,
         title: "", description: "", privacy: "unlisted",
       };
     },
     openSchedForm() {
       this.schedForm = this._blankSchedForm();
+      this.ovrFormOpen = false;
+      this.schedFormOpen = true;
+    },
+    editSchedule(s) {
+      this.schedForm = {
+        id: s.id,
+        name: s.name || "",
+        days: [...(s.days || [])],
+        time: s.time || "08:45",
+        timezone: s.timezone || "America/Chicago",
+        durationMin: s.durationMin || 120,
+        title: s.title || "",
+        description: s.description || "",
+        privacy: s.privacy || "unlisted",
+        enabled: s.enabled !== false,
+      };
+      if (s.presetId) this.selectedPreset = s.presetId;
+      this.ovrFormOpen = false;
       this.schedFormOpen = true;
     },
     toggleDay(day) {
@@ -1053,12 +1081,29 @@ document.addEventListener("alpine:init", () => {
         title: (this.schedForm.title || this.schedForm.name).trim(),
         name: this.schedForm.name.trim(),
         description: this.schedForm.description.trim(),
-        enabled: true,
+        enabled: this.schedForm.enabled !== false,
       };
       try {
-        await this.api("/api/schedules", { method: "POST", body: JSON.stringify(sched) });
+        const editing = !!sched.id;
+        const path = editing ? `/api/schedules/${sched.id}` : "/api/schedules";
+        const method = editing ? "PUT" : "POST";
+        await this.api(path, { method, body: JSON.stringify(sched) });
         this.schedFormOpen = false;
-        this.showToast("Schedule created.");
+        this.showToast(editing ? "Schedule updated." : "Schedule created.");
+        await this.loadSchedules();
+        await this.refresh();
+      } catch (e) {
+        alert(e.message);
+      }
+    },
+    async toggleScheduleEnabled(s) {
+      const enabled = !s.enabled;
+      try {
+        await this.api(`/api/schedules/${s.id}`, {
+          method: "PUT",
+          body: JSON.stringify({ ...s, enabled }),
+        });
+        this.showToast(enabled ? "Schedule resumed." : "Schedule paused.");
         await this.loadSchedules();
         await this.refresh();
       } catch (e) {
@@ -1074,7 +1119,30 @@ document.addEventListener("alpine:init", () => {
 
     openOvrForm() {
       this.ovrForm = this._blankOvrForm();
+      this.schedFormOpen = false;
       this.ovrFormOpen = true;
+    },
+    editOverride(o) {
+      this.ovrForm = {
+        id: o.id,
+        name: o.name || "",
+        wallClock: this.toDateTimeLocal(o.startTime),
+        timezone: o.timezone || this.ovrForm.timezone || "America/Chicago",
+        durationMin: o.durationMin || 120,
+        title: o.title || "",
+        description: o.description || "",
+        privacy: o.privacy || "unlisted",
+      };
+      if (o.presetId) this.selectedPreset = o.presetId;
+      this.schedFormOpen = false;
+      this.ovrFormOpen = true;
+    },
+    toDateTimeLocal(value) {
+      if (!value) return "";
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return "";
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
     },
     async saveOverride() {
       if (!this.ovrForm.wallClock) {
@@ -1089,9 +1157,12 @@ document.addEventListener("alpine:init", () => {
         description: this.ovrForm.description.trim(),
       };
       try {
-        await this.api("/api/overrides", { method: "POST", body: JSON.stringify(override) });
+        const editing = !!override.id;
+        const path = editing ? `/api/overrides/${override.id}` : "/api/overrides";
+        const method = editing ? "PUT" : "POST";
+        await this.api(path, { method, body: JSON.stringify(override) });
         this.ovrFormOpen = false;
-        this.showToast("Special event created.");
+        this.showToast(editing ? "Special event updated." : "Special event created.");
         await this.loadOverrides();
         await this.refresh();
       } catch (e) {

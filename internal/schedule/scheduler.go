@@ -28,7 +28,8 @@ type YouTubeController interface {
 	TransitionBroadcast(broadcastID, status string) error
 }
 
-// Scheduler creates YouTube broadcasts ahead of time and auto-starts streams.
+// Scheduler starts streams at the event time. It does not create YouTube
+// broadcasts ahead of time; the scheduled start time is the operator's intent.
 type Scheduler struct {
 	store  *Store
 	stream StreamController
@@ -57,12 +58,12 @@ func NewScheduler(store *Store, stream StreamController, yt YouTubeController, l
 
 // SchedulerStatus is returned by the status API.
 type SchedulerStatus struct {
-	Running          bool      `json:"running"`
-	ActiveEventName  string    `json:"activeEventName,omitempty"`
-	ActiveBroadcast  string    `json:"activeBroadcastId,omitempty"`
-	ActiveEndsAt     time.Time `json:"activeEndsAt,omitempty"`
-	ExtraMinutes     int       `json:"extraMinutes,omitempty"`
-	LastError        string    `json:"lastError,omitempty"`
+	Running         bool      `json:"running"`
+	ActiveEventName string    `json:"activeEventName,omitempty"`
+	ActiveBroadcast string    `json:"activeBroadcastId,omitempty"`
+	ActiveEndsAt    time.Time `json:"activeEndsAt,omitempty"`
+	ExtraMinutes    int       `json:"extraMinutes,omitempty"`
+	LastError       string    `json:"lastError,omitempty"`
 }
 
 // Status returns the scheduler's current state.
@@ -142,7 +143,7 @@ func (s *Scheduler) run(ctx context.Context) {
 		}
 	}()
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	// Run immediately on start, then every 30s.
@@ -171,7 +172,7 @@ func (s *Scheduler) tick() {
 	if active != nil {
 		endTime := active.StartTime.Add(time.Duration(active.DurationMin+extra) * time.Minute)
 		if now.After(endTime) {
-			s.stopActiveEvent(activeBroadcast)
+			s.stopActiveEvent(activeBroadcast, false)
 		}
 	}
 
@@ -180,13 +181,9 @@ func (s *Scheduler) tick() {
 	}
 
 	for _, event := range events {
-		// Create broadcast 30 min before start if not yet created.
-		if event.BroadcastID == "" && now.After(event.StartTime.Add(-30*time.Minute)) && now.Before(event.StartTime) {
-			s.prepareBroadcast(event)
-		}
-
-		// Go live at start time.
-		if event.BroadcastID != "" && !now.Before(event.StartTime) {
+		// Go live at start time. If the broadcast was not prepared by an
+		// earlier app version, create/bind it just-in-time here.
+		if !now.Before(event.StartTime) {
 			endTime := event.StartTime.Add(time.Duration(event.DurationMin) * time.Minute)
 			if now.Before(endTime) {
 				s.mu.Lock()
@@ -200,49 +197,69 @@ func (s *Scheduler) tick() {
 	}
 }
 
-func (s *Scheduler) prepareBroadcast(event Event) {
+func (s *Scheduler) prepareBroadcast(event Event) (Event, string, string, bool) {
 	s.logger.Printf("scheduler: creating YouTube broadcast for %q at %s", event.Name, event.StartTime.Format(time.RFC822))
 
 	broadcastID, err := s.yt.CreateBroadcast(event.Title, event.Description, event.StartTime, event.Privacy)
 	if err != nil {
 		s.setError(fmt.Sprintf("create broadcast for %q: %v", event.Name, err))
-		return
+		return event, "", "", false
 	}
 
-	streamID, _, _, err := s.yt.EnsureStream(event.PresetID)
+	streamID, ingestURL, streamKey, err := s.yt.EnsureStream(event.PresetID)
 	if err != nil {
 		s.setError(fmt.Sprintf("ensure stream for %q: %v", event.Name, err))
-		return
+		return event, "", "", false
 	}
 
 	if err := s.yt.BindBroadcast(broadcastID, streamID); err != nil {
 		s.setError(fmt.Sprintf("bind broadcast for %q: %v", event.Name, err))
-		return
+		return event, "", "", false
 	}
 
 	key := eventKey(event)
 	if err := s.store.SetBroadcastID(key, broadcastID, streamID); err != nil {
 		s.setError(fmt.Sprintf("save broadcast mapping: %v", err))
-		return
+		return event, "", "", false
 	}
+	event.BroadcastID = broadcastID
+	event.StreamID = streamID
 
 	s.logger.Printf("scheduler: broadcast %s created and bound to stream %s for %q", broadcastID, streamID, event.Name)
 	s.setError("")
+	return event, ingestURL, streamKey, true
 }
 
 func (s *Scheduler) goLive(event Event) {
 	s.logger.Printf("scheduler: going live with %q (broadcast %s)", event.Name, event.BroadcastID)
-
-	// Get stream ingest details.
-	streamID, ingestURL, streamKey, err := s.yt.EnsureStream(event.PresetID)
-	if err != nil {
-		s.setError(fmt.Sprintf("get stream for %q: %v", event.Name, err))
-		return
+	var ingestURL, streamKey string
+	if event.BroadcastID == "" {
+		var ok bool
+		event, ingestURL, streamKey, ok = s.prepareBroadcast(event)
+		if !ok {
+			return
+		}
+	} else {
+		// Older scheduled events may have a pre-created broadcast. Bind a
+		// fresh stream at the actual start time so FFmpeg and YouTube agree
+		// on the same ingest endpoint.
+		streamID, url, key, err := s.yt.EnsureStream(event.PresetID)
+		if err != nil {
+			s.setError(fmt.Sprintf("get stream for %q: %v", event.Name, err))
+			return
+		}
+		if err := s.yt.BindBroadcast(event.BroadcastID, streamID); err != nil {
+			s.setError(fmt.Sprintf("bind broadcast for %q: %v", event.Name, err))
+			return
+		}
+		event.StreamID = streamID
+		ingestURL = url
+		streamKey = key
 	}
 
 	// Start FFmpeg, passing through the YouTube IDs so the stream controller
 	// can complete the broadcast cleanly on stop.
-	if err := s.stream.StartWithIngest(event.PresetID, ingestURL, streamKey, event.BroadcastID, streamID); err != nil {
+	if err := s.stream.StartWithIngest(event.PresetID, ingestURL, streamKey, event.BroadcastID, event.StreamID); err != nil {
 		s.setError(fmt.Sprintf("start stream for %q: %v", event.Name, err))
 		return
 	}
@@ -290,7 +307,7 @@ func (s *Scheduler) transitionToLive(broadcastID string) {
 	s.setError("could not transition broadcast to live")
 }
 
-func (s *Scheduler) stopActiveEvent(broadcastID string) {
+func (s *Scheduler) stopActiveEvent(broadcastID string, suppress bool) {
 	s.logger.Printf("scheduler: stopping active event (broadcast %s)", broadcastID)
 	s.stream.StopStream()
 
@@ -302,6 +319,7 @@ func (s *Scheduler) stopActiveEvent(broadcastID string) {
 
 	s.mu.Lock()
 	event := s.activeEvent
+	extra := s.extraMinutes
 	s.activeEvent = nil
 	s.activeBroadcast = ""
 	s.extraMinutes = 0
@@ -309,7 +327,14 @@ func (s *Scheduler) stopActiveEvent(broadcastID string) {
 
 	if event != nil {
 		key := eventKey(*event)
-		_ = s.store.ClearBroadcast(key)
+		if suppress {
+			until := event.StartTime.Add(time.Duration(event.DurationMin+extra) * time.Minute)
+			if err := s.store.SkipEvent(key, until); err != nil {
+				s.logger.Printf("scheduler: suppress stopped event: %v", err)
+			}
+		} else {
+			_ = s.store.ClearBroadcast(key)
+		}
 	}
 }
 
@@ -318,7 +343,7 @@ func (s *Scheduler) StopActive() {
 	s.mu.Lock()
 	broadcast := s.activeBroadcast
 	s.mu.Unlock()
-	s.stopActiveEvent(broadcast)
+	s.stopActiveEvent(broadcast, true)
 }
 
 func (s *Scheduler) setError(msg string) {

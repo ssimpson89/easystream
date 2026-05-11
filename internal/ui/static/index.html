@@ -27,6 +27,7 @@
       <header class="topbar">
         <div class="brand">
           <h1>EasyStream</h1>
+          <span class="app-version" x-text="`v${app.version || 'dev'}`"></span>
         </div>
         <div class="topbar-right">
           <div class="yt-pill" x-show="youtube.authenticated && youtube.channelName">
@@ -60,7 +61,7 @@
               <p class="eyebrow">Next event</p>
               <h2 x-text="nextEvent?.name"></h2>
               <p class="next-event-when" x-text="nextEvent && formatEventWhen(new Date(nextEvent.startTime))"></p>
-              <p class="hint" x-text="nextEvent?.broadcastId ? 'Broadcast ready · will start automatically' : 'Broadcast will be created 30 min before · will start automatically'"></p>
+              <p class="hint" x-text="nextEvent?.broadcastId ? 'Broadcast ready · will start at the scheduled time' : 'Broadcast will be created and started at the scheduled time'"></p>
             </div>
             <button class="button go-button"
                     x-show="canStartScheduledNow"
@@ -302,7 +303,7 @@
       <section class="panel" x-show="youtube.authenticated">
         <p class="eyebrow">Schedule</p>
         <h2>Recurring events</h2>
-        <p class="hint">EasyStream creates a YouTube broadcast 30 min ahead and auto-starts at showtime.</p>
+        <p class="hint">EasyStream creates the YouTube broadcast and starts streaming at the scheduled time.</p>
 
         <div class="schedule-list">
           <template x-if="schedules.length === 0">
@@ -316,6 +317,8 @@
               </div>
               <div class="sched-actions">
                 <span class="badge" :class="s.enabled ? 'badge-ready' : 'badge-pending'" x-text="s.enabled ? 'Active' : 'Off'"></span>
+                <button class="button button-sm" @click="toggleScheduleEnabled(s)" x-text="s.enabled ? 'Pause' : 'Resume'"></button>
+                <button class="button button-sm" @click="editSchedule(s)">Edit</button>
                 <button class="button button-sm button-danger" @click="deleteSchedule(s.id)">Delete</button>
               </div>
             </div>
@@ -358,7 +361,7 @@
           <label>YouTube title <input x-model="schedForm.title" placeholder="Sunday Morning Service - Live"></label>
           <label>Description <textarea rows="2" x-model="schedForm.description" placeholder="Join us for worship"></textarea></label>
           <div class="form-actions">
-            <button class="button go-button" @click="saveSchedule()">Save schedule</button>
+            <button class="button go-button" @click="saveSchedule()" x-text="schedForm.id ? 'Update schedule' : 'Save schedule'"></button>
             <button class="button" @click="schedFormOpen = false">Cancel</button>
           </div>
         </div>
@@ -376,6 +379,7 @@
                 <span x-text="formatDateTime(new Date(o.startTime))"></span>
               </div>
               <div class="sched-actions">
+                <button class="button button-sm" @click="editOverride(o)">Edit</button>
                 <button class="button button-sm button-danger" @click="deleteOverride(o.id)">Delete</button>
               </div>
             </div>
@@ -408,7 +412,7 @@
           <label>YouTube title <input x-model="ovrForm.title" placeholder="Easter Sunday Service - Live"></label>
           <label>Description <textarea rows="2" x-model="ovrForm.description"></textarea></label>
           <div class="form-actions">
-            <button class="button go-button" @click="saveOverride()">Save event</button>
+            <button class="button go-button" @click="saveOverride()" x-text="ovrForm.id ? 'Update event' : 'Save event'"></button>
             <button class="button" @click="ovrFormOpen = false">Cancel</button>
           </div>
         </div>
