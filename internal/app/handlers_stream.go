@@ -1,0 +1,244 @@
+package app
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/ssimpson89/easystream/internal/ffmpeg"
+	"github.com/ssimpson89/easystream/internal/quality"
+)
+
+// --- Status ---
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	config := s.config
+	health := s.streamHealth
+	broadcastID := s.activeBroadcastID
+	destMode := s.destinationMode
+	s.mu.Unlock()
+
+	streamStatus := s.supervisor.Status()
+	confidence := computeConfidence(streamStatus, health, broadcastID, destMode)
+
+	result := map[string]any{
+		"stream":            streamStatus,
+		"config":            s.configResponse(config),
+		"presets":           quality.Selectable(),
+		"platform":          ffmpeg.PlatformBackend(),
+		"health":            health,
+		"confidence":        confidence,
+		"activeBroadcastId": broadcastID,
+	}
+	if s.adaptive != nil {
+		result["adaptive"] = s.adaptive.State()
+	}
+	if s.ytAuth != nil {
+		result["youtube"] = s.ytAuth.AuthStatus()
+	}
+	if s.scheduler != nil {
+		result["scheduler"] = s.scheduler.Status()
+	}
+	if s.schedStore != nil {
+		result["nextEvents"] = s.schedStore.NextEvents(5, time.Now().UTC())
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// --- Config ---
+
+func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, quality.Selectable())
+}
+
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	config := s.config
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, s.configResponse(config))
+}
+
+func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
+	var patch struct {
+		FFmpegBinary *string            `json:"ffmpegBinary"`
+		PresetID     *string            `json:"presetId"`
+		OutputMode   *ffmpeg.OutputMode `json:"outputMode"`
+		IngestURL    *string            `json:"ingestUrl"`
+		StreamName   *string            `json:"streamName"`
+		Input        *ffmpeg.Input      `json:"input"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	if patch.FFmpegBinary != nil && *patch.FFmpegBinary != "" {
+		s.config.Binary = *patch.FFmpegBinary
+	}
+	if patch.PresetID != nil && *patch.PresetID != "" {
+		preset, ok := quality.ByID(*patch.PresetID)
+		if !ok {
+			s.mu.Unlock()
+			writeError(w, http.StatusBadRequest, "unknown quality preset")
+			return
+		}
+		s.config.Preset = preset
+	}
+	if patch.OutputMode != nil {
+		s.config.OutputMode = *patch.OutputMode
+	}
+	if patch.IngestURL != nil {
+		s.config.IngestURL = strings.TrimSpace(*patch.IngestURL)
+	}
+	if patch.StreamName != nil {
+		s.config.StreamName = strings.TrimSpace(*patch.StreamName)
+	}
+	if patch.Input != nil {
+		s.config.Input = *patch.Input
+	}
+
+	s.preview.UpdateConfig(s.config)
+	config := s.config
+	s.mu.Unlock()
+	if s.configPath != "" {
+		if err := savePersistedConfig(s.configPath, config); err != nil {
+			s.logger.Printf("failed to persist stream config: %v", err)
+		}
+	}
+	writeJSON(w, http.StatusOK, s.configResponse(config))
+}
+
+// --- Start / Stop ---
+
+func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	config := s.config
+	s.mu.Unlock()
+
+	// Clean old HLS segments before starting a new stream.
+	if config.OutputMode == ffmpeg.OutputHLS && s.hlsServer != nil {
+		_ = s.hlsServer.Clean()
+	}
+
+	// Release the capture device from the preview before the main stream
+	// claims it. On macOS, only one process can hold a camera at a time.
+	if s.preview != nil && config.Input.Kind != ffmpeg.InputTestVideo {
+		s.preview.Block()
+	}
+
+	if err := s.supervisor.Start(config); err != nil {
+		// Unblock so the preview can resume if start failed.
+		if s.preview != nil {
+			s.preview.Unblock()
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if s.adaptive != nil {
+		s.adaptive.OnStreamStart(config.Preset.ID)
+	}
+	writeJSON(w, http.StatusAccepted, s.supervisor.Status())
+}
+
+func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler != nil {
+		s.scheduler.StopActive()
+	}
+	s.supervisor.Stop()
+	if s.adaptive != nil {
+		s.adaptive.OnStreamStop()
+	}
+	if s.preview != nil {
+		s.preview.Unblock()
+	}
+	// If a YouTube broadcast was bound to this stream, transition it to
+	// "complete" so viewers see "stream ended" instead of "reconnecting"
+	// followed by a YouTube-side timeout.
+	s.mu.Lock()
+	broadcastID := s.activeBroadcastID
+	s.activeBroadcastID = ""
+	s.activeStreamID = ""
+	s.streamHealth = streamHealthSnapshot{}
+	s.mu.Unlock()
+	if broadcastID != "" && s.ytClient != nil && s.ytAuth.IsAuthenticated() {
+		go func(id string) {
+			if err := s.ytClient.TransitionBroadcast(id, "complete"); err != nil {
+				s.logger.Printf("stop: complete broadcast %s: %v", id, err)
+			} else {
+				s.logger.Printf("stop: broadcast %s transitioned to complete", id)
+			}
+		}(broadcastID)
+	}
+	writeJSON(w, http.StatusOK, s.supervisor.Status())
+}
+
+// --- Extend / Adaptive ---
+
+// handleExtend bumps the auto-stop time of the currently-active scheduled event
+// by N minutes (default 15). For services that run long.
+func (s *Server) handleExtend(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeError(w, http.StatusBadRequest, "scheduler not available")
+		return
+	}
+	var body struct {
+		Minutes int `json:"minutes"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body) // tolerate empty body — defaults to 15
+	endsAt, err := s.scheduler.Extend(body.Minutes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"endsAt": endsAt})
+}
+
+func (s *Server) handleAdaptiveToggle(w http.ResponseWriter, r *http.Request) {
+	if s.adaptive == nil {
+		writeError(w, http.StatusBadRequest, "adaptive controller not available")
+		return
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.adaptive.SetEnabled(body.Enabled)
+	writeJSON(w, http.StatusOK, s.adaptive.State())
+}
+
+// --- Devices ---
+
+func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("refresh") == "1" {
+		s.devScanner.Invalidate()
+	}
+	writeJSON(w, http.StatusOK, s.devScanner.Scan())
+}
+
+// --- Config response helper ---
+
+func (s *Server) configResponse(config ffmpeg.Config) map[string]any {
+	outputMode := string(config.OutputMode)
+	if outputMode == "" {
+		outputMode = "rtmp"
+	}
+	result := map[string]any{
+		"ffmpegBinary": config.Binary,
+		"input":        config.Input,
+		"preset":       config.Preset,
+		"outputMode":   outputMode,
+		"ingestUrl":    config.IngestURL,
+		"hasStreamKey": config.StreamName != "",
+		"network":      config.Network,
+	}
+	if s.hlsServer != nil {
+		result["hlsUrl"] = "http://" + s.addr + "/hls/stream.m3u8"
+	}
+	return result
+}

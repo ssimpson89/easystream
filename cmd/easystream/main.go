@@ -39,10 +39,20 @@ func main() {
 		redirectURI,
 		filepath.Join(dataDir, "tokens.json"),
 	)
-	if ytAuth == nil {
-		logger.Println("YouTube integration disabled (set YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET to enable)")
-	} else {
-		logger.Println("YouTube integration enabled")
+	// Surface real auth state at startup, not just "credentials present."
+	// A typo'd client ID, expired token, or revoked OAuth grant should
+	// show up here — not when the volunteer clicks Go Live Sunday morning.
+	switch {
+	case ytAuth == nil:
+		logger.Println("YouTube: integration disabled (set YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET to enable)")
+	case !ytAuth.IsAuthenticated():
+		logger.Println("YouTube: credentials present but no saved token — click \"Connect YouTube\" in the UI")
+	default:
+		if name, err := ytAuth.VerifyAuth(); err != nil {
+			logger.Printf("YouTube: token invalid or expired (%v) — re-authenticate via the UI", err)
+		} else {
+			logger.Printf("YouTube: authenticated as %q", name)
+		}
 	}
 
 	// Schedule store.

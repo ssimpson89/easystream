@@ -50,6 +50,9 @@ type SupervisorConfig struct {
 	StableAfter         time.Duration
 	ProgressStallAfter  time.Duration
 	MaxRestarts         int
+	// PidFilePath records the FFmpeg child PID so orphans can be reaped
+	// after a crash. Empty disables the feature.
+	PidFilePath string
 }
 
 type Supervisor struct {
@@ -57,10 +60,11 @@ type Supervisor struct {
 	cfg    SupervisorConfig
 	logger *log.Logger
 
-	cancel context.CancelFunc
-	done   chan struct{}
-	ffmpeg Config
-	status Status
+	cancel  context.CancelFunc
+	done    chan struct{}
+	ffmpeg  Config
+	status  Status
+	pidFile *PidFile
 
 	// onRestart is called whenever FFmpeg exits non-cleanly and is about
 	// to be restarted by the supervisor. Used by the adaptive controller
@@ -98,11 +102,23 @@ func NewSupervisor(logger *log.Logger, cfg SupervisorConfig) *Supervisor {
 	if cfg.MaxRestarts <= 0 {
 		cfg.MaxRestarts = 20
 	}
-	return &Supervisor{
+	s := &Supervisor{
 		cfg:    cfg,
 		logger: logger,
 		status: Status{State: StateIdle, UpdatedAt: time.Now().UTC()},
 	}
+	if cfg.PidFilePath != "" {
+		s.pidFile = &PidFile{Path: cfg.PidFilePath}
+		// Reap any orphan FFmpeg from a previous EasyStream run that didn't
+		// exit cleanly. Without this, the orphan keeps pushing to YouTube
+		// and a new stream creates a second concurrent connection.
+		if reaped, err := s.pidFile.ReapOrphan(); err != nil {
+			logger.Printf("supervisor: pid file reap error: %v", err)
+		} else if reaped > 0 {
+			logger.Printf("supervisor: reaped orphan FFmpeg (pid %d) from previous session", reaped)
+		}
+	}
+	return s
 }
 
 func (s *Supervisor) Start(config Config) error {
@@ -267,6 +283,13 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 		return err
 	}
 
+	// Record the child PID so we can reap an orphan after a crash.
+	if s.pidFile != nil {
+		if err := s.pidFile.Write(cmd.Process.Pid); err != nil {
+			s.logger.Printf("supervisor: failed to write pid file: %v", err)
+		}
+	}
+
 	s.mu.Lock()
 	s.status.State = StateRunning
 	s.status.UpdatedAt = time.Now().UTC()
@@ -285,6 +308,10 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 
 	err = cmd.Wait()
 	wg.Wait()
+	// Clean exit (or crash we already detected): no orphan, drop the pid file.
+	if s.pidFile != nil {
+		s.pidFile.Clear()
+	}
 	return err
 }
 

@@ -186,6 +186,32 @@ func (a *Auth) HTTPClient() (*http.Client, error) {
 	return client, nil
 }
 
+// VerifyAuth probes the saved token by fetching channel info. Exercises
+// the full OAuth refresh path and returns the channel name on success.
+// Use at startup to surface "credentials are wrong" instead of finding out
+// when the volunteer clicks Go Live on Sunday morning.
+func (a *Auth) VerifyAuth() (string, error) {
+	if a == nil {
+		return "", fmt.Errorf("not configured")
+	}
+	if !a.IsAuthenticated() {
+		return "", fmt.Errorf("no saved token")
+	}
+	if err := a.fetchChannelInfo(); err != nil {
+		return "", err
+	}
+	a.mu.Lock()
+	name := ""
+	if a.token != nil {
+		name = a.token.ChannelName
+	}
+	a.mu.Unlock()
+	if name == "" {
+		return "", fmt.Errorf("channel info not available")
+	}
+	return name, nil
+}
+
 // Logout clears stored tokens.
 func (a *Auth) Logout() error {
 	if a == nil {
