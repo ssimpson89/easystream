@@ -143,6 +143,35 @@ func NewServer(cfg ServerConfig) *Server {
 			if persisted.DestinationMode != "" {
 				destinationMode = persisted.DestinationMode
 			}
+			// Resolve AVFoundation device names to current indexes. Device
+			// indexes shift between reboots or when USB devices are
+			// plugged/unplugged; the persisted name is the stable identifier.
+			backend := defaultCfg.Input.Backend
+			if backend == "" {
+				backend = ffmpeg.PlatformBackend()
+			}
+			if backend == "avfoundation" {
+				if defaultCfg.Input.VideoDeviceName != "" {
+					resolved := ffmpeg.ResolveAVFoundationDeviceIndex(
+						defaultCfg.Binary, defaultCfg.Input.VideoDevice,
+						defaultCfg.Input.VideoDeviceName, "video")
+					if resolved != defaultCfg.Input.VideoDevice {
+						cfg.Logger.Printf("resolved video device %q from index %s → %s",
+							defaultCfg.Input.VideoDeviceName, defaultCfg.Input.VideoDevice, resolved)
+					}
+					defaultCfg.Input.VideoDevice = resolved
+				}
+				if defaultCfg.Input.AudioDeviceName != "" {
+					resolved := ffmpeg.ResolveAVFoundationDeviceIndex(
+						defaultCfg.Binary, defaultCfg.Input.AudioDevice,
+						defaultCfg.Input.AudioDeviceName, "audio")
+					if resolved != defaultCfg.Input.AudioDevice {
+						cfg.Logger.Printf("resolved audio device %q from index %s → %s",
+							defaultCfg.Input.AudioDeviceName, defaultCfg.Input.AudioDevice, resolved)
+					}
+					defaultCfg.Input.AudioDevice = resolved
+				}
+			}
 			cfg.Logger.Printf("loaded persisted stream config from %s", configPath)
 		}
 	}
