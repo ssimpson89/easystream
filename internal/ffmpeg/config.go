@@ -180,6 +180,13 @@ func (c Config) Args() ([]string, error) {
 		"-color_primaries", "bt709",
 		"-color_trc", "bt709",
 		"-colorspace", "bt709",
+		// Audio filter: compute per-second RMS level and print to stderr so
+		// the supervisor can detect silent audio (stuck mic, wrong source).
+		// astats with metadata=1:reset=1:length=1 emits a stat every 1s.
+		// ametadata=print:key=lavfi.astats.Overall.RMS_level routes the value
+		// to stderr (file=- writes to stdout which we already use for progress,
+		// so we use the default stderr).
+		"-af", "astats=metadata=1:reset=1:length=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
 		"-c:a", "aac",
 		"-b:a", c.Preset.AudioBitrate(),
 		"-ar", "48000",

@@ -10,7 +10,11 @@ import (
 
 // StreamController is the interface the scheduler uses to start/stop FFmpeg.
 type StreamController interface {
-	StartWithIngest(presetID, ingestURL, streamKey string) error
+	// StartWithIngest starts FFmpeg with the given ingest details. broadcastID
+	// and streamID are the YouTube resources this stream is bound to (empty
+	// for non-YouTube destinations) so the controller can complete the
+	// broadcast cleanly on stop.
+	StartWithIngest(presetID, ingestURL, streamKey, broadcastID, streamID string) error
 	StopStream()
 	IsStreaming() bool
 }
@@ -34,6 +38,7 @@ type Scheduler struct {
 	mu              sync.Mutex
 	activeEvent     *Event // currently live event
 	activeBroadcast string // YouTube broadcast ID of active event
+	extraMinutes    int    // extra minutes added to active event by Extend button
 	lastError       string
 
 	cancel context.CancelFunc
@@ -52,10 +57,12 @@ func NewScheduler(store *Store, stream StreamController, yt YouTubeController, l
 
 // SchedulerStatus is returned by the status API.
 type SchedulerStatus struct {
-	Running         bool   `json:"running"`
-	ActiveEventName string `json:"activeEventName,omitempty"`
-	ActiveBroadcast string `json:"activeBroadcastId,omitempty"`
-	LastError       string `json:"lastError,omitempty"`
+	Running          bool      `json:"running"`
+	ActiveEventName  string    `json:"activeEventName,omitempty"`
+	ActiveBroadcast  string    `json:"activeBroadcastId,omitempty"`
+	ActiveEndsAt     time.Time `json:"activeEndsAt,omitempty"`
+	ExtraMinutes     int       `json:"extraMinutes,omitempty"`
+	LastError        string    `json:"lastError,omitempty"`
 }
 
 // Status returns the scheduler's current state.
@@ -69,8 +76,28 @@ func (s *Scheduler) Status() SchedulerStatus {
 	if s.activeEvent != nil {
 		st.ActiveEventName = s.activeEvent.Name
 		st.ActiveBroadcast = s.activeBroadcast
+		st.ExtraMinutes = s.extraMinutes
+		dur := time.Duration(s.activeEvent.DurationMin+s.extraMinutes) * time.Minute
+		st.ActiveEndsAt = s.activeEvent.StartTime.Add(dur)
 	}
 	return st
+}
+
+// Extend adds extra minutes to the currently-active event's effective duration.
+// Use this when a service runs long — pushes the auto-stop time out without
+// stopping/restarting the stream. Returns the new end time.
+func (s *Scheduler) Extend(minutes int) (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeEvent == nil {
+		return time.Time{}, fmt.Errorf("no active scheduled event to extend")
+	}
+	if minutes <= 0 {
+		minutes = 15
+	}
+	s.extraMinutes += minutes
+	dur := time.Duration(s.activeEvent.DurationMin+s.extraMinutes) * time.Minute
+	return s.activeEvent.StartTime.Add(dur), nil
 }
 
 // Start begins the background scheduler loop.
@@ -138,10 +165,11 @@ func (s *Scheduler) tick() {
 	s.mu.Lock()
 	active := s.activeEvent
 	activeBroadcast := s.activeBroadcast
+	extra := s.extraMinutes
 	s.mu.Unlock()
 
 	if active != nil {
-		endTime := active.StartTime.Add(time.Duration(active.DurationMin) * time.Minute)
+		endTime := active.StartTime.Add(time.Duration(active.DurationMin+extra) * time.Minute)
 		if now.After(endTime) {
 			s.stopActiveEvent(activeBroadcast)
 		}
@@ -206,14 +234,15 @@ func (s *Scheduler) goLive(event Event) {
 	s.logger.Printf("scheduler: going live with %q (broadcast %s)", event.Name, event.BroadcastID)
 
 	// Get stream ingest details.
-	_, ingestURL, streamKey, err := s.yt.EnsureStream(event.PresetID)
+	streamID, ingestURL, streamKey, err := s.yt.EnsureStream(event.PresetID)
 	if err != nil {
 		s.setError(fmt.Sprintf("get stream for %q: %v", event.Name, err))
 		return
 	}
 
-	// Start FFmpeg.
-	if err := s.stream.StartWithIngest(event.PresetID, ingestURL, streamKey); err != nil {
+	// Start FFmpeg, passing through the YouTube IDs so the stream controller
+	// can complete the broadcast cleanly on stop.
+	if err := s.stream.StartWithIngest(event.PresetID, ingestURL, streamKey, event.BroadcastID, streamID); err != nil {
 		s.setError(fmt.Sprintf("start stream for %q: %v", event.Name, err))
 		return
 	}
@@ -275,6 +304,7 @@ func (s *Scheduler) stopActiveEvent(broadcastID string) {
 	event := s.activeEvent
 	s.activeEvent = nil
 	s.activeBroadcast = ""
+	s.extraMinutes = 0
 	s.mu.Unlock()
 
 	if event != nil {

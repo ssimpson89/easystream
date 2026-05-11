@@ -212,6 +212,40 @@ section.panel.primary { margin-bottom: 0; }
   font-weight: 600;
 }
 
+/* --- Confidence panel (traffic-light health indicators) --- */
+.confidence-panel {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+}
+.confidence-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+.confidence-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--muted);
+}
+.confidence-dot.green   { background: var(--good); box-shadow: 0 0 8px color-mix(in srgb, var(--good) 60%, transparent); }
+.confidence-dot.yellow  { background: var(--warn); box-shadow: 0 0 8px color-mix(in srgb, var(--warn) 60%, transparent); }
+.confidence-dot.red     { background: var(--bad);  box-shadow: 0 0 8px color-mix(in srgb, var(--bad)  60%, transparent); }
+.confidence-dot.unknown { background: var(--muted); }
+.confidence-dot.off     { background: #21262d; }
+.confidence-info { min-width: 0; flex: 1; }
+.confidence-label { display: block; font-size: 13px; font-weight: 700; color: var(--text); }
+.confidence-detail { display: block; font-size: 12px; color: var(--muted); margin-top: 2px; }
+.confidence-item.red .confidence-detail   { color: var(--bad);  }
+.confidence-item.yellow .confidence-detail { color: var(--warn); }
+
 /* --- Metrics --- */
 .metrics {
   display: grid;

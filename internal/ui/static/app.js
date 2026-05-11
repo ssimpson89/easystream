@@ -14,6 +14,9 @@ const els = {
   presetInfoUpload: document.querySelector("#preset-info-upload"),
   start: document.querySelector("#start"),
   stop: document.querySelector("#stop"),
+  stopConfirm: document.querySelector("#stop-confirm"),
+  stopCancel: document.querySelector("#stop-cancel"),
+  extend: document.querySelector("#extend"),
   startReason: document.querySelector("#start-reason"),
   saveNotice: document.querySelector("#save-notice"),
   problemBanner: document.querySelector("#problem-banner"),
@@ -89,6 +92,8 @@ async function refresh() {
     if (data.youtube) renderYouTubeStatus(data.youtube);
     if (data.nextEvents) renderEvents(data.nextEvents);
     if (data.adaptive) renderAdaptiveStatus(data.adaptive);
+    if (data.confidence) renderConfidence(data.confidence);
+    if (data.scheduler) renderSchedulerActive(data.scheduler);
     cachedPresets = data.presets || [];
   } catch (error) {
     els.state.textContent = "Offline";
@@ -134,6 +139,57 @@ function renderProblemBanner(stream) {
   els.problemBannerTitle.textContent = titles[stream.state] || "Stream issue";
   els.problemBannerDetail.textContent =
     stream.lastError || stream.lastExit || stream.lastLogLine || "Check your network and capture source.";
+}
+
+// renderSchedulerActive shows the Extend button when a scheduled event is
+// currently live so the operator can push out the auto-stop time.
+function renderSchedulerActive(sched) {
+  if (!els.extend) return;
+  const active = !!sched.activeEventName;
+  els.extend.hidden = !active;
+  if (active && sched.activeEndsAt) {
+    const ends = new Date(sched.activeEndsAt);
+    const title = `${sched.activeEventName} ends at ${ends.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
+    els.extend.title = title;
+    if (sched.extraMinutes > 0) {
+      els.extend.textContent = `+15 min (was extended ${sched.extraMinutes}m)`;
+    } else {
+      els.extend.textContent = "+15 min";
+    }
+  }
+}
+
+// renderConfidence draws traffic-light indicators showing whether the broadcast
+// is actually healthy end-to-end (encoder sending, audio detected, destination
+// receiving). These answer "is the church actually live?" — separate from the
+// engineering metrics below.
+function renderConfidence(indicators) {
+  const panel = document.querySelector("#confidence-panel");
+  if (!panel) return;
+  if (!indicators || indicators.length === 0) {
+    panel.innerHTML = "";
+    return;
+  }
+  panel.innerHTML = "";
+  for (const ind of indicators) {
+    const item = document.createElement("div");
+    item.className = `confidence-item ${ind.status}`;
+    const dot = document.createElement("span");
+    dot.className = `confidence-dot ${ind.status}`;
+    const info = document.createElement("span");
+    info.className = "confidence-info";
+    const label = document.createElement("span");
+    label.className = "confidence-label";
+    label.textContent = ind.label;
+    const detail = document.createElement("span");
+    detail.className = "confidence-detail";
+    detail.textContent = ind.detail || "";
+    info.appendChild(label);
+    info.appendChild(detail);
+    item.appendChild(dot);
+    item.appendChild(info);
+    panel.appendChild(item);
+  }
 }
 
 function loadConfigIntoForm(config, presets) {
@@ -403,7 +459,37 @@ els.start.addEventListener("click", async () => {
   }
 });
 
-els.stop.addEventListener("click", async () => {
+// --- Stop with inline confirmation ---
+// First click swaps Stop for "Confirm stop / Cancel" so an accidental click
+// can't kill a live broadcast. Auto-cancels after 5 seconds of no action.
+let stopConfirmTimer = null;
+
+function showStopConfirm() {
+  if (els.stop) els.stop.hidden = true;
+  if (els.stopConfirm) els.stopConfirm.hidden = false;
+  if (els.stopCancel) els.stopCancel.hidden = false;
+  clearTimeout(stopConfirmTimer);
+  stopConfirmTimer = setTimeout(hideStopConfirm, 5000);
+}
+
+function hideStopConfirm() {
+  clearTimeout(stopConfirmTimer);
+  if (els.stop) els.stop.hidden = false;
+  if (els.stopConfirm) els.stopConfirm.hidden = true;
+  if (els.stopCancel) els.stopCancel.hidden = true;
+}
+
+els.stop?.addEventListener("click", () => {
+  if (els.stop.disabled) return;
+  showStopConfirm();
+});
+
+els.stopCancel?.addEventListener("click", () => {
+  hideStopConfirm();
+});
+
+els.stopConfirm?.addEventListener("click", async () => {
+  hideStopConfirm();
   try {
     els.stop.disabled = true;
     els.lastMessage.textContent = "Stopping stream...";
@@ -412,6 +498,24 @@ els.stop.addEventListener("click", async () => {
   } catch (error) {
     els.lastMessage.textContent = error.message;
     updateButtonStates(lastStreamState);
+  }
+});
+
+// --- Extend active scheduled event by 15 min ---
+els.extend?.addEventListener("click", async () => {
+  try {
+    els.extend.disabled = true;
+    const result = await api("/api/extend", {
+      method: "POST",
+      body: JSON.stringify({ minutes: 15 }),
+    });
+    const endsAt = new Date(result.endsAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    showNotice(`Extended — now ends at ${endsAt}`);
+    await refresh();
+  } catch (error) {
+    showNotice(error.message);
+  } finally {
+    els.extend.disabled = false;
   }
 });
 

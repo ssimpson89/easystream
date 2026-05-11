@@ -29,6 +29,14 @@ type Broadcast struct {
 	StreamID       string    `json:"streamId,omitempty"`
 }
 
+// StreamHealth is the live health snapshot for a bound stream.
+type StreamHealth struct {
+	StreamStatus       string   `json:"streamStatus"`       // active|created|error|inactive|ready
+	HealthStatus       string   `json:"healthStatus"`       // good|ok|bad|noData
+	Issues             []string `json:"issues,omitempty"`
+	LastUpdateTimeUnix int64    `json:"lastUpdateTime,omitempty"`
+}
+
 // Stream represents a YouTube live stream (RTMP endpoint).
 type Stream struct {
 	ID        string `json:"id"`
@@ -165,6 +173,55 @@ func (c *Client) GetStream(streamID string) (*Stream, error) {
 		return nil, fmt.Errorf("stream %s not found", streamID)
 	}
 	return parseStream(resp.Items[0])
+}
+
+// GetStreamHealth returns the platform-reported health for a stream.
+// Use this while broadcasting to know whether YouTube is actually
+// receiving and accepting the feed.
+func (c *Client) GetStreamHealth(streamID string) (*StreamHealth, error) {
+	path := fmt.Sprintf("/liveStreams?part=status&id=%s", url.QueryEscape(streamID))
+	body, err := c.get(path)
+	if err != nil {
+		return nil, fmt.Errorf("get stream health: %w", err)
+	}
+	var resp struct {
+		Items []struct {
+			Status struct {
+				StreamStatus string `json:"streamStatus"`
+				HealthStatus struct {
+					Status              string `json:"status"`
+					LastUpdateTimeSecs  int64  `json:"lastUpdateTimeSeconds,string"`
+					ConfigurationIssues []struct {
+						Type        string `json:"type"`
+						Severity    string `json:"severity"`
+						Reason      string `json:"reason"`
+						Description string `json:"description"`
+					} `json:"configurationIssues"`
+				} `json:"healthStatus"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	if len(resp.Items) == 0 {
+		return nil, fmt.Errorf("stream %s not found", streamID)
+	}
+	item := resp.Items[0]
+	issues := make([]string, 0, len(item.Status.HealthStatus.ConfigurationIssues))
+	for _, ci := range item.Status.HealthStatus.ConfigurationIssues {
+		if ci.Description != "" {
+			issues = append(issues, ci.Description)
+		} else if ci.Reason != "" {
+			issues = append(issues, ci.Reason)
+		}
+	}
+	return &StreamHealth{
+		StreamStatus:       item.Status.StreamStatus,
+		HealthStatus:       item.Status.HealthStatus.Status,
+		Issues:             issues,
+		LastUpdateTimeUnix: item.Status.HealthStatus.LastUpdateTimeSecs,
+	}, nil
 }
 
 // BindBroadcast binds a broadcast to a stream.

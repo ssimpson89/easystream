@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,16 +29,19 @@ const (
 )
 
 type Status struct {
-	State          State     `json:"state"`
-	StartedAt      time.Time `json:"startedAt,omitempty"`
-	UpdatedAt      time.Time `json:"updatedAt"`
-	RestartCount   int       `json:"restartCount"`
-	LastExit       string    `json:"lastExit,omitempty"`
-	LastError      string    `json:"lastError,omitempty"`
-	LastLogLine    string    `json:"lastLogLine,omitempty"`
-	LastProgress   Progress  `json:"lastProgress"`
-	ActivePresetID string    `json:"activePresetId"`
-	Command        []string  `json:"command,omitempty"`
+	State           State     `json:"state"`
+	StartedAt       time.Time `json:"startedAt,omitempty"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+	RestartCount    int       `json:"restartCount"`
+	LastExit        string    `json:"lastExit,omitempty"`
+	LastError       string    `json:"lastError,omitempty"`
+	LastLogLine     string    `json:"lastLogLine,omitempty"`
+	LastProgress    Progress  `json:"lastProgress"`
+	ActivePresetID  string    `json:"activePresetId"`
+	Command         []string  `json:"command,omitempty"`
+	AudioRMSdB      float64   `json:"audioRmsDb"`      // -inf to 0; lower = quieter, -inf = silent
+	AudioRMSAt      time.Time `json:"audioRmsAt"`      // when AudioRMSdB was last updated
+	AudioDetectedAt time.Time `json:"audioDetectedAt"` // when audio above silence floor was last seen
 }
 
 type SupervisorConfig struct {
@@ -301,6 +306,25 @@ func (s *Supervisor) recordLogs(r io.Reader) {
 		if line == "" {
 			continue
 		}
+
+		// Audio level lines look like:
+		//   [Parsed_ametadata_1 @ 0x...] lavfi.astats.Overall.RMS_level=-22.45
+		// Extract just the numeric value and update Status without spamming
+		// LastLogLine (these arrive every second).
+		if rms, ok := parseAudioRMS(line); ok {
+			now := time.Now().UTC()
+			s.mu.Lock()
+			s.status.AudioRMSdB = rms
+			s.status.AudioRMSAt = now
+			// Silence floor: RMS_level below -55 dB is effectively no audio.
+			// FFmpeg returns "-inf" for absolute silence which parses to -math.Inf(-1).
+			if rms > -55 {
+				s.status.AudioDetectedAt = now
+			}
+			s.mu.Unlock()
+			continue
+		}
+
 		hint := classifyFFmpegError(line)
 		s.mu.Lock()
 		s.status.LastLogLine = line
@@ -313,6 +337,27 @@ func (s *Supervisor) recordLogs(r io.Reader) {
 			s.logger.Printf("ffmpeg: %s", line)
 		}
 	}
+}
+
+// parseAudioRMS extracts the RMS_level value from an FFmpeg ametadata log line.
+func parseAudioRMS(line string) (float64, bool) {
+	idx := strings.Index(line, "lavfi.astats.Overall.RMS_level=")
+	if idx < 0 {
+		return 0, false
+	}
+	val := strings.TrimSpace(line[idx+len("lavfi.astats.Overall.RMS_level="):])
+	// Trim anything after the number (FFmpeg occasionally appends spaces).
+	if space := strings.IndexAny(val, " \t"); space >= 0 {
+		val = val[:space]
+	}
+	if val == "-inf" || val == "nan" {
+		return math.Inf(-1), true
+	}
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
 }
 
 // classifyFFmpegError pattern-matches known fatal FFmpeg messages and returns

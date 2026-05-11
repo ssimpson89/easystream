@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -46,9 +47,23 @@ type Server struct {
 	logger     *log.Logger
 	configPath string // disk persistence for stream config
 
-	mu              sync.Mutex
-	config          ffmpeg.Config
-	destinationMode string // UI hint: which destination tab is active
+	mu                sync.Mutex
+	config            ffmpeg.Config
+	destinationMode   string // UI hint: which destination tab is active
+	activeBroadcastID string // YouTube broadcast bound to the current stream
+	activeStreamID    string // YouTube stream resource bound to the current broadcast
+	streamHealth      streamHealthSnapshot
+}
+
+// streamHealthSnapshot is the latest result of polling the destination
+// (currently YouTube) for the bound stream's health.
+type streamHealthSnapshot struct {
+	StreamStatus  string    `json:"streamStatus,omitempty"`  // active|created|error|inactive|ready
+	HealthStatus  string    `json:"healthStatus,omitempty"`  // good|ok|bad|noData
+	Issues        []string  `json:"issues,omitempty"`
+	LastUpdate    time.Time `json:"lastUpdate,omitempty"`
+	Source        string    `json:"source,omitempty"` // "youtube" | "" if not available
+	HasBroadcast  bool      `json:"hasBroadcast"`
 }
 
 // persistedConfig is a subset of ffmpeg.Config we save across restarts,
@@ -177,6 +192,11 @@ func NewServer(cfg ServerConfig) *Server {
 		server.scheduler.Start()
 	}
 
+	// Start the health poller. When a YouTube broadcast is bound to the
+	// active stream, we poll YouTube every 15s for streamStatus/healthStatus
+	// so the UI can show "Receiving" / "noData" / "bad" indicators.
+	go server.runHealthPoller()
+
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(cfg.WebFS)))
 
@@ -188,6 +208,7 @@ func NewServer(cfg ServerConfig) *Server {
 	mux.HandleFunc("POST /api/start", server.handleStart)
 	mux.HandleFunc("POST /api/stop", server.handleStop)
 	mux.HandleFunc("POST /api/adaptive", server.handleAdaptiveToggle)
+	mux.HandleFunc("POST /api/extend", server.handleExtend)
 
 	// Devices.
 	mux.HandleFunc("GET /api/devices", server.handleDevices)
@@ -254,13 +275,22 @@ func (s *Server) Close() {
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	config := s.config
+	health := s.streamHealth
+	broadcastID := s.activeBroadcastID
+	destMode := s.destinationMode
 	s.mu.Unlock()
 
+	streamStatus := s.supervisor.Status()
+	confidence := computeConfidence(streamStatus, health, broadcastID, destMode)
+
 	result := map[string]any{
-		"stream":   s.supervisor.Status(),
-		"config":   s.configResponse(config),
-		"presets":  quality.Selectable(),
-		"platform": ffmpeg.PlatformBackend(),
+		"stream":       streamStatus,
+		"config":       s.configResponse(config),
+		"presets":      quality.Selectable(),
+		"platform":     ffmpeg.PlatformBackend(),
+		"health":       health,
+		"confidence":   confidence,
+		"activeBroadcastId": broadcastID,
 	}
 	if s.adaptive != nil {
 		result["adaptive"] = s.adaptive.State()
@@ -275,6 +305,87 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		result["nextEvents"] = s.schedStore.NextEvents(5, time.Now().UTC())
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// confidenceIndicator is a traffic-light view of one stream characteristic
+// for the operator's "is the broadcast actually working?" panel.
+type confidenceIndicator struct {
+	Label  string `json:"label"`
+	Status string `json:"status"` // "green" | "yellow" | "red" | "unknown" | "off"
+	Detail string `json:"detail,omitempty"`
+}
+
+func computeConfidence(stream ffmpeg.Status, health streamHealthSnapshot, broadcastID, destMode string) []confidenceIndicator {
+	out := []confidenceIndicator{}
+
+	// 1. Encoder is sending.
+	enc := confidenceIndicator{Label: "Encoder"}
+	switch stream.State {
+	case ffmpeg.StateRunning:
+		enc.Status = "green"
+		enc.Detail = "Sending data"
+	case ffmpeg.StateDegraded:
+		enc.Status = "yellow"
+		enc.Detail = "Stalled or backed up"
+	case ffmpeg.StateRestarting, ffmpeg.StateStarting:
+		enc.Status = "yellow"
+		enc.Detail = "Reconnecting"
+	case ffmpeg.StateFailed:
+		enc.Status = "red"
+		enc.Detail = "Stopped on error"
+	default:
+		enc.Status = "off"
+		enc.Detail = "Idle"
+	}
+	out = append(out, enc)
+
+	// 2. Audio detected.
+	aud := confidenceIndicator{Label: "Audio"}
+	if stream.State != ffmpeg.StateRunning && stream.State != ffmpeg.StateDegraded {
+		aud.Status = "off"
+	} else if stream.AudioRMSAt.IsZero() {
+		aud.Status = "unknown"
+		aud.Detail = "Waiting for level..."
+	} else if !stream.AudioDetectedAt.IsZero() && time.Since(stream.AudioDetectedAt) < 5*time.Second {
+		aud.Status = "green"
+		aud.Detail = fmt.Sprintf("%.0f dB RMS", stream.AudioRMSdB)
+	} else {
+		aud.Status = "red"
+		aud.Detail = "Silence detected — check mic / source"
+	}
+	out = append(out, aud)
+
+	// 3. Destination receiving (YouTube-side health, when available).
+	dest := confidenceIndicator{Label: "Destination"}
+	switch {
+	case stream.State != ffmpeg.StateRunning && stream.State != ffmpeg.StateDegraded:
+		dest.Status = "off"
+	case broadcastID == "" || health.Source == "":
+		// Manual RTMP / no YT API — we can only infer from encoder
+		dest.Status = "unknown"
+		dest.Detail = "No platform feedback (manual RTMP)"
+	case health.HealthStatus == "good":
+		dest.Status = "green"
+		dest.Detail = "YouTube: good"
+	case health.HealthStatus == "ok":
+		dest.Status = "green"
+		dest.Detail = "YouTube: ok"
+	case health.HealthStatus == "bad":
+		dest.Status = "yellow"
+		dest.Detail = "YouTube reports issues"
+		if len(health.Issues) > 0 {
+			dest.Detail = "YouTube: " + health.Issues[0]
+		}
+	case health.HealthStatus == "noData":
+		dest.Status = "red"
+		dest.Detail = "YouTube not receiving"
+	default:
+		dest.Status = "unknown"
+		dest.Detail = "Checking..."
+	}
+	out = append(out, dest)
+
+	return out
 }
 
 func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
@@ -369,6 +480,48 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, s.supervisor.Status())
 }
 
+// runHealthPoller polls YouTube for the bound stream's health every 15s
+// while we have an active broadcast. Updates s.streamHealth so the UI
+// confidence indicators reflect what YouTube actually sees.
+func (s *Server) runHealthPoller() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.pollStreamHealth()
+	}
+}
+
+func (s *Server) pollStreamHealth() {
+	s.mu.Lock()
+	streamID := s.activeStreamID
+	hasBroadcast := s.activeBroadcastID != ""
+	s.mu.Unlock()
+
+	// Only poll when we have a bound stream and YT auth.
+	if streamID == "" || s.ytClient == nil || s.ytAuth == nil || !s.ytAuth.IsAuthenticated() {
+		s.mu.Lock()
+		s.streamHealth = streamHealthSnapshot{HasBroadcast: hasBroadcast}
+		s.mu.Unlock()
+		return
+	}
+
+	health, err := s.ytClient.GetStreamHealth(streamID)
+	if err != nil {
+		s.logger.Printf("health poll: %v", err)
+		return
+	}
+	s.mu.Lock()
+	s.streamHealth = streamHealthSnapshot{
+		StreamStatus: health.StreamStatus,
+		HealthStatus: health.HealthStatus,
+		Issues:       health.Issues,
+		LastUpdate:   time.Now().UTC(),
+		Source:       "youtube",
+		HasBroadcast: true,
+	}
+	s.mu.Unlock()
+}
+
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler != nil {
 		s.scheduler.StopActive()
@@ -380,7 +533,44 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if s.preview != nil {
 		s.preview.Unblock()
 	}
+	// If a YouTube broadcast was bound to this stream, transition it to
+	// "complete" so viewers see "stream ended" instead of "reconnecting"
+	// followed by a YouTube-side timeout.
+	s.mu.Lock()
+	broadcastID := s.activeBroadcastID
+	s.activeBroadcastID = ""
+	s.activeStreamID = ""
+	s.streamHealth = streamHealthSnapshot{}
+	s.mu.Unlock()
+	if broadcastID != "" && s.ytClient != nil && s.ytAuth.IsAuthenticated() {
+		go func(id string) {
+			if err := s.ytClient.TransitionBroadcast(id, "complete"); err != nil {
+				s.logger.Printf("stop: complete broadcast %s: %v", id, err)
+			} else {
+				s.logger.Printf("stop: broadcast %s transitioned to complete", id)
+			}
+		}(broadcastID)
+	}
 	writeJSON(w, http.StatusOK, s.supervisor.Status())
+}
+
+// handleExtend bumps the auto-stop time of the currently-active scheduled event
+// by N minutes (default 15). For services that run long.
+func (s *Server) handleExtend(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeError(w, http.StatusBadRequest, "scheduler not available")
+		return
+	}
+	var body struct {
+		Minutes int `json:"minutes"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body) // tolerate empty body — defaults to 15
+	endsAt, err := s.scheduler.Extend(body.Minutes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"endsAt": endsAt})
 }
 
 func (s *Server) handleAdaptiveToggle(w http.ResponseWriter, r *http.Request) {
@@ -527,6 +717,8 @@ func (s *Server) handleGoLiveNow(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.config.IngestURL = stream.IngestURL
 	s.config.StreamName = stream.StreamKey
+	s.activeBroadcastID = broadcast.ID
+	s.activeStreamID = stream.ID
 	startConfig := s.config
 	s.mu.Unlock()
 
@@ -534,6 +726,10 @@ func (s *Server) handleGoLiveNow(w http.ResponseWriter, r *http.Request) {
 		s.preview.Block()
 	}
 	if err := s.supervisor.Start(startConfig); err != nil {
+		s.mu.Lock()
+		s.activeBroadcastID = ""
+		s.activeStreamID = ""
+		s.mu.Unlock()
 		if s.preview != nil {
 			s.preview.Unblock()
 		}
@@ -742,7 +938,7 @@ type streamControllerAdapter struct {
 	server *Server
 }
 
-func (a *streamControllerAdapter) StartWithIngest(presetID, ingestURL, streamKey string) error {
+func (a *streamControllerAdapter) StartWithIngest(presetID, ingestURL, streamKey, broadcastID, streamID string) error {
 	a.server.mu.Lock()
 	if presetID != "" {
 		if preset, ok := quality.ByID(presetID); ok {
@@ -751,12 +947,18 @@ func (a *streamControllerAdapter) StartWithIngest(presetID, ingestURL, streamKey
 	}
 	a.server.config.IngestURL = ingestURL
 	a.server.config.StreamName = streamKey
+	a.server.activeBroadcastID = broadcastID
+	a.server.activeStreamID = streamID
 	config := a.server.config
 	a.server.mu.Unlock()
 	if a.server.preview != nil && config.Input.Kind != ffmpeg.InputTestVideo {
 		a.server.preview.Block()
 	}
 	if err := a.server.supervisor.Start(config); err != nil {
+		a.server.mu.Lock()
+		a.server.activeBroadcastID = ""
+		a.server.activeStreamID = ""
+		a.server.mu.Unlock()
 		if a.server.preview != nil {
 			a.server.preview.Unblock()
 		}
@@ -770,6 +972,12 @@ func (a *streamControllerAdapter) StopStream() {
 	if a.server.preview != nil {
 		a.server.preview.Unblock()
 	}
+	// Caller (scheduler) already calls TransitionBroadcast itself; just clear local state.
+	a.server.mu.Lock()
+	a.server.activeBroadcastID = ""
+	a.server.activeStreamID = ""
+	a.server.streamHealth = streamHealthSnapshot{}
+	a.server.mu.Unlock()
 }
 
 func (a *streamControllerAdapter) IsStreaming() bool {
