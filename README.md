@@ -36,7 +36,18 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in your browser.
 
 ## Configuration
 
-All configuration is via environment variables:
+EasyStream reads its config from environment variables. On startup it also
+loads a `.env` file in the working directory if one is present. Real
+environment variables take precedence over `.env` entries, so production
+deployments (systemd, Docker, etc.) keep working unchanged.
+
+```bash
+cp .env.example .env
+# edit .env with your values
+go run ./cmd/easystream
+```
+
+`.env` is gitignored; only `.env.example` is committed.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -91,22 +102,24 @@ YouTube integration is optional. Without it, you can still stream using manual R
 
 ### 5. Run EasyStream with YouTube credentials
 
+Easiest: copy `.env.example` to `.env` and fill in your values:
+
+```bash
+cp .env.example .env
+# edit .env:
+#   YOUTUBE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+#   YOUTUBE_CLIENT_SECRET=your-client-secret
+go run ./cmd/easystream
+```
+
+`.env` is gitignored — your secrets stay local.
+
+If you'd rather export inline (CI/CD, systemd, etc.):
+
 ```bash
 export YOUTUBE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
 export YOUTUBE_CLIENT_SECRET="your-client-secret"
 go run ./cmd/easystream
-```
-
-Or create a `.env` file and source it:
-
-```bash
-# .env (do NOT commit this file)
-export YOUTUBE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
-export YOUTUBE_CLIENT_SECRET="your-client-secret"
-```
-
-```bash
-source .env && go run ./cmd/easystream
 ```
 
 ### 6. Connect your YouTube account

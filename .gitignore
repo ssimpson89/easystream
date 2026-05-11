@@ -1,5 +1,5 @@
-# Binaries
-easystream
+# Binaries (anchored to root so we don't accidentally ignore cmd/easystream/)
+/easystream
 *.exe
 
 # Data directory
@@ -8,6 +8,9 @@ easystream
 # Environment files
 .env
 .env.local
+
+# Local notes / scratch
+TODO.md
 
 # OS files
 .DS_Store
