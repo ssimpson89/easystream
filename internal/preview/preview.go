@@ -440,20 +440,41 @@ func previewArgs(config ffmpeg.Config, videoRTPPort, audioRTPPort int) []string 
 	inputs := previewInputs(config)
 	args = append(args, inputs.args...)
 
+	// Use the same encoder as the main stream to avoid CPU-heavy
+	// software re-encode when hardware encoding is available.
+	encoder := config.EffectiveEncoder()
+	previewScale := "scale=640:360:force_original_aspect_ratio=decrease"
 	args = append(args,
 		"-map", inputs.videoMap,
 		"-an",
-		"-vf", "scale=640:360:force_original_aspect_ratio=decrease",
+		"-vf", previewScale,
 		"-r", "15",
-		"-c:v", "libx264",
-		"-preset", "ultrafast",
-		"-tune", "zerolatency",
-		"-profile:v", "baseline",
-		"-level:v", "3.1",
-		"-pix_fmt", "yuv420p",
+	)
+	switch encoder {
+	case ffmpeg.EncoderVideoToolbox:
+		args = append(args,
+			"-c:v", "h264_videotoolbox",
+			"-profile:v", "baseline", "-level:v", "3.1",
+			"-allow_sw", "1", "-realtime", "1",
+			"-pix_fmt", "yuv420p", "-bf", "0",
+		)
+	case ffmpeg.EncoderNVENC:
+		args = append(args,
+			"-c:v", "h264_nvenc",
+			"-preset", "p1", "-profile:v", "baseline", "-level:v", "3.1",
+			"-rc", "cbr", "-bf", "0", "-pix_fmt", "yuv420p",
+		)
+	default:
+		args = append(args,
+			"-c:v", "libx264",
+			"-preset", "ultrafast", "-tune", "zerolatency",
+			"-profile:v", "baseline", "-level:v", "3.1",
+			"-pix_fmt", "yuv420p", "-bf", "0",
+		)
+	}
+	args = append(args,
 		"-g", "30",
 		"-keyint_min", "15",
-		"-bf", "0",
 		"-b:v", "800k",
 		"-flush_packets", "1",
 		"-muxdelay", "0",

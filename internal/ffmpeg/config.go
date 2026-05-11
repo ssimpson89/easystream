@@ -54,10 +54,69 @@ const (
 	OutputHLS  OutputMode = "hls"  // Write HLS segments to local dir
 )
 
+// Encoder selects which H.264 video encoder FFmpeg uses.
+type Encoder string
+
+const (
+	EncoderX264         Encoder = "libx264"           // Software (CPU)
+	EncoderVideoToolbox Encoder = "h264_videotoolbox" // macOS hardware (Apple Silicon / Intel)
+	EncoderNVENC        Encoder = "h264_nvenc"        // NVIDIA GPU
+	EncoderVAAPI        Encoder = "h264_vaapi"        // Linux Intel/AMD GPU
+	EncoderQSV          Encoder = "h264_qsv"          // Intel QuickSync
+)
+
+// EncoderInfo describes a detected encoder for the UI.
+type EncoderInfo struct {
+	ID          Encoder `json:"id"`
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	Available   bool    `json:"available"`
+}
+
+// knownEncoders lists all encoders we know how to configure, in display order.
+var knownEncoders = []EncoderInfo{
+	{EncoderX264, "Software (x264)", "CPU-based, always available, widest compatibility", true},
+	{EncoderVideoToolbox, "Apple VideoToolbox", "macOS hardware encoder (Apple Silicon / Intel)", false},
+	{EncoderNVENC, "NVIDIA NVENC", "NVIDIA GPU hardware encoder", false},
+	{EncoderVAAPI, "VA-API", "Linux Intel/AMD GPU hardware encoder", false},
+	{EncoderQSV, "Intel QuickSync", "Intel GPU hardware encoder", false},
+}
+
+// DetectEncoders probes ffmpeg for available hardware encoders.
+func DetectEncoders(binary string) []EncoderInfo {
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, binary, "-hide_banner", "-encoders").CombinedOutput()
+	if err != nil {
+		// Return list with only software available.
+		result := make([]EncoderInfo, len(knownEncoders))
+		copy(result, knownEncoders)
+		return result
+	}
+	output := string(out)
+	result := make([]EncoderInfo, len(knownEncoders))
+	copy(result, knownEncoders)
+	for i := range result {
+		if result[i].ID == EncoderX264 {
+			result[i].Available = true
+			continue
+		}
+		// Look for the encoder name in the output.
+		if strings.Contains(output, string(result[i].ID)) {
+			result[i].Available = true
+		}
+	}
+	return result
+}
+
 type Config struct {
 	Binary       string         `json:"binary"`
 	Input        Input          `json:"input"`
 	Preset       quality.Preset `json:"preset"`
+	Encoder      Encoder        `json:"encoder,omitempty"`
 	OutputMode   OutputMode     `json:"outputMode"`
 	IngestURL    string         `json:"ingestUrl"`
 	StreamName   string         `json:"streamName"`
@@ -114,6 +173,14 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// EffectiveEncoder returns the encoder to use, defaulting to libx264.
+func (c Config) EffectiveEncoder() Encoder {
+	if c.Encoder == "" {
+		return EncoderX264
+	}
+	return c.Encoder
+}
+
 func (c Config) OutputURL() string {
 	base := strings.TrimRight(c.IngestURL, "/")
 	name := strings.TrimLeft(c.StreamName, "/")
@@ -142,50 +209,51 @@ func (c Config) Args() ([]string, error) {
 	args = append(args, inputs.args...)
 	args = append(args, "-map", inputs.videoMap, "-map", inputs.audioMap)
 
+	encoder := c.EffectiveEncoder()
+	gop := fmt.Sprintf("%d", c.Preset.GOP())
+
 	// Build video filter chain. SDI/DeckLink sources may be interlaced
 	// so we auto-deinterlace with yadif, then scale + pad to the target
 	// resolution preserving aspect ratio.
 	//
 	// scale/pad accept W:H (colon-separated) — NOT W x H. The pad filter
 	// in particular doesn't recognise "1920x1080" as a dimension pair.
-	vf := fmt.Sprintf(
-		"yadif=deint=interlaced,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black",
-		c.Preset.Width, c.Preset.Height,
-		c.Preset.Width, c.Preset.Height,
-	)
-	// yadif deint=interlaced is a no-op on progressive sources.
+	var vf string
+	w, h := c.Preset.Width, c.Preset.Height
+	if encoder == EncoderVideoToolbox {
+		// VideoToolbox encoder handles progressive webcam/OBS input natively
+		// so we skip yadif deinterlacing. scale_vt requires hwaccel frames
+		// which AVFoundation doesn't produce, so we keep the CPU scaler
+		// (cheap relative to encoding).
+		vf = fmt.Sprintf(
+			"scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black",
+			w, h, w, h,
+		)
+	} else {
+		// Software path: yadif deint=interlaced is a no-op on progressive
+		// sources but catches real interlaced SDI/DeckLink input.
+		vf = fmt.Sprintf(
+			"yadif=deint=interlaced,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black",
+			w, h, w, h,
+		)
+	}
 
 	// Encoder settings aligned with YouTube's H.264 recommendations:
-	//   - High profile (CABAC, 8-bit 4:2:0)
-	//   - 2 B-frames, 1 reference frame, progressive scan
+	//   - High profile where supported (CABAC, 8-bit 4:2:0)
+	//   - 2 B-frames, 1 reference frame, progressive scan (software)
 	//   - CBR via -b:v == -maxrate, 2x bufsize for ~2s buffer
 	//   - 2-second keyframe interval (GOP = FPS * 2)
 	//   - Rec.709 color primaries / transfer / matrix for SDR
 	//   - 128 kbps AAC stereo at 48 kHz
-	//
-	// No -tune zerolatency: it disables B-frames, which YouTube explicitly
-	// recommends keeping (2 B-frames). Latency doesn't matter for broadcast
-	// streaming — viewers always have a multi-second buffer.
+	args = append(args, "-vf", vf)
+	args = append(args, c.encoderArgs(encoder, gop)...)
 	args = append(args,
-		"-c:v", "libx264",
-		"-preset", "veryfast",
-		"-profile:v", "high",
-		"-level:v", "4.1",
-		"-vf", vf,
 		"-b:v", c.Preset.VideoBitrate(),
 		"-maxrate", c.Preset.VideoBitrate(),
 		"-bufsize", c.Preset.BufferSize(),
-		"-g", fmt.Sprintf("%d", c.Preset.GOP()),
-		"-keyint_min", fmt.Sprintf("%d", c.Preset.GOP()),
-		"-sc_threshold", "0",
-		"-bf", "2",
-		"-refs", "1",
-		// Closed GOP: every keyframe is IDR and no frame references across
-		// keyframe boundaries. x264 default but explicit is safer. Required
-		// by Cloudflare Stream; preferred by YouTube/Twitch/etc.
-		"-x264-params", "open-gop=0",
-		"-pix_fmt", "yuv420p",
+		"-g", gop,
 		"-r", fmt.Sprintf("%d", c.Preset.FPS),
+		"-pix_fmt", "yuv420p",
 		"-color_primaries", "bt709",
 		"-color_trc", "bt709",
 		"-colorspace", "bt709",
@@ -223,14 +291,17 @@ func (c Config) Args() ([]string, error) {
 	}
 
 	// Secondary output: low-res H.264 RTP for live browser preview.
+	// Uses the same encoder family as the primary stream to avoid a
+	// redundant CPU-based re-encode when hardware encoding is active.
+	previewScale := "scale=640:360:force_original_aspect_ratio=decrease"
 	args = append(args,
 		"-map", inputs.videoMap, "-an",
-		"-vf", "scale=640:360:force_original_aspect_ratio=decrease",
+		"-vf", previewScale,
 		"-r", "15",
-		"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-		"-profile:v", "baseline", "-level:v", "3.1",
-		"-pix_fmt", "yuv420p",
-		"-g", "30", "-keyint_min", "15", "-bf", "0",
+	)
+	args = append(args, c.previewEncoderArgs(encoder)...)
+	args = append(args,
+		"-g", "30", "-keyint_min", "15",
 		"-b:v", "800k",
 		"-flush_packets", "1", "-muxdelay", "0", "-muxpreload", "0",
 		"-payload_type", "96",
@@ -249,6 +320,137 @@ func (c Config) Args() ([]string, error) {
 	)
 
 	return args, nil
+}
+
+// encoderArgs returns the encoder-specific flags for the primary stream output.
+// Each hardware encoder needs different flags because they don't share x264's
+// CLI options (no -preset veryfast, no -x264-params, etc.).
+func (c Config) encoderArgs(encoder Encoder, gop string) []string {
+	switch encoder {
+	case EncoderVideoToolbox:
+		// Apple VideoToolbox (macOS). Uses hardware H.264 on Apple Silicon
+		// or Intel. Supports -profile and -level but not x264 presets.
+		// -allow_sw 1 falls back to software if hardware is busy.
+		return []string{
+			"-c:v", "h264_videotoolbox",
+			"-profile:v", "high",
+			"-level:v", "4.1",
+			"-allow_sw", "1",
+			"-realtime", "1",
+		}
+
+	case EncoderNVENC:
+		// NVIDIA NVENC. Uses -preset p4 (balanced speed/quality) and
+		// CBR rate control. -rc cbr requires -b:v to be set (done by caller).
+		return []string{
+			"-c:v", "h264_nvenc",
+			"-preset", "p4",
+			"-profile:v", "high",
+			"-level:v", "4.1",
+			"-rc", "cbr",
+			"-bf", "2",
+			"-g", gop,
+			"-keyint_min", gop,
+		}
+
+	case EncoderVAAPI:
+		// VA-API (Linux Intel/AMD). Requires a DRM render device.
+		// The video filter chain needs hwupload and format conversion.
+		return []string{
+			"-vaapi_device", "/dev/dri/renderD128",
+			"-c:v", "h264_vaapi",
+			"-profile:v", "high",
+			"-level", "41",
+			"-bf", "2",
+			"-g", gop,
+			"-keyint_min", gop,
+		}
+
+	case EncoderQSV:
+		// Intel QuickSync Video.
+		return []string{
+			"-c:v", "h264_qsv",
+			"-preset", "veryfast",
+			"-profile:v", "high",
+			"-level", "41",
+			"-bf", "2",
+			"-g", gop,
+			"-keyint_min", gop,
+		}
+
+	default: // libx264 (software)
+		// No -tune zerolatency: it disables B-frames, which YouTube
+		// explicitly recommends keeping (2 B-frames). Latency doesn't
+		// matter for broadcast streaming.
+		return []string{
+			"-c:v", "libx264",
+			"-preset", "veryfast",
+			"-profile:v", "high",
+			"-level:v", "4.1",
+			"-keyint_min", gop,
+			"-sc_threshold", "0",
+			"-bf", "2",
+			"-refs", "1",
+			// Closed GOP: every keyframe is IDR and no frame references
+			// across keyframe boundaries. Required by Cloudflare Stream;
+			// preferred by YouTube/Twitch/etc.
+			"-x264-params", "open-gop=0",
+		}
+	}
+}
+
+// previewEncoderArgs returns lightweight encoder flags for the secondary
+// low-res RTP preview output. Hardware encoders use their native codec;
+// software falls back to ultrafast/zerolatency for minimal CPU overhead.
+func (c Config) previewEncoderArgs(encoder Encoder) []string {
+	switch encoder {
+	case EncoderVideoToolbox:
+		return []string{
+			"-c:v", "h264_videotoolbox",
+			"-profile:v", "baseline",
+			"-level:v", "3.1",
+			"-allow_sw", "1",
+			"-realtime", "1",
+			"-pix_fmt", "yuv420p",
+			"-bf", "0",
+		}
+	case EncoderNVENC:
+		return []string{
+			"-c:v", "h264_nvenc",
+			"-preset", "p1",
+			"-profile:v", "baseline",
+			"-level:v", "3.1",
+			"-rc", "cbr",
+			"-bf", "0",
+			"-pix_fmt", "yuv420p",
+		}
+	case EncoderVAAPI:
+		return []string{
+			"-c:v", "h264_vaapi",
+			"-profile:v", "constrained_baseline",
+			"-level", "31",
+			"-bf", "0",
+		}
+	case EncoderQSV:
+		return []string{
+			"-c:v", "h264_qsv",
+			"-preset", "veryfast",
+			"-profile:v", "baseline",
+			"-level", "31",
+			"-bf", "0",
+			"-pix_fmt", "yuv420p",
+		}
+	default:
+		return []string{
+			"-c:v", "libx264",
+			"-preset", "ultrafast",
+			"-tune", "zerolatency",
+			"-profile:v", "baseline",
+			"-level:v", "3.1",
+			"-pix_fmt", "yuv420p",
+			"-bf", "0",
+		}
+	}
 }
 
 // inputBuild describes the constructed FFmpeg inputs and how to map them.

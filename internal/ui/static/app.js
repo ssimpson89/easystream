@@ -55,6 +55,8 @@ document.addEventListener("alpine:init", () => {
     videoSourceValue: "",
     audioSourceValue: "",
     selectedPreset: "recommended",
+    selectedEncoder: "libx264",
+    encoders: [],
     outputMode: "rtmp",
     ingestUrl: "",
     streamKey: "",
@@ -124,8 +126,13 @@ document.addEventListener("alpine:init", () => {
         }
       } catch (_) {}
 
-      // Initial loads
+      // Initial loads — scan encoders first so the <select> has options
+      // before syncConfigToForm sets the selected value. Otherwise Alpine
+      // resets selectedEncoder to the first option ("libx264") because no
+      // matching <option> exists yet.
+      await this.scanEncoders();
       await this.refresh();
+      this._initDone = true;
       this.loadSchedules();
       this.loadOverrides();
       this.scanDevices();
@@ -358,6 +365,11 @@ document.addEventListener("alpine:init", () => {
         if (data.config && (!this._configLoaded || !this.videoSourceValue)) {
           this.syncConfigToForm(data.config);
         }
+        // Keep encoder in sync with backend on every poll — the encoder
+        // select is side-effect-free so this won't trigger saves.
+        if (data.config?.encoder) {
+          this.selectedEncoder = data.config.encoder;
+        }
       } catch (e) {
         this.showToast("Connection error: " + e.message);
       }
@@ -383,6 +395,23 @@ document.addEventListener("alpine:init", () => {
           ? "No video devices detected. Connect a camera or capture card and click Refresh."
           : `${v} video, ${a} audio detected.`;
       } catch (_) {}
+    },
+
+    async scanEncoders() {
+      try {
+        const data = await this.api("/api/encoders");
+        this.encoders = (data || []).filter((e) => e.available);
+      } catch (_) {}
+    },
+    onEncoderChange() {
+      // Skip saves triggered by Alpine reactivity during init —
+      // only save when the user explicitly changes the select.
+      if (!this._initDone) return;
+      this.saveConfig().then(() => this.showToast("Encoder saved"));
+    },
+    encoderDescription() {
+      const enc = this.encoders.find((e) => e.id === this.selectedEncoder);
+      return enc ? enc.description : "";
     },
 
     async loadSchedules() {
@@ -704,6 +733,7 @@ document.addEventListener("alpine:init", () => {
     syncConfigToForm(config) {
       if (!config) return;
       this.selectedPreset = config.preset.id;
+      this.selectedEncoder = config.encoder || "libx264";
       this.videoSourceValue = this.encodeSourceValue(config.input);
       this.audioSourceValue = config.input.audioDevice || "";
       this.outputMode = config.outputMode || "rtmp";
@@ -822,6 +852,7 @@ document.addEventListener("alpine:init", () => {
       }
       const payload = {
         presetId: this.selectedPreset,
+        encoder: this.selectedEncoder,
         ingestUrl: (this.ingestUrl || "").trim(),
         outputMode: this.outputMode,
         input: {
@@ -847,6 +878,7 @@ document.addEventListener("alpine:init", () => {
         const result = await this.api("/api/config", { method: "POST", body: JSON.stringify(payload) });
         this.config = result;
         this.selectedPreset = result.preset.id;
+        this.selectedEncoder = result.encoder || "libx264";
         this.ingestUrl = result.ingestUrl || "";
         this.streamKey = "";
         this.hasStreamKey = !!result.hasStreamKey;

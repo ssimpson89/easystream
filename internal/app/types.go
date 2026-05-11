@@ -27,6 +27,7 @@ type streamHealthSnapshot struct {
 // startup; Network is fixed.
 type persistedConfig struct {
 	PresetID        string            `json:"presetId"`
+	Encoder         ffmpeg.Encoder    `json:"encoder,omitempty"`
 	OutputMode      ffmpeg.OutputMode `json:"outputMode"`
 	IngestURL       string            `json:"ingestUrl"`
 	StreamName      string            `json:"streamName"`
@@ -47,6 +48,7 @@ func loadPersistedConfig(path string) (persistedConfig, error) {
 func savePersistedConfig(path string, cfg ffmpeg.Config) error {
 	p := persistedConfig{
 		PresetID:   cfg.Preset.ID,
+		Encoder:    cfg.Encoder,
 		OutputMode: cfg.OutputMode,
 		IngestURL:  cfg.IngestURL,
 		StreamName: cfg.StreamName,

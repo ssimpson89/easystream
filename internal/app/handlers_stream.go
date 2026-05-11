@@ -64,6 +64,7 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	var patch struct {
 		FFmpegBinary *string            `json:"ffmpegBinary"`
 		PresetID     *string            `json:"presetId"`
+		Encoder      *ffmpeg.Encoder    `json:"encoder"`
 		OutputMode   *ffmpeg.OutputMode `json:"outputMode"`
 		IngestURL    *string            `json:"ingestUrl"`
 		StreamName   *string            `json:"streamName"`
@@ -98,6 +99,9 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if patch.Input != nil {
 		s.config.Input = *patch.Input
+	}
+	if patch.Encoder != nil {
+		s.config.Encoder = *patch.Encoder
 	}
 
 	s.preview.UpdateConfig(s.config)
@@ -230,6 +234,13 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.devScanner.Scan())
 }
 
+func (s *Server) handleEncoders(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	binary := s.config.Binary
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, ffmpeg.DetectEncoders(binary))
+}
+
 // --- Config response helper ---
 
 func (s *Server) configResponse(config ffmpeg.Config) map[string]any {
@@ -241,6 +252,7 @@ func (s *Server) configResponse(config ffmpeg.Config) map[string]any {
 		"ffmpegBinary": config.Binary,
 		"input":        config.Input,
 		"preset":       config.Preset,
+		"encoder":      string(config.EffectiveEncoder()),
 		"outputMode":   outputMode,
 		"ingestUrl":    config.IngestURL,
 		"hasStreamKey": config.StreamName != "",

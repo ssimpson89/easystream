@@ -147,3 +147,53 @@ func TestChooseAVFoundationDeviceIndex(t *testing.T) {
 		t.Fatal("expected not found for audio device searched in video section")
 	}
 }
+
+func TestEncoderArgsVideoToolbox(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Encoder = EncoderVideoToolbox
+	cfg.StreamName = "abc"
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	joined := strings.Join(args, " ")
+	for _, expected := range []string{
+		"-c:v h264_videotoolbox",
+		"-allow_sw 1",
+		"-realtime 1",
+		"-profile:v high",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("expected args to contain %q, got %s", expected, joined)
+		}
+	}
+	// Should NOT contain x264-specific flags.
+	for _, absent := range []string{
+		"-preset veryfast",
+		"-x264-params",
+	} {
+		if strings.Contains(joined, absent) {
+			t.Fatalf("did not expect args to contain %q for videotoolbox", absent)
+		}
+	}
+}
+
+func TestDefaultEncoderIsX264(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.StreamName = "abc"
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-c:v libx264") {
+		t.Fatalf("expected default encoder to be libx264, got %s", joined)
+	}
+	if !strings.Contains(joined, "-preset veryfast") {
+		t.Fatalf("expected veryfast preset for libx264, got %s", joined)
+	}
+}

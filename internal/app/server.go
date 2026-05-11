@@ -140,6 +140,9 @@ func NewServer(cfg ServerConfig) *Server {
 			if persisted.Input.Kind != "" {
 				defaultCfg.Input = persisted.Input
 			}
+			if persisted.Encoder != "" {
+				defaultCfg.Encoder = persisted.Encoder
+			}
 			if persisted.DestinationMode != "" {
 				destinationMode = persisted.DestinationMode
 			}
@@ -258,6 +261,7 @@ func (s *Server) routes(webFS fs.FS) http.Handler {
 
 	// Devices.
 	mux.HandleFunc("GET /api/devices", s.handleDevices)
+	mux.HandleFunc("GET /api/encoders", s.handleEncoders)
 
 	// Preview (WebRTC SDP offer/answer).
 	mux.Handle("POST /api/preview/webrtc/offer", s.preview)

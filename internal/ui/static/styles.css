@@ -519,6 +519,28 @@ dd { margin: 4px 0 0; font-size: 24px; font-weight: 740; font-variant-numeric: t
 }
 .adaptive-toggle input { width: auto; min-height: 0; margin: 0; cursor: pointer; }
 
+.encoder-select {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.encoder-select .field-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
+.encoder-select select {
+  width: 100%;
+}
+.encoder-hint {
+  margin-top: 4px;
+  font-size: 12px;
+}
+
 .logline {
   min-height: 42px;
   margin-top: 14px;
