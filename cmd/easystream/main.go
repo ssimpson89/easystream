@@ -1,16 +1,20 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/ssimpson89/easystream/internal/app"
 	"github.com/ssimpson89/easystream/internal/hls"
+	"github.com/ssimpson89/easystream/internal/preview"
 	"github.com/ssimpson89/easystream/internal/schedule"
 	"github.com/ssimpson89/easystream/internal/ui"
 	"github.com/ssimpson89/easystream/internal/youtube"
@@ -18,6 +22,13 @@ import (
 
 func main() {
 	logger := log.New(os.Stdout, "easystream ", log.LstdFlags|log.LUTC)
+
+	// Reap any leftover ffmpeg children from a previous EasyStream session.
+	// Without this, orphans accumulate on every restart (or crash) and all
+	// write to the same RTP port, garbling the preview. The supervisor's
+	// pid file already handles the main-stream ffmpeg; this catches the
+	// preview ffmpeg and any post-tee secondary outputs.
+	preview.ReapOrphans(logger)
 
 	// Load .env from the current directory if present. godotenv's default
 	// Load() does NOT override values already in os.Environ, so real env
@@ -80,6 +91,19 @@ func main() {
 		DataDir:         dataDir,
 	})
 	defer server.Close()
+
+	// Graceful shutdown: on SIGTERM/SIGINT, close the server and stop the
+	// supervised FFmpeg before exiting. EasyStream intentionally keeps FFmpeg
+	// owned by this process so live telemetry and recovery never go blind.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		s := <-sigCh
+		logger.Printf("received %s — shutting down", s)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	}()
 
 	logger.Printf("starting web interface on http://%s", server.Addr())
 	logger.Printf("HLS playlist URL: http://%s/hls/stream.m3u8", addr)

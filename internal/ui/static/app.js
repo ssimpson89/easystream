@@ -1,1162 +1,1138 @@
-// --- Element references ---
-const els = {
-  state: document.querySelector("#state"),
-  title: document.querySelector("#status-title"),
-  bitrate: document.querySelector("#bitrate"),
-  frames: document.querySelector("#frames"),
-  restarts: document.querySelector("#restarts"),
-  speed: document.querySelector("#speed"),
-  lastMessage: document.querySelector("#last-message"),
-  presetTrigger: document.querySelector("#preset-trigger"),
-  presetMenu: document.querySelector("#preset-menu"),
-  presetDropdown: document.querySelector("#preset-dropdown"),
-  presetInfoTitle: document.querySelector("#preset-info-title"),
-  presetInfoUpload: document.querySelector("#preset-info-upload"),
-  start: document.querySelector("#start"),
-  stop: document.querySelector("#stop"),
-  stopConfirm: document.querySelector("#stop-confirm"),
-  stopCancel: document.querySelector("#stop-cancel"),
-  extend: document.querySelector("#extend"),
-  startReason: document.querySelector("#start-reason"),
-  saveNotice: document.querySelector("#save-notice"),
-  problemBanner: document.querySelector("#problem-banner"),
-  problemBannerTitle: document.querySelector("#problem-banner-title"),
-  problemBannerDetail: document.querySelector("#problem-banner-detail"),
-  ingestURL: document.querySelector("#ingest-url"),
-  streamName: document.querySelector("#stream-name"),
-  videoSource: document.querySelector("#video-source"),
-  audioSource: document.querySelector("#audio-source"),
-  audioSourceLabel: document.querySelector("#audio-source-label"),
-  // Output mode
-  outputMode: document.querySelector("#output-mode"),
-  rtmpFields: document.querySelector("#rtmp-fields"),
-  hlsFields: document.querySelector("#hls-fields"),
-  hlsUrl: document.querySelector("#hls-url"),
-  copyHlsUrl: document.querySelector("#copy-hls-url"),
-  // YouTube
-  ytAccount: document.querySelector("#yt-account"),
-  ytChannelName: document.querySelector("#yt-channel-name"),
-  ytLogout: document.querySelector("#yt-logout"),
-  ytLoginPrompt: document.querySelector("#yt-login-prompt"),
-  ytLogin: document.querySelector("#yt-login"),
-  scheduleUI: document.querySelector("#schedule-ui"),
-  nowYTLogin: document.querySelector("#now-yt-login"),
-  nowUI: document.querySelector("#now-ui"),
-  // Schedule
-  eventsList: document.querySelector("#events-list"),
-  schedulesList: document.querySelector("#schedules-list"),
-  overridesList: document.querySelector("#overrides-list"),
-  deviceStatus: document.querySelector("#device-status"),
-  adaptiveBanner: document.querySelector("#adaptive-banner"),
-  adaptiveBannerTitle: document.querySelector("#adaptive-banner-title"),
-  adaptiveBannerDetail: document.querySelector("#adaptive-banner-detail"),
-  adaptiveEnabled: document.querySelector("#adaptive-enabled"),
-  // Preview
-  previewToggle: document.querySelector("#preview-toggle"),
-  previewContainer: document.querySelector("#preview-container"),
-  previewVideo: document.querySelector("#preview-video"),
-};
+// EasyStream — Alpine.js front-end.
+//
+// Single reactive component holds all state. Polls /api/status every 2s and
+// mirrors the result into reactive properties. The DOM binds declaratively
+// via x-show, x-bind, x-text, x-model etc., so we never call querySelector
+// from rendering code.
+//
+// WebRTC and the clipboard API stay imperative — they're exposed as methods
+// on the component and called from Alpine event handlers.
 
-let selectedPreset = "recommended";
-let lastDeviceScan = null;
-let pendingVideoValue = "test-video::";
-let pendingAudioDevice = "";
-let configLoaded = false;
-let lastStreamState = "idle";
-let currentDestMode = "scheduled";
-let previewActive = false;
-let cachedPresets = [];
+document.addEventListener("alpine:init", () => {
+  Alpine.data("app", () => ({
 
-// --- API helper ---
-async function api(path, options = {}) {
-  const headers = {};
-  if (options.body) {
-    headers["content-type"] = "application/json";
-  }
-  const response = await fetch(path, { ...options, headers });
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.error || "Request failed");
-  return body;
-}
+    // ============================================================
+    // SERVER-SOURCED STATE (refreshed every 2s)
+    // ============================================================
+    stream: { state: "idle", lastProgress: {}, restartCount: 0 },
+    config: null,
+    youtube: { authenticated: false, configured: false, channelName: "" },
+    scheduler: null,
+    nextEvents: [],
+    presets: [],
+    confidence: [],
+    adaptive: { enabled: true, isFallback: false },
+    health: {},
+    activeBroadcastId: "",
+    devices: { video: [], audio: [] },
+    schedules: [],
+    overrides: [],
 
-// --- Status polling ---
-async function refresh() {
-  try {
-    const data = await api("/api/status");
-    renderStatus(data);
-    if (!configLoaded) {
-      loadConfigIntoForm(data.config, data.presets);
-      if (data.platform) setPlatformDefault(data.platform);
-      configLoaded = true;
-    }
-    if (data.youtube) renderYouTubeStatus(data.youtube);
-    if (data.nextEvents) renderEvents(data.nextEvents);
-    if (data.adaptive) renderAdaptiveStatus(data.adaptive);
-    if (data.confidence) renderConfidence(data.confidence);
-    if (data.scheduler) renderSchedulerActive(data.scheduler);
-    cachedPresets = data.presets || [];
-  } catch (error) {
-    els.state.textContent = "Offline";
-    els.state.className = "state failed";
-    els.lastMessage.textContent = error.message;
-  }
-}
+    // ============================================================
+    // UI STATE
+    // ============================================================
+    view: "dashboard",
+    presetMenuOpen: false,
+    schedFormOpen: false,
+    ovrFormOpen: false,
+    stopConfirm: false,
+    toast: "",
+    deviceStatusText: "Scanning for devices...",
 
-function renderStatus(data) {
-  const stream = data.stream;
-  lastStreamState = stream.state;
+    ytModal: { open: false, title: "Live Stream", privacy: "unlisted", warn: "", busy: false },
+    customModal: { open: false, warn: "", busy: false },
 
-  els.state.textContent = labelState(stream.state);
-  els.state.className = `state ${stream.state}`;
-  els.title.textContent = titleForState(stream.state);
-  els.bitrate.textContent = stream.lastProgress?.bitrateKbps
-    ? `${Math.round(stream.lastProgress.bitrateKbps)} kbps`
-    : "-";
-  els.frames.textContent = stream.lastProgress?.frame || "-";
-  els.restarts.textContent = stream.restartCount ?? 0;
-  els.speed.textContent = stream.lastProgress?.speed || "-";
-  els.lastMessage.textContent =
-    stream.lastError || stream.lastExit || stream.lastLogLine || "No stream activity yet.";
+    // Preview
+    previewVisible: true,        // user wants the preview pane open
+    previewError: "",
+    previewSuppressed: false,    // user explicitly hid it
+    audioMeterLevel: 0,
+    audioMeterPeak: 0,
+    audioMeterText: "No audio",
+    audioMeterActive: false,
 
-  renderProblemBanner(stream);
-  updateButtonStates(stream.state);
-}
+    // Form mirror of server config (auto-saved on change)
+    videoSourceValue: "",
+    audioSourceValue: "",
+    selectedPreset: "recommended",
+    outputMode: "rtmp",
+    ingestUrl: "",
+    streamKey: "",
+    hasStreamKey: false,
+    hlsUrl: "http://127.0.0.1:8080/hls/stream.m3u8",
 
-function renderProblemBanner(stream) {
-  if (!els.problemBanner) return;
-  const problemStates = { degraded: true, restarting: true, failed: true };
-  if (!problemStates[stream.state]) {
-    els.problemBanner.hidden = true;
-    return;
-  }
-  els.problemBanner.hidden = false;
-  els.problemBanner.className = `problem-banner ${stream.state}`;
-  const titles = {
-    degraded: "Stream needs attention",
-    restarting: "Reconnecting to ingest...",
-    failed: "Stream failed",
-  };
-  els.problemBannerTitle.textContent = titles[stream.state] || "Stream issue";
-  els.problemBannerDetail.textContent =
-    stream.lastError || stream.lastExit || stream.lastLogLine || "Check your network and capture source.";
-}
+    schedForm: { name: "", days: [], time: "08:45", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted" },
+    ovrForm: { name: "", wallClock: "", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted" },
 
-// renderSchedulerActive shows the Extend button when a scheduled event is
-// currently live so the operator can push out the auto-stop time.
-function renderSchedulerActive(sched) {
-  if (!els.extend) return;
-  const active = !!sched.activeEventName;
-  els.extend.hidden = !active;
-  if (active && sched.activeEndsAt) {
-    const ends = new Date(sched.activeEndsAt);
-    const title = `${sched.activeEventName} ends at ${ends.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
-    els.extend.title = title;
-    if (sched.extraMinutes > 0) {
-      els.extend.textContent = `+15 min (was extended ${sched.extraMinutes}m)`;
-    } else {
-      els.extend.textContent = "+15 min";
-    }
-  }
-}
+    // Internal
+    _previewPC: null,
+    _previewTimeout: null,
+    _previewStarting: false,
+    _audioMeterInterval: null,
+    _audioMeterLastEnergy: null,
+    _audioMeterLastDuration: null,
+    _audioMeterPeakHold: 0,
+    _audioMeterContext: null,
+    _audioMeterSource: null,
+    _audioMeterAnalyser: null,
+    _audioMeterGain: null,
+    _audioMeterData: null,
+    _configLoaded: false,
+    _wasLive: false,
+    _stopTimer: null,
+    _toastTimer: null,
+    _statusInterval: null,
+    _deviceInterval: null,
 
-// renderConfidence draws traffic-light indicators showing whether the broadcast
-// is actually healthy end-to-end (encoder sending, audio detected, destination
-// receiving). These answer "is the church actually live?" — separate from the
-// engineering metrics below.
-function renderConfidence(indicators) {
-  const panel = document.querySelector("#confidence-panel");
-  if (!panel) return;
-  if (!indicators || indicators.length === 0) {
-    panel.innerHTML = "";
-    return;
-  }
-  panel.innerHTML = "";
-  for (const ind of indicators) {
-    const item = document.createElement("div");
-    item.className = `confidence-item ${ind.status}`;
-    const dot = document.createElement("span");
-    dot.className = `confidence-dot ${ind.status}`;
-    const info = document.createElement("span");
-    info.className = "confidence-info";
-    const label = document.createElement("span");
-    label.className = "confidence-label";
-    label.textContent = ind.label;
-    const detail = document.createElement("span");
-    detail.className = "confidence-detail";
-    detail.textContent = ind.detail || "";
-    info.appendChild(label);
-    info.appendChild(detail);
-    item.appendChild(dot);
-    item.appendChild(info);
-    panel.appendChild(item);
-  }
-}
+    dayList: [
+      { value: "sunday",    label: "Sun" },
+      { value: "monday",    label: "Mon" },
+      { value: "tuesday",   label: "Tue" },
+      { value: "wednesday", label: "Wed" },
+      { value: "thursday",  label: "Thu" },
+      { value: "friday",    label: "Fri" },
+      { value: "saturday",  label: "Sat" },
+    ],
+    tzList: [
+      { value: "America/Chicago",     label: "Central (CST/CDT)" },
+      { value: "America/New_York",    label: "Eastern (EST/EDT)" },
+      { value: "America/Denver",      label: "Mountain (MST/MDT)" },
+      { value: "America/Los_Angeles", label: "Pacific (PST/PDT)" },
+      { value: "America/Phoenix",     label: "Arizona (MST)" },
+      { value: "Pacific/Honolulu",    label: "Hawaii (HST)" },
+      { value: "America/Anchorage",   label: "Alaska (AKST/AKDT)" },
+      { value: "UTC",                 label: "UTC" },
+    ],
+    tzListShort: [
+      { value: "America/Chicago",     label: "Central (CST/CDT)" },
+      { value: "America/New_York",    label: "Eastern (EST/EDT)" },
+      { value: "America/Denver",      label: "Mountain (MST/MDT)" },
+      { value: "America/Los_Angeles", label: "Pacific (PST/PDT)" },
+      { value: "UTC",                 label: "UTC" },
+    ],
 
-function loadConfigIntoForm(config, presets) {
-  selectedPreset = config.preset.id;
-  els.ingestURL.value = config.ingestUrl || "";
-  els.streamName.placeholder = config.hasStreamKey
-    ? "Stream key is set (enter a new one to replace)"
-    : "Paste your stream key here";
+    // ============================================================
+    // INIT / LIFECYCLE
+    // ============================================================
+    async init() {
+      // Browser timezone as schedForm default (overridden later by user).
+      try {
+        const browserTZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        if (this.tzList.some((t) => t.value === browserTZ)) {
+          this.schedForm.timezone = browserTZ;
+          this.ovrForm.timezone = browserTZ;
+        }
+      } catch (_) {}
 
-  // Video source value is encoded as "kind:backend:device" so the scanner
-  // can match it back when populating the dropdown.
-  pendingVideoValue = encodeSourceValue(config.input);
-  pendingAudioDevice = config.input.audioDevice || "";
+      // Initial loads
+      await this.refresh();
+      this.loadSchedules();
+      this.loadOverrides();
+      this.scanDevices();
 
-  if (els.outputMode) {
-    els.outputMode.value = config.outputMode || "rtmp";
-    updateOutputModeVisibility();
-  }
-  if (config.hlsUrl && els.hlsUrl) {
-    els.hlsUrl.textContent = config.hlsUrl;
-  }
-  renderPresets(presets);
-}
+      // Polling
+      this._statusInterval = setInterval(() => this.refresh(), 2000);
+      this._deviceInterval = setInterval(() => this.scanDevices(false), 5000);
 
-function setPlatformDefault(_platform) {
-  // No-op: backend is now auto-determined from the selected device.
-}
+      // Track previous live state so we only act on actual transitions,
+      // not on every reactive re-evaluation (refresh() reassigns this.stream
+      // every 2s, which can re-trigger $watch even when isLive stays false).
+      this._wasLive = this.isLive;
+      this.$watch("isLive", (now) => {
+        const prev = this._wasLive;
+        this._wasLive = now;
+        if (now === prev) return; // no real transition
 
-// destinationReadiness inspects current UI state to decide whether Go Live
-// can fire. Returns {ready: bool, reason: string} where reason is shown
-// inline when ready is false.
-function destinationReadiness() {
-  const videoOK = els.videoSource?.value && els.videoSource.value !== "";
-  if (!videoOK) {
-    return { ready: false, reason: "Select a video source in Step 3" };
-  }
-  switch (currentDestMode) {
-    case "scheduled":
-      // Scheduled mode handles itself via the scheduler. Manual Go Live
-      // from this tab uses the last manually-configured destination,
-      // which we treat as Manual mode requirements.
-      if (!ytAuthed && !destinationHasManualURL()) {
-        return { ready: false, reason: "Connect YouTube or use the Manual tab" };
-      }
-      return { ready: true };
-    case "now":
-      if (!ytAuthed) {
-        return { ready: false, reason: "Connect YouTube to go live now" };
-      }
-      return { ready: true };
-    case "manual":
-      if (!destinationHasManualURL()) {
-        return { ready: false, reason: "Paste an ingest URL and stream key" };
-      }
-      return { ready: true };
-    default:
-      return { ready: true };
-  }
-}
+        document.title = now ? "● LIVE · EasyStream" : "EasyStream";
+        const favicon = document.querySelector("#favicon");
+        if (favicon) {
+          favicon.href = now
+            ? "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230d1117'/%3E%3Ccircle cx='8' cy='8' r='5' fill='%23ff1a1a'/%3E%3C/svg%3E"
+            : "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230d1117'/%3E%3Cpath d='M5 4 L12 8 L5 12 Z' fill='%232f81f7'/%3E%3C/svg%3E";
+        }
 
-function destinationHasManualURL() {
-  const url = els.ingestURL?.value?.trim();
-  if (!url) return false;
-  // RTMP needs a key; HLS doesn't.
-  if (els.outputMode?.value === "hls") return true;
-  const keyTyped = els.streamName?.value?.trim().length > 0;
-  const keyAlreadySaved = els.streamName?.placeholder?.includes("Stream key is set");
-  return keyTyped || keyAlreadySaved;
-}
+        if (now && this.previewVisible && !this.previewSuppressed) {
+          // Going live — reconnect the audio meter to the existing WebRTC
+          // audio track so it picks up audio from the main stream's RTP feed.
+          setTimeout(() => {
+            if (!this.isLive || !this._previewPC) return;
+            const pc = this._previewPC;
+            const receivers = pc.getReceivers ? pc.getReceivers() : [];
+            for (const r of receivers) {
+              if (r.track && r.track.kind === "audio") {
+                this.attachAudioMeterTrack(r.track);
+                break;
+              }
+            }
+          }, 1500);
+        }
 
-let ytAuthed = false;
+        if (!now && this.previewVisible && !this.previewSuppressed) {
+          // Going idle — refresh the full PeerConnection after preview
+          // FFmpeg has had time to start via Unblock().
+          setTimeout(() => {
+            if (this.isLive) return;
+            if (!this.previewVisible || this.previewSuppressed) return;
+            this.refreshPreview();
+          }, 2000);
+        }
+      });
 
-function updateButtonStates(state) {
-  const isActive = ["starting", "running", "degraded", "restarting"].includes(state);
-  const isStopping = state === "stopping";
-  els.stop.disabled = !isActive;
+      // Tear down WebRTC PC on tab close.
+      window.addEventListener("beforeunload", () => this.stopPreviewPC());
+      window.addEventListener("pointerdown", () => this.resumeAudioMeterContext(), { passive: true });
+      window.addEventListener("keydown", () => this.resumeAudioMeterContext());
 
-  if (isActive || isStopping) {
-    els.start.disabled = true;
-    if (els.startReason) els.startReason.hidden = true;
-    return;
-  }
-
-  const readiness = destinationReadiness();
-  els.start.disabled = !readiness.ready;
-  if (els.startReason) {
-    if (readiness.ready) {
-      els.startReason.hidden = true;
-    } else {
-      els.startReason.hidden = false;
-      els.startReason.textContent = readiness.reason;
-    }
-  }
-}
-
-// --- Output mode ---
-function updateOutputModeVisibility() {
-  if (!els.outputMode) return;
-  const isHLS = els.outputMode.value === "hls";
-  if (els.rtmpFields) els.rtmpFields.hidden = isHLS;
-  if (els.hlsFields) els.hlsFields.hidden = !isHLS;
-}
-
-els.outputMode?.addEventListener("change", updateOutputModeVisibility);
-
-els.copyHlsUrl?.addEventListener("click", () => {
-  const url = els.hlsUrl?.textContent;
-  if (url) {
-    navigator.clipboard.writeText(url).then(() => showNotice("HLS URL copied!"));
-  }
-});
-
-// --- Capture source ---
-// Encode/decode source values for the unified picker.
-// Format: "kind:backend:device" (e.g., "webcam:avfoundation:0", "sdi:decklink:DeckLink Mini Recorder")
-// Special: "test-video::" for the test pattern.
-function encodeSourceValue(input) {
-  if (!input || input.kind === "test-video") return "test-video::";
-  const kind = input.kind || "webcam";
-  const backend = input.backend || "avfoundation";
-  const device = input.videoDevice || "";
-  return `${kind}:${backend}:${device}`;
-}
-
-function decodeSourceValue(value) {
-  if (!value || value === "test-video::") {
-    return { kind: "test-video", backend: "lavfi", videoDevice: "" };
-  }
-  const [kind, backend, ...rest] = value.split(":");
-  return { kind, backend, videoDevice: rest.join(":") };
-}
-
-// Map device type to an input kind for FFmpeg config.
-function kindForDeviceType(type) {
-  switch (type) {
-    case "sdi": return "sdi";
-    case "capture-card": return "hdmi";
-    case "screen": return "webcam"; // screen capture uses platform backend like a webcam
-    case "camera": return "webcam";
-    default: return "webcam";
-  }
-}
-
-// --- Presets (custom card-style dropdown) ---
-function presetTitle(preset) {
-  const fps = preset.fps === 60 ? "60" : "";
-  return `${preset.name} · ${preset.height}p${fps} · ${preset.videoKbps / 1000} Mbps`;
-}
-
-function renderPresets(presets) {
-  if (!els.presetMenu) return;
-  els.presetMenu.innerHTML = "";
-  for (const preset of presets) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = `preset-option ${preset.id === selectedPreset ? "active" : ""}`;
-    btn.dataset.presetId = preset.id;
-    btn.innerHTML = `
-      <strong></strong>
-      <span class="preset-upload"></span>
-    `;
-    btn.querySelector("strong").textContent = presetTitle(preset);
-    btn.querySelector(".preset-upload").textContent = `Min upload speed: ${preset.uploadTarget}`;
-    btn.addEventListener("click", () => {
-      selectedPreset = preset.id;
-      closePresetMenu();
-      updatePresetDescription(presets);
-      renderPresets(presets);
-      autoSave(true);
-    });
-    els.presetMenu.appendChild(btn);
-  }
-  updatePresetDescription(presets);
-}
-
-function updatePresetDescription(presets) {
-  const preset = (presets || cachedPresets).find((p) => p.id === selectedPreset);
-  if (!preset) return;
-  if (els.presetInfoTitle) els.presetInfoTitle.textContent = presetTitle(preset);
-  if (els.presetInfoUpload) els.presetInfoUpload.textContent = `Min upload speed: ${preset.uploadTarget}`;
-}
-
-function openPresetMenu() {
-  els.presetMenu.hidden = false;
-  els.presetTrigger.setAttribute("aria-expanded", "true");
-}
-function closePresetMenu() {
-  els.presetMenu.hidden = true;
-  els.presetTrigger.setAttribute("aria-expanded", "false");
-}
-
-els.presetTrigger?.addEventListener("click", (e) => {
-  e.stopPropagation();
-  if (els.presetMenu.hidden) openPresetMenu();
-  else closePresetMenu();
-});
-document.addEventListener("click", (e) => {
-  if (!els.presetDropdown.contains(e.target)) closePresetMenu();
-});
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") closePresetMenu();
-});
-
-// --- State labels ---
-function labelState(state) {
-  return { idle: "Idle", starting: "Starting", running: "Live", degraded: "Degraded",
-    restarting: "Restarting", stopping: "Stopping", failed: "Failed" }[state] || state;
-}
-function titleForState(state) {
-  return { idle: "Ready to go live", starting: "Starting encoder...", running: "Stream is live",
-    degraded: "Stream needs attention", restarting: "Recovering stream...",
-    stopping: "Stopping encoder...", failed: "Stream failed" }[state] || "Checking status...";
-}
-
-// --- Save notice ---
-function showNotice(message) {
-  if (!els.saveNotice) return;
-  els.saveNotice.textContent = message;
-  els.saveNotice.classList.add("visible");
-  clearTimeout(showNotice._t);
-  showNotice._t = setTimeout(() => els.saveNotice.classList.remove("visible"), 3000);
-}
-
-// --- Config save ---
-async function saveConfig() {
-  const decoded = decodeSourceValue(els.videoSource.value);
-  const payload = {
-    presetId: selectedPreset,
-    ingestUrl: els.ingestURL.value.trim(),
-    outputMode: els.outputMode?.value || "rtmp",
-    input: {
-      kind: decoded.kind,
-      backend: decoded.backend,
-      videoDevice: decoded.videoDevice,
-      audioDevice: els.audioSource.value || "",
+      // Start preview on initial load (idle state) — unless user suppressed.
+      this.$nextTick(() => {
+        if (!this.isLive) this.maybeStartPreview();
+      });
     },
-  };
-  const key = els.streamName.value.trim();
-  if (key) payload.streamName = key;
 
-  const result = await api("/api/config", { method: "POST", body: JSON.stringify(payload) });
-  selectedPreset = result.preset.id;
-  els.ingestURL.value = result.ingestUrl || "";
-  els.streamName.value = "";
-  els.streamName.placeholder = result.hasStreamKey
-    ? "Stream key is set (enter a new one to replace)"
-    : "Paste your stream key here";
-  pendingVideoValue = encodeSourceValue(result.input);
-  pendingAudioDevice = result.input.audioDevice || "";
-  if (els.outputMode) els.outputMode.value = result.outputMode || "rtmp";
-  if (result.hlsUrl && els.hlsUrl) els.hlsUrl.textContent = result.hlsUrl;
-  updateOutputModeVisibility();
-  applyPendingToDropdowns();
-}
-
-// --- Button handlers ---
-els.start.addEventListener("click", async () => {
-  try {
-    els.start.disabled = true;
-    els.lastMessage.textContent = "Saving settings and starting stream...";
-    await saveConfig();
-    await api("/api/start", { method: "POST" });
-    await refresh();
-  } catch (error) {
-    els.lastMessage.textContent = error.message;
-    updateButtonStates(lastStreamState);
-  }
-});
-
-// --- Stop with inline confirmation ---
-// First click swaps Stop for "Confirm stop / Cancel" so an accidental click
-// can't kill a live broadcast. Auto-cancels after 5 seconds of no action.
-let stopConfirmTimer = null;
-
-function showStopConfirm() {
-  if (els.stop) els.stop.hidden = true;
-  if (els.stopConfirm) els.stopConfirm.hidden = false;
-  if (els.stopCancel) els.stopCancel.hidden = false;
-  clearTimeout(stopConfirmTimer);
-  stopConfirmTimer = setTimeout(hideStopConfirm, 5000);
-}
-
-function hideStopConfirm() {
-  clearTimeout(stopConfirmTimer);
-  if (els.stop) els.stop.hidden = false;
-  if (els.stopConfirm) els.stopConfirm.hidden = true;
-  if (els.stopCancel) els.stopCancel.hidden = true;
-}
-
-els.stop?.addEventListener("click", () => {
-  if (els.stop.disabled) return;
-  showStopConfirm();
-});
-
-els.stopCancel?.addEventListener("click", () => {
-  hideStopConfirm();
-});
-
-els.stopConfirm?.addEventListener("click", async () => {
-  hideStopConfirm();
-  try {
-    els.stop.disabled = true;
-    els.lastMessage.textContent = "Stopping stream...";
-    await api("/api/stop", { method: "POST" });
-    await refresh();
-  } catch (error) {
-    els.lastMessage.textContent = error.message;
-    updateButtonStates(lastStreamState);
-  }
-});
-
-// --- Extend active scheduled event by 15 min ---
-els.extend?.addEventListener("click", async () => {
-  try {
-    els.extend.disabled = true;
-    const result = await api("/api/extend", {
-      method: "POST",
-      body: JSON.stringify({ minutes: 15 }),
-    });
-    const endsAt = new Date(result.endsAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-    showNotice(`Extended — now ends at ${endsAt}`);
-    await refresh();
-  } catch (error) {
-    showNotice(error.message);
-  } finally {
-    els.extend.disabled = false;
-  }
-});
-
-// --- Auto-save on field change ---
-// Replaces the old global "Save Settings" button. Each form change is
-// debounced and saved automatically.
-let autoSaveTimer = null;
-function autoSave(immediate = false) {
-  clearTimeout(autoSaveTimer);
-  const fire = async () => {
-    try {
-      await saveConfig();
-      showNotice("Settings saved");
-      // Refresh button states (destination might now be ready/unready).
-      updateButtonStates(lastStreamState);
-    } catch (error) {
-      els.lastMessage.textContent = error.message;
-    }
-  };
-  if (immediate) {
-    fire();
-  } else {
-    autoSaveTimer = setTimeout(fire, 600);
-  }
-}
-
-// Text fields save on blur. Update Go Live readiness live as user types.
-els.ingestURL?.addEventListener("blur", () => autoSave(true));
-els.ingestURL?.addEventListener("input", () => updateButtonStates(lastStreamState));
-els.streamName?.addEventListener("blur", () => autoSave(true));
-els.streamName?.addEventListener("input", () => updateButtonStates(lastStreamState));
-// Selects save immediately on change.
-els.outputMode?.addEventListener("change", () => autoSave(true));
-
-// --- Destination mode tabs ---
-document.querySelectorAll("#dest-tabs .tab").forEach((tab) => {
-  tab.addEventListener("click", () => {
-    document.querySelectorAll("#dest-tabs .tab").forEach((t) => t.classList.remove("active"));
-    tab.classList.add("active");
-    currentDestMode = tab.dataset.mode;
-    document.querySelectorAll(".mode-content").forEach((el) => (el.hidden = true));
-    document.querySelector(`#mode-${currentDestMode}`).hidden = false;
-    updateButtonStates(lastStreamState);
-  });
-});
-
-// --- YouTube auth ---
-function loginYouTube() {
-  api("/api/youtube/auth/url").then((data) => {
-    if (data.url) window.open(data.url, "_blank", "width=600,height=700");
-  }).catch((err) => {
-    els.lastMessage.textContent = "YouTube login failed: " + err.message;
-  });
-}
-
-els.ytLogin?.addEventListener("click", loginYouTube);
-els.ytLogout?.addEventListener("click", async () => {
-  await api("/api/youtube/auth/logout", { method: "POST" });
-  await refresh();
-});
-
-// --- Adaptive quality status ---
-let adaptiveEnabledInitialized = false;
-
-function renderAdaptiveStatus(state) {
-  // One-time sync of the toggle to server state.
-  if (!adaptiveEnabledInitialized && els.adaptiveEnabled) {
-    els.adaptiveEnabled.checked = state.enabled;
-    adaptiveEnabledInitialized = true;
-  }
-
-  if (state.isFallback && state.activePreset && state.originalPreset) {
-    const orig = cachedPresets.find((p) => p.id === state.originalPreset) || { name: state.originalPreset };
-    const active = cachedPresets.find((p) => p.id === state.activePreset) || { name: state.activePreset };
-    if (els.adaptiveBanner) {
-      els.adaptiveBanner.hidden = false;
-      els.adaptiveBannerTitle.textContent = `Auto-reduced quality to ${active.name}`;
-      els.adaptiveBannerDetail.textContent =
-        `${state.reason || "Network conditions"} — original target was ${orig.name}. Will restore automatically when stable.`;
-    }
-  } else if (els.adaptiveBanner) {
-    els.adaptiveBanner.hidden = true;
-  }
-}
-
-els.adaptiveEnabled?.addEventListener("change", async (e) => {
-  try {
-    await api("/api/adaptive", {
-      method: "POST",
-      body: JSON.stringify({ enabled: e.target.checked }),
-    });
-    showNotice(e.target.checked ? "Auto-quality enabled" : "Auto-quality disabled");
-  } catch (err) {
-    els.lastMessage.textContent = err.message;
-    e.target.checked = !e.target.checked;
-  }
-});
-
-function renderYouTubeStatus(yt) {
-  const authed = yt.authenticated;
-  const configured = yt.configured;
-  ytAuthed = authed;
-
-  // Header account info
-  if (authed && yt.channelName) {
-    els.ytAccount.hidden = false;
-    els.ytChannelName.textContent = yt.channelName;
-  } else {
-    els.ytAccount.hidden = true;
-  }
-
-  // Scheduled mode
-  if (configured) {
-    els.ytLoginPrompt.hidden = authed;
-    els.scheduleUI.hidden = !authed;
-  } else {
-    els.ytLoginPrompt.querySelector("p").textContent =
-      "YouTube integration is not configured. Set YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET environment variables to enable.";
-    els.ytLoginPrompt.querySelector("button").hidden = true;
-    els.ytLoginPrompt.hidden = false;
-    els.scheduleUI.hidden = true;
-  }
-
-  // Go Live Now mode
-  if (configured && authed) {
-    els.nowYTLogin.hidden = true;
-    els.nowUI.hidden = false;
-  } else {
-    els.nowYTLogin.hidden = false;
-    els.nowUI.hidden = true;
-    if (!configured) {
-      els.nowYTLogin.querySelector("p").textContent =
-        "YouTube not configured. Use Manual mode or set up YouTube credentials.";
-      els.nowYTLogin.querySelector("button").hidden = true;
-    }
-  }
-}
-
-// --- Go Live Now ---
-document.querySelector("#now-go-live")?.addEventListener("click", async () => {
-  try {
-    const title = document.querySelector("#now-title").value.trim() || "Live Stream";
-    const privacy = document.querySelector("#now-privacy").value;
-    els.lastMessage.textContent = "Creating YouTube broadcast and going live...";
-    await saveConfig();
-    const result = await api("/api/youtube/go-live-now", {
-      method: "POST",
-      body: JSON.stringify({ title, privacy }),
-    });
-    showNotice("Broadcast created! Stream is starting...");
-    await refresh();
-  } catch (error) {
-    els.lastMessage.textContent = error.message;
-  }
-});
-
-// --- Events ---
-function renderEvents(events) {
-  if (!els.eventsList) return;
-  if (!events || events.length === 0) {
-    els.eventsList.innerHTML = '<p class="hint">No upcoming events.</p>';
-    return;
-  }
-  els.eventsList.innerHTML = "";
-  for (const event of events.slice(0, 5)) {
-    const div = document.createElement("div");
-    div.className = "event-card";
-    const when = new Date(event.startTime);
-    const dateStr = when.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
-    const timeStr = when.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-    const statusBadge = event.broadcastId
-      ? '<span class="badge badge-ready">Ready</span>'
-      : '<span class="badge badge-pending">Pending</span>';
-    div.innerHTML = `
-      <div class="event-info">
-        <strong>${event.name}</strong>
-        <span>${dateStr} at ${timeStr}</span>
-      </div>
-      <div class="event-meta">${statusBadge}</div>
-    `;
-    els.eventsList.appendChild(div);
-  }
-}
-
-// --- Schedules ---
-async function loadSchedules() {
-  try {
-    const schedules = await api("/api/schedules");
-    renderSchedules(schedules);
-  } catch (_) {}
-}
-
-function renderSchedules(schedules) {
-  if (!els.schedulesList) return;
-  if (!schedules || schedules.length === 0) {
-    els.schedulesList.innerHTML = '<p class="hint">No recurring schedules.</p>';
-    return;
-  }
-  els.schedulesList.innerHTML = "";
-  for (const sched of schedules) {
-    const div = document.createElement("div");
-    div.className = "sched-card";
-    const days = sched.days.map((d) => d.charAt(0).toUpperCase() + d.slice(0, 3)).join(", ");
-    div.innerHTML = `
-      <div class="sched-info">
-        <strong>${sched.name}</strong>
-        <span>${days} at ${sched.time} (${sched.timezone.split("/").pop().replace("_", " ")})</span>
-      </div>
-      <div class="sched-actions">
-        <span class="badge ${sched.enabled ? "badge-ready" : "badge-pending"}">${sched.enabled ? "Active" : "Off"}</span>
-        <button class="button button-sm button-danger" data-delete-schedule="${sched.id}">Delete</button>
-      </div>
-    `;
-    els.schedulesList.appendChild(div);
-  }
-  // Wire delete buttons
-  els.schedulesList.querySelectorAll("[data-delete-schedule]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      if (!confirm("Delete this schedule?")) return;
-      await api(`/api/schedules/${btn.dataset.deleteSchedule}`, { method: "DELETE" });
-      await loadSchedules();
-    });
-  });
-}
-
-// Schedule form
-document.querySelector("#add-schedule-btn")?.addEventListener("click", () => {
-  document.querySelector("#schedule-form").hidden = false;
-});
-document.querySelector("#sched-cancel")?.addEventListener("click", () => {
-  document.querySelector("#schedule-form").hidden = true;
-});
-
-// Day picker
-document.querySelectorAll("#sched-days .day-btn").forEach((btn) => {
-  btn.addEventListener("click", () => btn.classList.toggle("selected"));
-});
-
-document.querySelector("#sched-save")?.addEventListener("click", async () => {
-  const selectedDays = Array.from(document.querySelectorAll("#sched-days .day-btn.selected"))
-    .map((b) => b.dataset.day);
-  if (selectedDays.length === 0) {
-    alert("Select at least one day.");
-    return;
-  }
-  const sched = {
-    name: document.querySelector("#sched-name").value.trim(),
-    days: selectedDays,
-    time: document.querySelector("#sched-time").value,
-    timezone: document.querySelector("#sched-tz").value,
-    durationMin: parseInt(document.querySelector("#sched-duration").value) || 120,
-    presetId: selectedPreset,
-    title: document.querySelector("#sched-title").value.trim() || document.querySelector("#sched-name").value.trim(),
-    description: document.querySelector("#sched-desc").value.trim(),
-    privacy: document.querySelector("#sched-privacy").value,
-    enabled: true,
-  };
-  try {
-    await api("/api/schedules", { method: "POST", body: JSON.stringify(sched) });
-    document.querySelector("#schedule-form").hidden = true;
-    showNotice("Schedule created.");
-    // Clear form
-    document.querySelector("#sched-name").value = "";
-    document.querySelector("#sched-title").value = "";
-    document.querySelector("#sched-desc").value = "";
-    document.querySelectorAll("#sched-days .day-btn").forEach((b) => b.classList.remove("selected"));
-    await loadSchedules();
-    await refresh();
-  } catch (error) {
-    alert(error.message);
-  }
-});
-
-// --- Overrides ---
-async function loadOverrides() {
-  try {
-    const overrides = await api("/api/overrides");
-    renderOverrides(overrides);
-  } catch (_) {}
-}
-
-function renderOverrides(overrides) {
-  if (!els.overridesList) return;
-  if (!overrides || overrides.length === 0) {
-    els.overridesList.innerHTML = '<p class="hint">No special events.</p>';
-    return;
-  }
-  els.overridesList.innerHTML = "";
-  for (const o of overrides) {
-    const div = document.createElement("div");
-    div.className = "sched-card";
-    const when = new Date(o.startTime);
-    const dateStr = when.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
-    const timeStr = when.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-    div.innerHTML = `
-      <div class="sched-info">
-        <strong>${o.name}</strong>
-        <span>${dateStr} at ${timeStr}</span>
-      </div>
-      <div class="sched-actions">
-        <button class="button button-sm button-danger" data-delete-override="${o.id}">Delete</button>
-      </div>
-    `;
-    els.overridesList.appendChild(div);
-  }
-  els.overridesList.querySelectorAll("[data-delete-override]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      if (!confirm("Delete this event?")) return;
-      await api(`/api/overrides/${btn.dataset.deleteOverride}`, { method: "DELETE" });
-      await loadOverrides();
-    });
-  });
-}
-
-// Override form
-document.querySelector("#add-override-btn")?.addEventListener("click", () => {
-  document.querySelector("#override-form").hidden = false;
-});
-document.querySelector("#ovr-cancel")?.addEventListener("click", () => {
-  document.querySelector("#override-form").hidden = true;
-});
-
-document.querySelector("#ovr-save")?.addEventListener("click", async () => {
-  const datetimeStr = document.querySelector("#ovr-datetime").value;
-  if (!datetimeStr) {
-    alert("Pick a date and time.");
-    return;
-  }
-  // Parse the datetime-local as the selected timezone
-  const tz = document.querySelector("#ovr-tz").value;
-  // datetime-local returns YYYY-MM-DDTHH:MM as a wall-clock with no timezone.
-  // Send it verbatim along with the selected timezone; the server converts
-  // to UTC correctly (browser Date() would have used the browser's tz, which
-  // is wrong when the user picks a different zone for the event).
-  const override = {
-    name: document.querySelector("#ovr-name").value.trim(),
-    wallClock: datetimeStr,
-    timezone: tz,
-    durationMin: parseInt(document.querySelector("#ovr-duration").value) || 120,
-    presetId: selectedPreset,
-    title: document.querySelector("#ovr-title").value.trim() || document.querySelector("#ovr-name").value.trim(),
-    description: document.querySelector("#ovr-desc").value.trim(),
-    privacy: document.querySelector("#ovr-privacy").value,
-  };
-  try {
-    await api("/api/overrides", { method: "POST", body: JSON.stringify(override) });
-    document.querySelector("#override-form").hidden = true;
-    showNotice("Special event created.");
-    document.querySelector("#ovr-name").value = "";
-    document.querySelector("#ovr-title").value = "";
-    document.querySelector("#ovr-desc").value = "";
-    document.querySelector("#ovr-datetime").value = "";
-    await loadOverrides();
-    await refresh();
-  } catch (error) {
-    alert(error.message);
-  }
-});
-
-// --- Device discovery (smart unified picker) ---
-
-const DEVICE_GROUPS = [
-  { type: "camera",       label: "Cameras" },
-  { type: "capture-card", label: "Capture cards (USB HDMI)" },
-  { type: "screen",       label: "Screen capture" },
-  { type: "sdi",          label: "SDI (Blackmagic DeckLink)" },
-];
-
-const AUDIO_GROUPS = [
-  { type: "microphone",  label: "Microphones" },
-  { type: "audio-input", label: "Audio inputs" },
-];
-
-async function scanDevices(forceRefresh) {
-  try {
-    const url = `/api/devices${forceRefresh ? "?refresh=1" : ""}`;
-    const data = await api(url);
-    lastDeviceScan = data;
-    renderDevicePickers(data);
-  } catch (_) {}
-}
-
-function renderDevicePickers(data) {
-  // --- Video picker with grouped categories ---
-  els.videoSource.innerHTML = "";
-
-  // Always-available test pattern at the top.
-  const testOpt = document.createElement("option");
-  testOpt.value = "test-video::";
-  testOpt.textContent = "Test pattern (no hardware)";
-  els.videoSource.appendChild(testOpt);
-
-  let videoCount = 0;
-  for (const group of DEVICE_GROUPS) {
-    const matches = (data.video || []).filter((d) => d.type === group.type);
-    if (matches.length === 0) continue;
-    const og = document.createElement("optgroup");
-    og.label = group.label;
-    for (const d of matches) {
-      const opt = document.createElement("option");
-      const kind = kindForDeviceType(d.type);
-      opt.value = `${kind}:${d.backend}:${d.index}`;
-      opt.textContent = d.backend === "decklink" ? d.name : `${d.name} [${d.index}]`;
-      og.appendChild(opt);
-      videoCount++;
-    }
-    els.videoSource.appendChild(og);
-  }
-
-  // Restore selection.
-  const wantedVideo = pendingVideoValue || els.videoSource.value;
-  if (wantedVideo && [...els.videoSource.options].some((o) => o.value === wantedVideo)) {
-    els.videoSource.value = wantedVideo;
-  }
-
-  // --- Audio picker ---
-  els.audioSource.innerHTML = "";
-  const noneOpt = document.createElement("option");
-  noneOpt.value = "";
-
-  // Detect if currently selected video is SDI; if so, default to embedded SDI audio.
-  const selectedKind = decodeSourceValue(els.videoSource.value).kind;
-  noneOpt.textContent = selectedKind === "sdi" ? "Embedded SDI audio" : "None / silent";
-  els.audioSource.appendChild(noneOpt);
-
-  let audioCount = 0;
-  for (const group of AUDIO_GROUPS) {
-    const matches = (data.audio || []).filter((d) => d.type === group.type);
-    if (matches.length === 0) continue;
-    const og = document.createElement("optgroup");
-    og.label = group.label;
-    for (const d of matches) {
-      const opt = document.createElement("option");
-      opt.value = d.index;
-      opt.textContent = `${d.name} [${d.index}]`;
-      og.appendChild(opt);
-      audioCount++;
-    }
-    els.audioSource.appendChild(og);
-  }
-
-  if (pendingAudioDevice && [...els.audioSource.options].some((o) => o.value === pendingAudioDevice)) {
-    els.audioSource.value = pendingAudioDevice;
-  }
-
-  // Hide audio picker for SDI sources (audio is always embedded).
-  if (els.audioSourceLabel) {
-    els.audioSourceLabel.hidden = selectedKind === "sdi";
-  }
-
-  // Clear pending values once applied.
-  if (els.videoSource.value === pendingVideoValue) pendingVideoValue = "";
-  if (els.audioSource.value === pendingAudioDevice) pendingAudioDevice = "";
-
-  // Status line.
-  if (els.deviceStatus) {
-    if (videoCount === 0) {
-      els.deviceStatus.textContent = `No video devices detected. Connect a camera or capture card and click Refresh.`;
-    } else {
-      els.deviceStatus.textContent = `${videoCount} video, ${audioCount} audio detected. Auto-refreshes every 5s.`;
-    }
-  }
-}
-
-function applyPendingToDropdowns() {
-  if (lastDeviceScan) renderDevicePickers(lastDeviceScan);
-}
-
-// Poll for devices every 5 seconds.
-scanDevices();
-setInterval(() => scanDevices(), 5000);
-
-// Refresh button.
-document.querySelector("#refresh-devices")?.addEventListener("click", () => scanDevices(true));
-
-// --- Preview (WebRTC) ---
-// Browser establishes an RTCPeerConnection with the EasyStream server.
-// Server runs FFmpeg encoding H.264 RTP and bridges to the WebRTC track.
-// Sub-second latency, works in Safari/Chrome/Firefox alike.
-let previewFailed = false;
-let previewPC = null; // current RTCPeerConnection
-
-function stopPreviewPC() {
-  clearTimeout(startPreview._timeout);
-  if (previewPC) {
-    try { previewPC.close(); } catch (_) {}
-    previewPC = null;
-  }
-  if (els.previewVideo) {
-    els.previewVideo.srcObject = null;
-    els.previewVideo.style.display = "";
-  }
-}
-
-async function saveAndRestartPreview() {
-  if (!previewActive) return;
-  previewFailed = false;
-  stopPreviewPC();
-  hidePreviewError();
-  setTimeout(startPreview, 300);
-}
-const restartPreview = saveAndRestartPreview;
-
-els.previewToggle?.addEventListener("click", () => {
-  previewActive = !previewActive;
-  els.previewContainer.hidden = !previewActive;
-  els.previewToggle.textContent = previewActive ? "Hide Preview" : "Show Preview";
-  const refreshBtn = document.querySelector("#preview-refresh");
-  if (refreshBtn) refreshBtn.hidden = !previewActive;
-  if (previewActive) {
-    previewFailed = false;
-    hidePreviewError();
-    startPreview();
-  } else {
-    stopPreviewPC();
-    hidePreviewError();
-  }
-});
-
-document.querySelector("#preview-refresh")?.addEventListener("click", () => {
-  previewFailed = false;
-  stopPreviewPC();
-  hidePreviewError();
-  startPreview();
-});
-
-// Tear down the peer connection when the tab is closed so the server-side
-// FFmpeg / UDP listener / PC get reaped promptly.
-window.addEventListener("beforeunload", stopPreviewPC);
-
-async function startPreview() {
-  if (previewFailed) return;
-  await saveConfig();
-
-  stopPreviewPC();
-  const pc = new RTCPeerConnection();
-  previewPC = pc;
-  pc.addTransceiver("video", { direction: "recvonly" });
-
-  pc.ontrack = (e) => {
-    if (els.previewVideo && e.streams && e.streams[0]) {
-      els.previewVideo.srcObject = e.streams[0];
-    }
-  };
-
-  // 4-second timeout to detect "FFmpeg can't open the capture device."
-  clearTimeout(startPreview._timeout);
-  let connected = false;
-  startPreview._timeout = setTimeout(() => {
-    if (!connected && previewActive && !previewFailed && previewPC === pc) {
-      previewFailed = true;
-      showPreviewError("Could not open capture device. Check that camera permission is granted (System Settings > Privacy & Security > Camera), the device isn't in use by another app, and the correct device is selected.");
-      stopPreviewPC();
-    }
-  }, 4000);
-
-  pc.oniceconnectionstatechange = () => {
-    if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
-      connected = true;
-      clearTimeout(startPreview._timeout);
-    } else if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
-      if (previewActive && previewPC === pc) {
-        // Try a single auto-reconnect.
-        setTimeout(() => {
-          if (previewActive && previewPC === pc) startPreview();
-        }, 1000);
+    // ============================================================
+    // COMPUTED
+    // ============================================================
+    get isLive() {
+      return ["starting", "running", "degraded", "restarting"].includes(this.stream.state);
+    },
+    get videoOK() {
+      return !!this.videoSourceValue;
+    },
+    get hasCustomDest() {
+      if (!this.ingestUrl) return false;
+      if (this.outputMode === "hls") return true;
+      return this.streamKey.length > 0 || this.hasStreamKey;
+    },
+    get ytActionReason() {
+      if (!this.youtube.authenticated) return "Connect YouTube in Settings to enable.";
+      if (!this.videoOK) return "Pick a video source in Settings.";
+      return "";
+    },
+    get customActionReason() {
+      if (!this.videoOK) return "Pick a video source in Settings.";
+      if (!this.hasCustomDest) return "Set a server URL & key in Settings.";
+      return "";
+    },
+    get startedAt() {
+      const s = this.stream?.startedAt;
+      return s && !s.startsWith("0001-01-01") ? new Date(s) : null;
+    },
+    get scheduleEndsAt() {
+      const e = this.scheduler?.activeEndsAt;
+      return e && !e.startsWith("0001-01-01") ? new Date(e) : null;
+    },
+    get activeEventName() {
+      return this.scheduler?.activeEventName || "";
+    },
+    get liveHeadline() {
+      return this.activeEventName || "Live stream";
+    },
+    get liveMeta() {
+      const parts = [];
+      if (this.startedAt) parts.push(`Started ${this.fmtTime(this.startedAt)}`);
+      if (this.scheduleEndsAt) parts.push(`ends ${this.fmtTime(this.scheduleEndsAt)}`);
+      return parts.join(" · ") || "Streaming";
+    },
+    get liveBannerEvent() {
+      return this.activeEventName ? `· ${this.activeEventName}` : "";
+    },
+    get liveBannerTime() {
+      return this.startedAt ? `started ${this.fmtTime(this.startedAt)}` : "";
+    },
+    get liveHealthParts() {
+      const parts = [];
+      let dest;
+      if (this.activeBroadcastId) dest = "LIVE on YouTube";
+      else if (this.outputMode === "hls") dest = "Streaming to local HLS playlist";
+      else {
+        const platform = this.platformFromURL(this.ingestUrl);
+        dest = platform ? `Streaming to ${platform}` : "Streaming to custom server";
       }
-    }
-  };
+      parts.push({ text: dest });
 
-  try {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    const resp = await fetch("/api/preview/webrtc/offer", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(pc.localDescription),
-    });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(errText || `HTTP ${resp.status}`);
-    }
-    const answer = await resp.json();
-    await pc.setRemoteDescription(answer);
-  } catch (err) {
-    previewFailed = true;
-    showPreviewError(`Preview connection failed: ${err.message}`);
-    stopPreviewPC();
-  }
-}
+      const conf = (this.confidence || []).reduce((a, c) => (a[c.label] = c, a), {});
+      const enc = conf.Encoder;
+      if (enc?.status === "green" || enc?.status === "yellow") parts.push({ text: "Receiving video" });
+      else if (enc?.status === "red") parts.push({ text: "Video problem" });
+      else parts.push({ text: "Sending video..." });
 
-function showPreviewError(msg) {
-  let el = document.querySelector("#preview-error");
-  if (!el) {
-    el = document.createElement("p");
-    el.id = "preview-error";
-    el.className = "preview-error";
-    els.previewContainer.appendChild(el);
-  }
-  el.textContent = msg;
-  el.hidden = false;
-  if (els.previewVideo) els.previewVideo.style.display = "none";
-}
+      const aud = conf.Audio;
+      if (aud?.status === "green") parts.push({ text: "Audio detected" });
+      else if (aud?.status === "yellow") parts.push({ text: "Audio very quiet" });
+      else if (aud?.status === "red") parts.push({ text: "No audio" });
+      else parts.push({ text: "Waiting for audio..." });
 
-function hidePreviewError() {
-  const el = document.querySelector("#preview-error");
-  if (el) el.hidden = true;
-  if (els.previewVideo) els.previewVideo.style.display = "";
-}
+      return parts;
+    },
+    get liveHealthSeverity() {
+      let worst = "green";
+      for (const c of (this.confidence || [])) {
+        if (c.status === "red") return "failed";
+        if (c.status === "yellow") worst = "degraded";
+      }
+      return worst === "green" ? "" : worst;
+    },
+    get nextEvent() {
+      return this.nextEvents[0] || null;
+    },
+    get canStartScheduledNow() {
+      if (!this.nextEvent) return false;
+      const when = new Date(this.nextEvent.startTime);
+      const minutesUntil = (when.getTime() - Date.now()) / 60000;
+      return minutesUntil < 60 && this.stream.state === "idle";
+    },
+    get extendLabel() {
+      const extra = this.scheduler?.extraMinutes || 0;
+      return extra > 0 ? `+15 min (extended ${extra}m)` : "+15 min";
+    },
+    get showExtendButton() {
+      return !!this.activeEventName;
+    },
+    get bitrateText() {
+      const k = this.stream.lastProgress?.bitrateKbps;
+      return k ? `${Math.round(k)} kbps` : "-";
+    },
+    get logLineText() {
+      return this.stream.lastError || this.stream.lastExit || this.stream.lastLogLine || "Stream is live.";
+    },
+    get problemTitle() {
+      return {
+        degraded: "Stream needs attention",
+        restarting: "Reconnecting to ingest...",
+        failed: "Stream failed",
+      }[this.stream.state] || "Stream issue";
+    },
+    get problemDetail() {
+      return this.stream.lastError || this.stream.lastExit || this.stream.lastLogLine || "Check your network and capture source.";
+    },
+    get idleLabel() {
+      return {
+        idle: "Idle",
+        stopping: "Stopping",
+        failed: "Stopped",
+      }[this.stream.state] || "Idle";
+    },
+    get idleDetail() {
+      if (this.stream.state === "stopping") return "Stopping encoder...";
+      if (this.stream.state === "failed") return this.stream.lastError || this.stream.lastExit || "Last attempt did not complete.";
+      return "Ready to stream.";
+    },
+    get currentPreset() {
+      return this.presets.find((p) => p.id === this.selectedPreset);
+    },
+    get customDestLabel() {
+      if (this.outputMode === "hls") return `Local HLS playlist · ${this.hlsUrl}`;
+      const platform = this.platformFromURL(this.ingestUrl);
+      return platform ? `${platform} · ${this.ingestUrl}` : (this.ingestUrl || "(not set)");
+    },
+    get isSDISource() {
+      return this.decodeSourceValue(this.videoSourceValue)?.kind === "sdi";
+    },
 
-// Restart preview when capture source settings change.
-els.videoSource.addEventListener("change", () => {
-  // Re-render audio dropdown so "Embedded SDI audio" label matches new kind.
-  if (lastDeviceScan) renderDevicePickers(lastDeviceScan);
-  saveAndRestartPreview();
+    // ============================================================
+    // POLLING / API CALLS
+    // ============================================================
+    async api(path, options = {}) {
+      const headers = {};
+      if (options.body) headers["content-type"] = "application/json";
+      const resp = await fetch(path, { ...options, headers });
+      const body = await resp.json();
+      if (!resp.ok) throw new Error(body.error || "Request failed");
+      return body;
+    },
+
+    async refresh() {
+      try {
+        const data = await this.api("/api/status");
+        this.stream = data.stream || this.stream;
+        this.config = data.config;
+        this.youtube = data.youtube || this.youtube;
+        this.scheduler = data.scheduler || null;
+        this.nextEvents = data.nextEvents || [];
+        this.presets = data.presets || [];
+        this.confidence = data.confidence || [];
+        this.adaptive = data.adaptive || this.adaptive;
+        this.health = data.health || {};
+        this.activeBroadcastId = data.activeBroadcastId || "";
+
+        if (data.config && (!this._configLoaded || !this.videoSourceValue)) {
+          this.syncConfigToForm(data.config);
+        }
+      } catch (e) {
+        this.showToast("Connection error: " + e.message);
+      }
+    },
+
+    async scanDevices(force) {
+      try {
+        const url = `/api/devices${force ? "?refresh=1" : ""}`;
+        const data = await this.api(url);
+        this.devices = data;
+        // Re-resolve the video source value by device name in case
+        // AVFoundation indexes shifted since last scan.
+        if (this.config?.input?.videoDeviceName && (data.video || []).length > 0) {
+          const resolved = this.encodeSourceValue(this.config.input);
+          if (resolved && resolved !== this.videoSourceValue) {
+            this.videoSourceValue = resolved;
+          }
+        }
+        this.$nextTick(() => this.syncSelectElements());
+        const v = (data.video || []).length;
+        const a = (data.audio || []).length;
+        this.deviceStatusText = v === 0
+          ? "No video devices detected. Connect a camera or capture card and click Refresh."
+          : `${v} video, ${a} audio detected.`;
+      } catch (_) {}
+    },
+
+    async loadSchedules() {
+      try {
+        const data = await this.api("/api/schedules");
+        this.schedules = data || [];
+      } catch (_) {}
+    },
+
+    async loadOverrides() {
+      try {
+        const data = await this.api("/api/overrides");
+        this.overrides = data || [];
+      } catch (_) {}
+    },
+
+    // ============================================================
+    // PREVIEW (WebRTC, imperative)
+    //
+    // The server-side swaps the RTP source between the preview's own ffmpeg
+    // (idle) and the main stream's preview output (live). The UI reconnects
+    // on the transition to live so the browser picks up the pipe feed.
+    // ============================================================
+    togglePreview() {
+      this.previewVisible = !this.previewVisible;
+      this.previewSuppressed = !this.previewVisible;
+      if (this.previewVisible) {
+        this.maybeStartPreview();
+      } else {
+        this.stopPreviewPC();
+        this.previewError = "";
+      }
+    },
+
+    maybeStartPreview() {
+      if (!this.previewVisible) return;
+      if (this._previewPC || this._previewStarting) return;
+      this.startPreview();
+    },
+
+    refreshPreview() {
+      this.previewError = "";
+      this.stopPreviewPC();
+      this.$nextTick(() => this.startPreview());
+    },
+
+    async startPreview() {
+      if (this._previewStarting) return;
+      this._previewStarting = true;
+      try {
+        this.stopPreviewPC();
+
+        const pc = new RTCPeerConnection();
+        this._previewPC = pc;
+        pc.addTransceiver("video", { direction: "recvonly" });
+        pc.addTransceiver("audio", { direction: "recvonly" });
+        this.startAudioMeter(pc);
+        pc.ontrack = (e) => this.handlePreviewTrack(e);
+
+        // Connect timeout only — once connected, we don't tear down on
+        // transient ICE disconnects. The transient state is recoverable
+        // and reconnecting would cause visible video stutter.
+        let connected = false;
+        clearTimeout(this._previewTimeout);
+        this._previewTimeout = setTimeout(() => {
+          if (!connected && this._previewPC === pc) {
+            this.previewError = "Could not connect to preview. Click Refresh to try again.";
+            this.stopPreviewPC();
+          }
+        }, 10000);
+
+        pc.oniceconnectionstatechange = () => {
+          if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+            connected = true;
+            clearTimeout(this._previewTimeout);
+          } else if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "closed") {
+            if (this._previewPC === pc) {
+              this.previewError = "Preview disconnected. Click Refresh.";
+              this.stopPreviewPC();
+            }
+          }
+        };
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        const resp = await fetch("/api/preview/webrtc/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(pc.localDescription),
+        });
+        if (!resp.ok) {
+          const t = await resp.text();
+          throw new Error(t || `HTTP ${resp.status}`);
+        }
+        const answer = await resp.json();
+        await pc.setRemoteDescription(answer);
+      } catch (e) {
+        this.previewError = `Preview connection failed: ${e.message}`;
+        this.stopPreviewPC();
+      } finally {
+        this._previewStarting = false;
+      }
+    },
+
+    stopPreviewPC() {
+      clearTimeout(this._previewTimeout);
+      this.stopAudioMeter();
+      if (this._previewPC) {
+        try { this._previewPC.close(); } catch (_) {}
+        this._previewPC = null;
+      }
+      const v = this.$refs.previewVideo;
+      if (v) v.srcObject = null;
+    },
+
+    handlePreviewTrack(e) {
+      const stream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
+      if (e.track.kind === "video") {
+        const v = this.$refs.previewVideo;
+        if (v) v.srcObject = stream;
+      }
+      if (e.track.kind === "audio") {
+        this.attachAudioMeterTrack(e.track);
+      }
+    },
+
+    startAudioMeter(pc) {
+      this.stopAudioMeter();
+      this.audioMeterLevel = 0;
+      this.audioMeterPeak = 0;
+      this.audioMeterText = "Waiting";
+      this.audioMeterActive = false;
+      this._audioMeterPeakHold = 0;
+      this._audioMeterFallbackLevel = null;
+
+      // Stats polling loop (runs every 500ms as a fallback if Web Audio is suspended)
+      this._audioMeterInterval = setInterval(async () => {
+        if (!pc || this._previewPC !== pc) return;
+        try {
+          const stats = await pc.getStats();
+          if (this._previewPC !== pc) return;
+          let statsLevel = null;
+          stats.forEach((report) => {
+            if (report.type !== "inbound-rtp") return;
+            if (report.kind !== "audio" && report.mediaType !== "audio") return;
+            if (typeof report.audioLevel === "number") {
+              statsLevel = report.audioLevel;
+              return;
+            }
+            if (typeof report.totalAudioEnergy !== "number" || typeof report.totalSamplesDuration !== "number") return;
+            if (this._audioMeterLastEnergy == null || this._audioMeterLastDuration == null) {
+              this._audioMeterLastEnergy = report.totalAudioEnergy;
+              this._audioMeterLastDuration = report.totalSamplesDuration;
+              return;
+            }
+            const energyDelta = report.totalAudioEnergy - this._audioMeterLastEnergy;
+            const durationDelta = report.totalSamplesDuration - this._audioMeterLastDuration;
+            this._audioMeterLastEnergy = report.totalAudioEnergy;
+            this._audioMeterLastDuration = report.totalSamplesDuration;
+            if (energyDelta >= 0 && durationDelta > 0) {
+              statsLevel = Math.sqrt(energyDelta / durationDelta);
+            }
+          });
+          if (statsLevel != null) this._audioMeterFallbackLevel = statsLevel;
+        } catch (_) {}
+      }, 500);
+
+      // Fast render loop for smooth UI
+      const render = () => {
+        if (!pc || this._previewPC !== pc) return;
+        this._audioMeterRaf = requestAnimationFrame(render);
+        this.updateAudioMeterRender();
+      };
+      this._audioMeterRaf = requestAnimationFrame(render);
+    },
+
+    stopAudioMeter() {
+      clearInterval(this._audioMeterInterval);
+      cancelAnimationFrame(this._audioMeterRaf);
+      this._audioMeterInterval = null;
+      this._audioMeterRaf = null;
+      this.stopAudioMeterGraph();
+      this._audioMeterLastEnergy = null;
+      this._audioMeterLastDuration = null;
+      this._audioMeterPeakHold = 0;
+      this._audioMeterFallbackLevel = null;
+      this.audioMeterLevel = 0;
+      this.audioMeterPeak = 0;
+      this.audioMeterText = "No audio";
+      this.audioMeterActive = false;
+    },
+
+    attachAudioMeterTrack(track) {
+      this.stopAudioMeterGraph();
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextCtor || !track) return;
+      try {
+        const ctx = new AudioContextCtor();
+        const source = ctx.createMediaStreamSource(new MediaStream([track]));
+        const analyser = ctx.createAnalyser();
+        const gain = ctx.createGain();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.25;
+        gain.gain.value = 0;
+        source.connect(analyser);
+        analyser.connect(gain);
+        gain.connect(ctx.destination); // keeps the graph active while remaining silent
+        this._audioMeterContext = ctx;
+        this._audioMeterSource = source;
+        this._audioMeterAnalyser = analyser;
+        this._audioMeterGain = gain;
+        this._audioMeterData = new Uint8Array(analyser.fftSize);
+        this.resumeAudioMeterContext();
+      } catch (_) {
+        this.stopAudioMeterGraph();
+      }
+    },
+
+    resumeAudioMeterContext() {
+      const ctx = this._audioMeterContext;
+      if (ctx && ctx.state === "suspended") {
+        ctx.resume().catch(() => {});
+      }
+    },
+
+    stopAudioMeterGraph() {
+      try { this._audioMeterSource?.disconnect(); } catch (_) {}
+      try { this._audioMeterAnalyser?.disconnect(); } catch (_) {}
+      try { this._audioMeterGain?.disconnect(); } catch (_) {}
+      const ctx = this._audioMeterContext;
+      if (ctx && ctx.state !== "closed") ctx.close().catch(() => {});
+      this._audioMeterContext = null;
+      this._audioMeterSource = null;
+      this._audioMeterAnalyser = null;
+      this._audioMeterGain = null;
+      this._audioMeterData = null;
+    },
+
+    readAudioMeterLevel() {
+      const analyser = this._audioMeterAnalyser;
+      const data = this._audioMeterData;
+      if (!analyser || !data) return null;
+      if (this._audioMeterContext?.state === "suspended") {
+        this.resumeAudioMeterContext();
+        return null;
+      }
+      analyser.getByteTimeDomainData(data);
+      let max = 0;
+      for (const sample of data) {
+        const val = Math.abs(sample - 128);
+        if (val > max) max = val;
+      }
+      return max / 128;
+    },
+
+    updateAudioMeterRender() {
+      try {
+        let rawLevel = this.readAudioMeterLevel();
+        if (rawLevel == null) rawLevel = this._audioMeterFallbackLevel;
+
+        if (rawLevel == null) {
+          this.audioMeterActive = false;
+          this.audioMeterLevel = Math.max(0, this.audioMeterLevel - 0.05);
+          this.audioMeterPeak = Math.max(0, this.audioMeterPeak - 0.01);
+          this.audioMeterText = "Waiting";
+          return;
+        }
+
+        const clamped = Math.min(1, Math.max(0, rawLevel));
+        const db = clamped > 0 ? 20 * Math.log10(clamped) : -60;
+        const display = Math.min(1, Math.max(0, (db + 60) / 60));
+        
+        // Instant attack, smooth release
+        if (display > this.audioMeterLevel) {
+          this.audioMeterLevel = display;
+        } else {
+          this.audioMeterLevel = Math.max(0, this.audioMeterLevel - 0.04);
+        }
+        
+        if (display > this._audioMeterPeakHold) {
+          this._audioMeterPeakHold = display;
+        } else {
+          this._audioMeterPeakHold = Math.max(0, this._audioMeterPeakHold - 0.005);
+        }
+        
+        this.audioMeterPeak = this._audioMeterPeakHold;
+        this.audioMeterText = clamped > 0 ? `${Math.round(Math.max(-60, db))} dB` : "-∞ dB";
+        if (clamped > 0.001) this.audioMeterActive = true;
+      } catch (_) {
+        this.audioMeterActive = false;
+        this.audioMeterText = "No audio";
+      }
+    },
+
+    // ============================================================
+    // CAPTURE SOURCE
+    // ============================================================
+    encodeSourceValue(input) {
+      if (!input || input.kind === "test-video") return "test-video::";
+      const kind = input.kind || "webcam";
+      const backend = input.backend || "avfoundation";
+      let device = input.videoDevice || "";
+      // If a device name is persisted and devices are loaded, resolve the
+      // current index by name — AVFoundation indexes can shift between boots.
+      if (input.videoDeviceName && (this.devices.video || []).length > 0) {
+        const match = this.devices.video.find(
+          (d) => d.name === input.videoDeviceName && d.backend === backend
+        );
+        if (match) device = String(match.index);
+      }
+      return `${kind}:${backend}:${device}`;
+    },
+    decodeSourceValue(value) {
+      if (!value) return null;
+      if (value === "test-video::") return { kind: "test-video", backend: "lavfi", videoDevice: "" };
+      const [kind, backend, ...rest] = value.split(":");
+      return { kind, backend, videoDevice: rest.join(":") };
+    },
+    syncConfigToForm(config) {
+      if (!config) return;
+      this.selectedPreset = config.preset.id;
+      this.videoSourceValue = this.encodeSourceValue(config.input);
+      this.audioSourceValue = config.input.audioDevice || "";
+      this.outputMode = config.outputMode || "rtmp";
+      this.ingestUrl = config.ingestUrl || "";
+      this.hasStreamKey = !!config.hasStreamKey;
+      if (config.hlsUrl) this.hlsUrl = config.hlsUrl;
+      this._configLoaded = true;
+      this.$nextTick(() => this.syncSelectElements());
+    },
+    syncSelectElements() {
+      // Native select rendering can miss an x-model value when options arrive
+      // later from /api/devices. Keep the visible control aligned with state.
+      if (this.$refs.videoSourceSelect) this.$refs.videoSourceSelect.value = this.videoSourceValue;
+      if (this.$refs.audioSourceSelect) this.$refs.audioSourceSelect.value = this.audioSourceValue;
+    },
+    kindForDeviceType(type) {
+      switch (type) {
+        case "sdi": return "sdi";
+        case "capture-card": return "hdmi";
+        default: return "webcam";
+      }
+    },
+    deviceGroups() {
+      const labels = {
+        camera:         "Cameras",
+        "capture-card": "Capture cards (USB HDMI)",
+        screen:         "Screen capture",
+        sdi:            "SDI (Blackmagic DeckLink)",
+      };
+      const order = ["camera", "capture-card", "screen", "sdi"];
+      const out = [];
+      for (const t of order) {
+        const matches = (this.devices.video || []).filter((d) => d.type === t);
+        if (matches.length === 0) continue;
+        out.push({
+          label: labels[t],
+          devices: matches.map((d) => ({
+            kind: this.kindForDeviceType(d.type),
+            backend: d.backend,
+            index: d.index,
+            label: d.backend === "decklink" ? d.name : `${d.name} [${d.index}]`,
+          })),
+        });
+      }
+      return out;
+    },
+    videoSourceOptions() {
+      const labels = {
+        camera:         "Cameras",
+        "capture-card": "Capture cards",
+        screen:         "Screen capture",
+        sdi:            "SDI",
+      };
+      const order = ["camera", "capture-card", "screen", "sdi"];
+      const out = [
+        { key: "group:test", value: "__group:test", label: "Test source", disabled: true },
+        { key: "test-video", value: "test-video::", label: "  Test pattern (no hardware)", disabled: false },
+      ];
+      for (const t of order) {
+        const matches = (this.devices.video || []).filter((d) => d.type === t);
+        if (matches.length === 0) continue;
+        out.push({ key: `group:${t}`, value: `__group:${t}`, label: labels[t] || "Video", disabled: true });
+        for (const d of matches) {
+          const kind = this.kindForDeviceType(d.type);
+          const label = d.backend === "decklink" ? d.name : `${d.name} [${d.index}]`;
+          out.push({ key: `${kind}:${d.backend}:${d.index}`, value: `${kind}:${d.backend}:${d.index}`, label: `  ${label}`, disabled: false });
+        }
+      }
+      return out;
+    },
+    audioDeviceGroups() {
+      const labels = { microphone: "Microphones", "audio-input": "Audio inputs" };
+      const order = ["microphone", "audio-input"];
+      const out = [];
+      for (const t of order) {
+        const matches = (this.devices.audio || []).filter((d) => d.type === t);
+        if (matches.length === 0) continue;
+        out.push({ label: labels[t], devices: matches });
+      }
+      return out;
+    },
+    audioSourceOptions() {
+      const labels = { microphone: "Microphones", "audio-input": "Audio inputs" };
+      const order = ["microphone", "audio-input"];
+      const out = [{ key: "silent", value: "", label: this.isSDISource ? "Embedded SDI audio" : "None / silent", disabled: false }];
+      for (const t of order) {
+        const matches = (this.devices.audio || []).filter((d) => d.type === t);
+        if (matches.length === 0) continue;
+        out.push({ key: `group:${t}`, value: `__group:${t}`, label: labels[t] || "Audio", disabled: true });
+        for (const d of matches) {
+          out.push({ key: `${t}:${d.index}`, value: d.index, label: `  ${d.name} [${d.index}]`, disabled: false });
+        }
+      }
+      return out;
+    },
+    onVideoSourceChange() {
+      // If we switched to SDI, clear external audio (embedded SDI audio is used).
+      if (this.isSDISource) this.audioSourceValue = "";
+      this.saveConfig();
+      this.refreshPreview();
+    },
+
+    // ============================================================
+    // CONFIG SAVE
+    // ============================================================
+    async saveConfig() {
+      if (!this.videoSourceValue && this.config?.input) {
+        this.videoSourceValue = this.encodeSourceValue(this.config.input);
+        this.audioSourceValue = this.config.input.audioDevice || this.audioSourceValue || "";
+        this.syncSelectElements();
+      }
+      const decoded = this.decodeSourceValue(this.videoSourceValue);
+      if (!decoded) {
+        this.showToast("Pick a video source before saving.");
+        return false;
+      }
+      const payload = {
+        presetId: this.selectedPreset,
+        ingestUrl: (this.ingestUrl || "").trim(),
+        outputMode: this.outputMode,
+        input: {
+          kind: decoded.kind,
+          backend: decoded.backend,
+          videoDevice: decoded.videoDevice,
+          audioDevice: this.audioSourceValue || "",
+        },
+      };
+      // Persist device names so the backend can resolve stable AVFoundation
+      // indexes by name even when indexes shift between reboots/replugs.
+      const vDev = (this.devices.video || []).find(
+        (d) => String(d.index) === String(decoded.videoDevice) && d.backend === decoded.backend
+      );
+      if (vDev) payload.input.videoDeviceName = vDev.name;
+      const aDev = (this.devices.audio || []).find(
+        (d) => String(d.index) === String(this.audioSourceValue)
+      );
+      if (aDev) payload.input.audioDeviceName = aDev.name;
+      const key = (this.streamKey || "").trim();
+      if (key) payload.streamName = key;
+      try {
+        const result = await this.api("/api/config", { method: "POST", body: JSON.stringify(payload) });
+        this.config = result;
+        this.selectedPreset = result.preset.id;
+        this.ingestUrl = result.ingestUrl || "";
+        this.streamKey = "";
+        this.hasStreamKey = !!result.hasStreamKey;
+        this.outputMode = result.outputMode || "rtmp";
+        if (result.hlsUrl) this.hlsUrl = result.hlsUrl;
+        return true;
+      } catch (e) {
+        this.showToast("Save failed: " + e.message);
+        return false;
+      }
+    },
+
+    // ============================================================
+    // PRESETS
+    // ============================================================
+    presetTitle(p) {
+      const fps = p.fps === 60 ? "60" : "";
+      return `${p.name} · ${p.height}p${fps} · ${p.videoKbps / 1000} Mbps`;
+    },
+    presetName(id) {
+      return this.presets.find((p) => p.id === id)?.name || id;
+    },
+    selectPreset(id) {
+      this.selectedPreset = id;
+      this.presetMenuOpen = false;
+      this.saveConfig().then(() => this.showToast("Quality saved"));
+    },
+
+    // ============================================================
+    // STREAM CONTROLS
+    // ============================================================
+    async startNow() {
+      try {
+        if (!(await this.saveConfig())) return;
+        await this.api("/api/start", { method: "POST" });
+        this.showToast("Starting...");
+        await this.refresh();
+      } catch (e) {
+        this.showToast(e.message);
+      }
+    },
+
+    openYTModal() {
+      this.ytModal.warn = "";
+      this.ytModal.open = true;
+    },
+    openCustomModal() {
+      this.customModal.warn = "";
+      this.customModal.open = true;
+    },
+
+    async goLiveYouTube() {
+      this.ytModal.busy = true;
+      this.ytModal.warn = "";
+      try {
+        if (!(await this.saveConfig())) return;
+        await this.api("/api/youtube/go-live-now", {
+          method: "POST",
+          body: JSON.stringify({ title: (this.ytModal.title || "Live Stream").trim(), privacy: this.ytModal.privacy }),
+        });
+        this.ytModal.open = false;
+        this.showToast("Broadcast created — going live...");
+        await this.refresh();
+      } catch (e) {
+        this.ytModal.warn = e.message;
+      } finally {
+        this.ytModal.busy = false;
+      }
+    },
+
+    async startCustom() {
+      this.customModal.busy = true;
+      this.customModal.warn = "";
+      try {
+        if (!(await this.saveConfig())) return;
+        await this.api("/api/start", { method: "POST" });
+        this.customModal.open = false;
+        this.showToast("Stream starting...");
+        await this.refresh();
+      } catch (e) {
+        this.customModal.warn = e.message;
+      } finally {
+        this.customModal.busy = false;
+      }
+    },
+
+    showStopConfirm() {
+      this.stopConfirm = true;
+      clearTimeout(this._stopTimer);
+      this._stopTimer = setTimeout(() => { this.stopConfirm = false; }, 5000);
+    },
+    async doStop() {
+      clearTimeout(this._stopTimer);
+      this.stopConfirm = false;
+      try {
+        await this.api("/api/stop", { method: "POST" });
+        await this.refresh();
+      } catch (e) {
+        this.showToast(e.message);
+      }
+    },
+
+    async extend() {
+      try {
+        const result = await this.api("/api/extend", { method: "POST", body: JSON.stringify({ minutes: 15 }) });
+        const endsAt = new Date(result.endsAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+        this.showToast(`Extended — now ends at ${endsAt}`);
+        await this.refresh();
+      } catch (e) {
+        this.showToast(e.message);
+      }
+    },
+
+    async setAdaptive(enabled) {
+      try {
+        await this.api("/api/adaptive", { method: "POST", body: JSON.stringify({ enabled }) });
+        this.adaptive.enabled = enabled;
+        this.showToast(enabled ? "Auto-quality enabled" : "Auto-quality disabled");
+      } catch (e) {
+        this.showToast(e.message);
+      }
+    },
+
+    // ============================================================
+    // YOUTUBE OAUTH
+    // ============================================================
+    async loginYouTube() {
+      try {
+        const data = await this.api("/api/youtube/auth/url");
+        if (data.url) window.open(data.url, "_blank", "width=600,height=700");
+      } catch (e) {
+        this.showToast("YouTube login failed: " + e.message);
+      }
+    },
+    async logoutYouTube() {
+      await this.api("/api/youtube/auth/logout", { method: "POST" });
+      await this.refresh();
+    },
+
+    // ============================================================
+    // SCHEDULES
+    // ============================================================
+    _blankSchedForm() {
+      return {
+        name: "", days: [], time: "08:45", timezone: "America/Chicago",
+        durationMin: 120, title: "", description: "", privacy: "unlisted",
+      };
+    },
+    _blankOvrForm() {
+      return {
+        name: "", wallClock: "", timezone: "America/Chicago", durationMin: 120,
+        title: "", description: "", privacy: "unlisted",
+      };
+    },
+    openSchedForm() {
+      this.schedForm = this._blankSchedForm();
+      this.schedFormOpen = true;
+    },
+    toggleDay(day) {
+      const idx = this.schedForm.days.indexOf(day);
+      if (idx < 0) this.schedForm.days.push(day);
+      else this.schedForm.days.splice(idx, 1);
+    },
+    async saveSchedule() {
+      if (this.schedForm.days.length === 0) {
+        alert("Select at least one day.");
+        return;
+      }
+      const sched = {
+        ...this.schedForm,
+        presetId: this.selectedPreset,
+        title: (this.schedForm.title || this.schedForm.name).trim(),
+        name: this.schedForm.name.trim(),
+        description: this.schedForm.description.trim(),
+        enabled: true,
+      };
+      try {
+        await this.api("/api/schedules", { method: "POST", body: JSON.stringify(sched) });
+        this.schedFormOpen = false;
+        this.showToast("Schedule created.");
+        await this.loadSchedules();
+        await this.refresh();
+      } catch (e) {
+        alert(e.message);
+      }
+    },
+    async deleteSchedule(id) {
+      if (!confirm("Delete this schedule?")) return;
+      await this.api(`/api/schedules/${id}`, { method: "DELETE" });
+      await this.loadSchedules();
+      await this.refresh();
+    },
+
+    openOvrForm() {
+      this.ovrForm = this._blankOvrForm();
+      this.ovrFormOpen = true;
+    },
+    async saveOverride() {
+      if (!this.ovrForm.wallClock) {
+        alert("Pick a date and time.");
+        return;
+      }
+      const override = {
+        ...this.ovrForm,
+        presetId: this.selectedPreset,
+        title: (this.ovrForm.title || this.ovrForm.name).trim(),
+        name: this.ovrForm.name.trim(),
+        description: this.ovrForm.description.trim(),
+      };
+      try {
+        await this.api("/api/overrides", { method: "POST", body: JSON.stringify(override) });
+        this.ovrFormOpen = false;
+        this.showToast("Special event created.");
+        await this.loadOverrides();
+        await this.refresh();
+      } catch (e) {
+        alert(e.message);
+      }
+    },
+    async deleteOverride(id) {
+      if (!confirm("Delete this event?")) return;
+      await this.api(`/api/overrides/${id}`, { method: "DELETE" });
+      await this.loadOverrides();
+      await this.refresh();
+    },
+
+    // ============================================================
+    // QUICK FILL + HLS COPY
+    // ============================================================
+    quickFill(platform) {
+      const URLS = {
+        youtube: "rtmps://a.rtmps.youtube.com/live2",
+        cloudflare: "rtmps://live.cloudflare.com:443/live/",
+        twitch: "rtmp://live.twitch.tv/app",
+      };
+      const url = URLS[platform];
+      if (!url) return;
+      this.ingestUrl = url;
+      this.saveConfig();
+      this.showToast(`${platform} URL filled — paste your stream key.`);
+    },
+    copyHLSUrl() {
+      navigator.clipboard.writeText(this.hlsUrl).then(() => this.showToast("HLS URL copied!"));
+    },
+
+    // ============================================================
+    // HELPERS / FORMATTING
+    // ============================================================
+    fmtTime(d) {
+      return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    },
+    formatEventWhen(d) {
+      const now = new Date();
+      const sameDay = d.toDateString() === now.toDateString();
+      const tomorrow = new Date(now.getTime() + 86400000);
+      const isTomorrow = d.toDateString() === tomorrow.toDateString();
+      const timeStr = this.fmtTime(d);
+      if (sameDay) return `Today at ${timeStr}`;
+      if (isTomorrow) return `Tomorrow at ${timeStr}`;
+      const dateStr = d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+      return `${dateStr} at ${timeStr}`;
+    },
+    formatDateTime(d) {
+      const dateStr = d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+      const timeStr = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+      return `${dateStr} at ${timeStr}`;
+    },
+    formatDays(days) {
+      return (days || []).map((d) => d.charAt(0).toUpperCase() + d.slice(0, 3)).join(", ");
+    },
+    shortTZ(tz) {
+      return (tz || "").split("/").pop().replace("_", " ");
+    },
+    platformFromURL(url) {
+      if (!url) return null;
+      const u = url.toLowerCase();
+      if (u.includes("youtube.com")) return "YouTube";
+      if (u.includes("cloudflare.com")) return "Cloudflare";
+      if (u.includes("twitch.tv")) return "Twitch";
+      if (u.includes("facebook.com") || u.includes("fb.com")) return "Facebook";
+      return null;
+    },
+    showToast(msg) {
+      this.toast = msg;
+      clearTimeout(this._toastTimer);
+      this._toastTimer = setTimeout(() => { this.toast = ""; }, 3000);
+    },
+  }));
 });
-els.audioSource.addEventListener("change", saveAndRestartPreview);
-
-// --- Quick-fill destination presets ---
-const DEST_PRESETS = {
-  youtube: "rtmps://a.rtmps.youtube.com/live2",
-  cloudflare: "rtmps://live.cloudflare.com:443/live/",
-  twitch: "rtmp://live.twitch.tv/app",
-};
-document.querySelectorAll("[data-preset]").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    const url = DEST_PRESETS[btn.dataset.preset];
-    if (url) {
-      els.ingestURL.value = url;
-      els.streamName.focus();
-      showNotice(`${btn.textContent} URL filled — paste your stream key.`);
-    }
-  });
-});
-
-// --- Init ---
-refresh();
-setInterval(refresh, 2000);
-
-// Load schedules and overrides on init
-setTimeout(() => {
-  loadSchedules();
-  loadOverrides();
-}, 500);

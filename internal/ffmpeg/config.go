@@ -1,9 +1,14 @@
 package ffmpeg
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math"
+	"os/exec"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,11 +37,13 @@ const (
 )
 
 type Input struct {
-	Kind        InputKind `json:"kind"`
-	Backend     string    `json:"backend"`
-	VideoDevice string    `json:"videoDevice"`
-	AudioDevice string    `json:"audioDevice"`
-	Format      string    `json:"format"`
+	Kind            InputKind `json:"kind"`
+	Backend         string    `json:"backend"`
+	VideoDevice     string    `json:"videoDevice"`
+	AudioDevice     string    `json:"audioDevice"`
+	VideoDeviceName string    `json:"videoDeviceName,omitempty"`
+	AudioDeviceName string    `json:"audioDeviceName,omitempty"`
+	Format          string    `json:"format"`
 }
 
 // OutputMode selects where FFmpeg sends the encoded stream.
@@ -125,6 +132,8 @@ func (c Config) Args() ([]string, error) {
 		"-hide_banner",
 		"-nostdin",
 		"-loglevel", defaultString(c.LogLevel, "warning"),
+		"-fflags", "nobuffer",
+		"-flags", "low_delay",
 		"-progress", "pipe:1",
 		"-stats_period", "1",
 	}
@@ -183,10 +192,9 @@ func (c Config) Args() ([]string, error) {
 		// Audio filter: compute per-second RMS level and print to stderr so
 		// the supervisor can detect silent audio (stuck mic, wrong source).
 		// astats with metadata=1:reset=1:length=1 emits a stat every 1s.
-		// ametadata=print:key=lavfi.astats.Overall.RMS_level routes the value
-		// to stderr (file=- writes to stdout which we already use for progress,
-		// so we use the default stderr).
-		"-af", "astats=metadata=1:reset=1:length=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
+		// ametadata file output bypasses -loglevel warning suppression while
+		// keeping stdout reserved for FFmpeg's machine-readable progress stream.
+		"-af", "astats=metadata=1:reset=1:length=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr",
 		"-c:a", "aac",
 		"-b:a", c.Preset.AudioBitrate(),
 		"-ar", "48000",
@@ -213,6 +221,33 @@ func (c Config) Args() ([]string, error) {
 		}
 		args = append(args, c.OutputURL())
 	}
+
+	// Secondary output: low-res H.264 RTP for live browser preview.
+	args = append(args,
+		"-map", inputs.videoMap, "-an",
+		"-vf", "scale=640:360:force_original_aspect_ratio=decrease",
+		"-r", "15",
+		"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+		"-profile:v", "baseline", "-level:v", "3.1",
+		"-pix_fmt", "yuv420p",
+		"-g", "30", "-keyint_min", "15", "-bf", "0",
+		"-b:v", "800k",
+		"-flush_packets", "1", "-muxdelay", "0", "-muxpreload", "0",
+		"-payload_type", "96",
+		"-f", "rtp",
+		"rtp://127.0.0.1:52001?pkt_size=1200",
+	)
+
+	// Tertiary output: Opus RTP for live browser audio meter.
+	args = append(args,
+		"-map", inputs.audioMap, "-vn",
+		"-c:a", "libopus", "-ar", "48000", "-ac", "2", "-b:a", "64k",
+		"-flush_packets", "1", "-muxdelay", "0", "-muxpreload", "0",
+		"-payload_type", "111",
+		"-f", "rtp",
+		"rtp://127.0.0.1:52002?pkt_size=1200",
+	)
+
 	return args, nil
 }
 
@@ -251,18 +286,20 @@ func (c Config) buildInputs() inputBuild {
 
 	switch backend {
 	case "avfoundation":
-		device := c.Input.VideoDevice
-		if c.Input.AudioDevice != "" {
+		device := ResolveAVFoundationDeviceIndex(c.Binary, c.Input.VideoDevice, c.Input.VideoDeviceName, "video")
+		audio := ResolveAVFoundationDeviceIndex(c.Binary, c.Input.AudioDevice, c.Input.AudioDeviceName, "audio")
+		fps := ProbeAVFoundationFramerate(c.Binary, device, c.Preset.FPS)
+		if audio != "" {
 			// Both video and audio in one avfoundation input.
 			return inputBuild{
-				args:     []string{"-f", "avfoundation", "-i", device + ":" + c.Input.AudioDevice},
+				args:     []string{"-f", "avfoundation", "-framerate", fps, "-i", device + ":" + audio},
 				videoMap: "0:v", audioMap: "0:a",
 			}
 		}
 		// Video only; mix in a silent audio track.
 		return inputBuild{
 			args: []string{
-				"-f", "avfoundation", "-i", device + ":none",
+				"-f", "avfoundation", "-framerate", fps, "-i", device + ":none",
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
@@ -326,4 +363,106 @@ func defaultString(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+// ProbeAVFoundationFramerate queries the given AVFoundation video device index
+// for its supported framerates, and returns the one closest to targetFPS. If
+// the probe fails or cannot parse the output, it defaults to "30".
+func ProbeAVFoundationFramerate(binary, deviceIndex string, targetFPS int) string {
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, binary, "-hide_banner", "-f", "avfoundation", "-i", deviceIndex, "-vframes", "1", "-f", "null", "-").CombinedOutput()
+	if fps, ok := chooseAVFoundationFramerate(string(out), targetFPS); ok {
+		return fps
+	}
+	return "30"
+}
+
+var avfoundationModeRE = regexp.MustCompile(`@\[([0-9.]+)`)
+
+// avfoundationDeviceRE matches AVFoundation device listing lines like "[0] FaceTime HD Camera".
+var avfoundationDeviceRE = regexp.MustCompile(`\[(\d+)\]\s+(.+)`)
+
+func chooseAVFoundationFramerate(output string, targetFPS int) (string, bool) {
+	if targetFPS <= 0 {
+		targetFPS = 30
+	}
+	var bestFPS string
+	bestDiff := 1000.0
+
+	for _, matches := range avfoundationModeRE.FindAllStringSubmatch(output, -1) {
+		if len(matches) <= 1 {
+			continue
+		}
+		if f, err := strconv.ParseFloat(matches[1], 64); err == nil {
+			diff := math.Abs(f - float64(targetFPS))
+			if diff < bestDiff {
+				bestDiff = diff
+				bestFPS = strconv.FormatFloat(f, 'f', -1, 64)
+			}
+		}
+	}
+	if bestFPS != "" {
+		return bestFPS, true
+	}
+	return "", false
+}
+
+// ResolveAVFoundationDeviceIndex resolves a device name to its current
+// AVFoundation index. If deviceName is empty or the probe fails, it falls
+// back to fallbackIndex. This handles the AVFoundation problem where
+// device indices shift between system boots or when USB devices are
+// plugged/unplugged — persisting the name gives stable device selection.
+func ResolveAVFoundationDeviceIndex(binary, fallbackIndex, deviceName, kind string) string {
+	if deviceName == "" {
+		return fallbackIndex
+	}
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, binary, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "").CombinedOutput()
+	if idx, ok := chooseAVFoundationDeviceIndex(string(out), deviceName, kind); ok {
+		return idx
+	}
+	return fallbackIndex
+}
+
+// chooseAVFoundationDeviceIndex scans FFmpeg's AVFoundation device list output
+// for a device matching the given name in the correct section (video or audio).
+// Returns the device index and true if found.
+func chooseAVFoundationDeviceIndex(output, deviceName, kind string) (string, bool) {
+	if deviceName == "" {
+		return "", false
+	}
+	targetName := strings.TrimSpace(strings.ToLower(deviceName))
+	inCorrectSection := false
+	wantAudio := kind == "audio"
+
+	for _, line := range strings.Split(output, "\n") {
+		lower := strings.ToLower(line)
+		// Detect section headers in FFmpeg's device listing.
+		if strings.Contains(lower, "avfoundation video devices") {
+			inCorrectSection = !wantAudio
+			continue
+		}
+		if strings.Contains(lower, "avfoundation audio devices") {
+			inCorrectSection = wantAudio
+			continue
+		}
+		if !inCorrectSection {
+			continue
+		}
+		if m := avfoundationDeviceRE.FindStringSubmatch(line); len(m) == 3 {
+			name := strings.TrimSpace(strings.ToLower(m[2]))
+			if name == targetName {
+				return m[1], true
+			}
+		}
+	}
+	return "", false
 }

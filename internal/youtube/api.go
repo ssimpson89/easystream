@@ -31,8 +31,8 @@ type Broadcast struct {
 
 // StreamHealth is the live health snapshot for a bound stream.
 type StreamHealth struct {
-	StreamStatus       string   `json:"streamStatus"`       // active|created|error|inactive|ready
-	HealthStatus       string   `json:"healthStatus"`       // good|ok|bad|noData
+	StreamStatus       string   `json:"streamStatus"` // active|created|error|inactive|ready
+	HealthStatus       string   `json:"healthStatus"` // good|ok|bad|noData
 	Issues             []string `json:"issues,omitempty"`
 	LastUpdateTimeUnix int64    `json:"lastUpdateTime,omitempty"`
 }
@@ -58,9 +58,9 @@ func (c *Client) CreateBroadcast(title, description string, scheduledStart time.
 			"scheduledStartTime": scheduledStart.UTC().Format(time.RFC3339),
 		},
 		"contentDetails": map[string]any{
-			"enableAutoStart":  false,
-			"enableAutoStop":   false,
-			"enableDvr":        true,
+			"enableAutoStart":   false,
+			"enableAutoStop":    false,
+			"enableDvr":         true,
 			"latencyPreference": "normal",
 		},
 		"status": map[string]any{
@@ -113,17 +113,29 @@ func (c *Client) listBroadcasts(broadcastStatus string) ([]Broadcast, error) {
 
 // CreateStream creates a reusable live stream endpoint.
 func (c *Client) CreateStream(title string, resolution string, fps int) (*Stream, error) {
+	return c.createStream(title, resolution, fps, true)
+}
+
+// CreateStreamForBroadcast creates a non-reusable live stream endpoint
+// intended for a single broadcast. Using non-reusable streams prevents
+// multiple active broadcasts from sharing the same ingest, which causes
+// YouTube to show the wrong watch page.
+func (c *Client) CreateStreamForBroadcast(title string, resolution string, fps int) (*Stream, error) {
+	return c.createStream(title, resolution, fps, false)
+}
+
+func (c *Client) createStream(title string, resolution string, fps int, reusable bool) (*Stream, error) {
 	payload := map[string]any{
 		"snippet": map[string]any{
 			"title": title,
 		},
 		"cdn": map[string]any{
-			"frameRate":  fpsCategory(fps),
+			"frameRate":     fpsCategory(fps),
 			"ingestionType": "rtmp",
-			"resolution": resolutionCategory(resolution),
+			"resolution":    resolutionCategory(resolution),
 		},
 		"contentDetails": map[string]any{
-			"isReusable": true,
+			"isReusable": reusable,
 		},
 	}
 	body, err := c.post("/liveStreams?part=snippet,cdn,contentDetails,status", payload)
@@ -222,6 +234,39 @@ func (c *Client) GetStreamHealth(streamID string) (*StreamHealth, error) {
 		Issues:             issues,
 		LastUpdateTimeUnix: item.Status.HealthStatus.LastUpdateTimeSecs,
 	}, nil
+}
+
+// GetConcurrentViewers returns the current number of viewers for a live
+// broadcast. Uses the videos.list endpoint with liveStreamingDetails part.
+// Returns -1 if the field is not available (e.g. broadcast not yet live).
+func (c *Client) GetConcurrentViewers(broadcastID string) (int, error) {
+	path := fmt.Sprintf("/videos?part=liveStreamingDetails&id=%s", url.QueryEscape(broadcastID))
+	body, err := c.get(path)
+	if err != nil {
+		return -1, fmt.Errorf("get concurrent viewers: %w", err)
+	}
+	var resp struct {
+		Items []struct {
+			LiveStreamingDetails struct {
+				ConcurrentViewers string `json:"concurrentViewers"`
+			} `json:"liveStreamingDetails"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return -1, err
+	}
+	if len(resp.Items) == 0 {
+		return -1, nil
+	}
+	raw := resp.Items[0].LiveStreamingDetails.ConcurrentViewers
+	if raw == "" {
+		return -1, nil
+	}
+	var n int
+	if _, err := fmt.Sscanf(raw, "%d", &n); err != nil {
+		return -1, nil
+	}
+	return n, nil
 }
 
 // BindBroadcast binds a broadcast to a stream.

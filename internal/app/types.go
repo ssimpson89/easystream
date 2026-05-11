@@ -12,12 +12,13 @@ import (
 // streamHealthSnapshot is the latest result of polling the destination
 // (currently YouTube) for the bound stream's health.
 type streamHealthSnapshot struct {
-	StreamStatus string    `json:"streamStatus,omitempty"` // active|created|error|inactive|ready
-	HealthStatus string    `json:"healthStatus,omitempty"` // good|ok|bad|noData
-	Issues       []string  `json:"issues,omitempty"`
-	LastUpdate   time.Time `json:"lastUpdate,omitempty"`
-	Source       string    `json:"source,omitempty"` // "youtube" | "" if not available
-	HasBroadcast bool      `json:"hasBroadcast"`
+	StreamStatus      string    `json:"streamStatus,omitempty"` // active|created|error|inactive|ready
+	HealthStatus      string    `json:"healthStatus,omitempty"` // good|ok|bad|noData
+	Issues            []string  `json:"issues,omitempty"`
+	LastUpdate        time.Time `json:"lastUpdate,omitempty"`
+	Source            string    `json:"source,omitempty"` // "youtube" | "" if not available
+	HasBroadcast      bool      `json:"hasBroadcast"`
+	ConcurrentViewers *int      `json:"concurrentViewers,omitempty"` // nil = unavailable
 }
 
 // persistedConfig is a subset of ffmpeg.Config we save across restarts,

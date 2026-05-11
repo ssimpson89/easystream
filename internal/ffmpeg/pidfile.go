@@ -10,16 +10,10 @@ import (
 	"time"
 )
 
-// PidFile records the FFmpeg child PID on disk so we can detect orphans
-// after an EasyStream crash or kill -9.
-//
-// True "reattachment" to a still-running FFmpeg child isn't possible on
-// Unix once the parent process dies — the child's stdout/stderr pipes are
-// gone and we can't reacquire them. The next best thing is deterministic
-// cleanup: on startup we find any leftover ffmpeg from our previous
-// session and terminate it, so state matches reality before we start a
-// new stream. Without this an orphan keeps pushing to the destination
-// invisibly until someone notices.
+// PidFile records the FFmpeg child PID on disk so we can detect EasyStream
+// orphans after a crash or kill -9. We do not adopt those processes: once the
+// parent dies their progress/audio/error pipes are gone, so startup reaps the
+// orphan and starts a fresh, fully observable FFmpeg when live intent exists.
 type PidFile struct {
 	Path string
 }
@@ -77,8 +71,9 @@ func (p *PidFile) ReapOrphan() (int, error) {
 		return 0, nil
 	}
 
-	// Confirm it's actually ffmpeg before killing. PIDs recycle.
-	if !isFFmpegProcess(pid) {
+	// Confirm it's an EasyStream-owned ffmpeg before killing. PIDs recycle, and
+	// this machine may have unrelated FFmpeg jobs running.
+	if !isEasyStreamFFmpegProcess(pid) {
 		p.Clear()
 		return 0, nil
 	}
@@ -98,20 +93,27 @@ func (p *PidFile) ReapOrphan() (int, error) {
 	return pid, nil
 }
 
-// isFFmpegProcess checks whether a PID corresponds to an ffmpeg process.
-// Uses `ps` for portability across macOS/Linux/BSD. Matches only when the
-// executable name (basename of argv[0]) is exactly "ffmpeg" — substring
-// matching would falsely match ffmpeg.test (the test binary), ffmpeg-go,
-// any tail -f /tmp/ffmpeg.log, etc.
-//
-// Returns false on any error so we err on the side of NOT killing
-// unrelated processes.
-func isFFmpegProcess(pid int) bool {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+// isEasyStreamFFmpegProcess checks whether a PID is an FFmpeg process started
+// by EasyStream. It intentionally requires EasyStream-specific command-line
+// markers, not just argv[0] == ffmpeg, so a stale PID cannot kill an unrelated
+// user FFmpeg job after PID reuse.
+func isEasyStreamFFmpegProcess(pid int) bool {
+	line, err := processCommand(pid)
 	if err != nil {
 		return false
 	}
-	line := strings.TrimSpace(string(out))
+	return isFFmpegCommandLine(line) && isEasyStreamCommandLine(line)
+}
+
+func processCommand(pid int) (string, error) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func isFFmpegCommandLine(line string) bool {
 	if line == "" {
 		return false
 	}
@@ -125,4 +127,19 @@ func isFFmpegProcess(pid int) bool {
 		base = line[idx+1:]
 	}
 	return strings.EqualFold(base, "ffmpeg")
+}
+
+func isEasyStreamCommandLine(line string) bool {
+	markers := []string{
+		"-progress pipe:1",
+		"lavfi.astats.Overall.RMS_level",
+		"rtp://127.0.0.1:52001",
+		"rtp://127.0.0.1:52002",
+	}
+	for _, marker := range markers {
+		if !strings.Contains(line, marker) {
+			return false
+		}
+	}
+	return true
 }

@@ -24,6 +24,8 @@ type streamIntent struct {
 	Mode        string    `json:"mode,omitempty"` // "manual" | "go-live-now" | "scheduled"
 	BroadcastID string    `json:"broadcastId,omitempty"`
 	StreamID    string    `json:"streamId,omitempty"`
+	IngestURL   string    `json:"ingestUrl,omitempty"`
+	StreamName  string    `json:"streamName,omitempty"`
 	StartedAt   time.Time `json:"startedAt,omitempty"`
 }
 

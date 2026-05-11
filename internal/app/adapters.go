@@ -35,12 +35,14 @@ func (a *streamControllerAdapter) StartWithIngest(presetID, ingestURL, streamKey
 		a.server.mu.Lock()
 		a.server.activeBroadcastID = ""
 		a.server.activeStreamID = ""
+		a.server.destinationBad = 0
 		a.server.mu.Unlock()
 		if a.server.preview != nil {
 			a.server.preview.Unblock()
 		}
 		return err
 	}
+	a.server.resetDestinationBadCount()
 	a.server.markLive("scheduled", broadcastID, streamID)
 	return nil
 }
@@ -56,6 +58,7 @@ func (a *streamControllerAdapter) StopStream() {
 	a.server.activeBroadcastID = ""
 	a.server.activeStreamID = ""
 	a.server.streamHealth = streamHealthSnapshot{}
+	a.server.destinationBad = 0
 	a.server.mu.Unlock()
 }
 
@@ -88,8 +91,10 @@ func (a *ytControllerAdapter) EnsureStream(presetID string) (streamID, ingestURL
 	if !ok {
 		preset = quality.Default()
 	}
-	title := "EasyStream - " + preset.Name
-	stream, err := a.client.EnsureStream(title, preset.Resolution(), preset.FPS)
+	// Create a fresh, non-reusable stream for each broadcast to avoid
+	// binding multiple active broadcasts to the same ingest endpoint.
+	title := "EasyStream - " + preset.Name + " - " + time.Now().UTC().Format("20060102-150405")
+	stream, err := a.client.CreateStreamForBroadcast(title, preset.Resolution(), preset.FPS)
 	if err != nil {
 		return "", "", "", err
 	}

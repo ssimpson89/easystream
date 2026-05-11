@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"math/rand"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -39,7 +39,7 @@ type Status struct {
 	LastProgress    Progress  `json:"lastProgress"`
 	ActivePresetID  string    `json:"activePresetId"`
 	Command         []string  `json:"command,omitempty"`
-	AudioRMSdB      float64   `json:"audioRmsDb"`      // -inf to 0; lower = quieter, -inf = silent
+	AudioRMSdB      float64   `json:"audioRmsDb"`      // finite dB value; lower = quieter, -120 = silence floor
 	AudioRMSAt      time.Time `json:"audioRmsAt"`      // when AudioRMSdB was last updated
 	AudioDetectedAt time.Time `json:"audioDetectedAt"` // when audio above silence floor was last seen
 }
@@ -65,12 +65,15 @@ type Supervisor struct {
 	ffmpeg  Config
 	status  Status
 	pidFile *PidFile
+	restart chan string
 
 	// onRestart is called whenever FFmpeg exits non-cleanly and is about
 	// to be restarted by the supervisor. Used by the adaptive controller
 	// to detect restart storms.
 	onRestart func()
 }
+
+var errRestartRequested = errors.New("supervisor restart requested")
 
 // SetOnRestart installs a callback invoked when FFmpeg restarts.
 func (s *Supervisor) SetOnRestart(fn func()) {
@@ -109,9 +112,9 @@ func NewSupervisor(logger *log.Logger, cfg SupervisorConfig) *Supervisor {
 	}
 	if cfg.PidFilePath != "" {
 		s.pidFile = &PidFile{Path: cfg.PidFilePath}
-		// Reap any orphan FFmpeg from a previous EasyStream run that didn't
-		// exit cleanly. Without this, the orphan keeps pushing to YouTube
-		// and a new stream creates a second concurrent connection.
+		// Reap any orphan EasyStream-owned FFmpeg from a previous crash before
+		// deciding whether intent should start a fresh stream. We never adopt a
+		// blind process because that would lose progress, audio, and error data.
 		if reaped, err := s.pidFile.ReapOrphan(); err != nil {
 			logger.Printf("supervisor: pid file reap error: %v", err)
 		} else if reaped > 0 {
@@ -140,6 +143,7 @@ func (s *Supervisor) Start(config Config) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 	s.done = make(chan struct{})
+	s.restart = make(chan string, 1)
 	s.ffmpeg = config
 	s.status = Status{
 		State:          StateStarting,
@@ -151,6 +155,27 @@ func (s *Supervisor) Start(config Config) error {
 
 	go s.run(ctx)
 	return nil
+}
+
+// Restart asks the running supervisor loop to replace FFmpeg while keeping
+// the stream intent active. It returns false when there is no active stream.
+func (s *Supervisor) Restart(reason string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cancel == nil || s.restart == nil {
+		return false
+	}
+	if reason == "" {
+		reason = "restart requested"
+	}
+	s.status.State = StateDegraded
+	s.status.LastError = reason
+	s.status.UpdatedAt = time.Now().UTC()
+	select {
+	case s.restart <- reason:
+	default:
+	}
+	return true
 }
 
 func (s *Supervisor) Stop() {
@@ -175,21 +200,54 @@ func (s *Supervisor) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	status := s.status
-	if (status.State == StateRunning || status.State == StateDegraded) &&
-		!status.LastProgress.UpdatedAt.IsZero() &&
-		time.Since(status.LastProgress.UpdatedAt) > s.cfg.ProgressStallAfter {
+	if (status.State == StateRunning || status.State == StateDegraded) && status.progressStalled(s.cfg.ProgressStallAfter, time.Now()) {
 		status.State = StateDegraded
 		status.LastError = "FFmpeg progress has stalled"
 	}
 	return status
 }
 
+func (s Status) progressStalled(after time.Duration, now time.Time) bool {
+	if after <= 0 {
+		return false
+	}
+	if !s.LastProgress.UpdatedAt.IsZero() {
+		return now.Sub(s.LastProgress.UpdatedAt) > after
+	}
+	return !s.StartedAt.IsZero() && now.Sub(s.StartedAt) > after
+}
+
+func (s *Supervisor) progressStalledSince(started time.Time) (bool, string) {
+	s.mu.Lock()
+	status := s.status
+	after := s.cfg.ProgressStallAfter
+	s.mu.Unlock()
+	now := time.Now()
+	if !status.progressStalled(after, now) {
+		return false, ""
+	}
+	if status.LastProgress.UpdatedAt.IsZero() {
+		return true, fmt.Sprintf("FFmpeg reported no progress for %s", now.Sub(started).Round(time.Second))
+	}
+	return true, fmt.Sprintf("FFmpeg progress stalled for %s", now.Sub(status.LastProgress.UpdatedAt).Round(time.Second))
+}
+
+func (s *Supervisor) markDegraded(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.State = StateDegraded
+	s.status.LastError = reason
+	s.status.UpdatedAt = time.Now().UTC()
+}
+
 func (s *Supervisor) run(ctx context.Context) {
 	defer func() {
 		s.mu.Lock()
 		done := s.done
+		restart := s.restart
 		s.cancel = nil
 		s.done = nil
+		s.restart = nil
 		if s.status.State == StateStopping {
 			s.status.State = StateIdle
 			s.status.UpdatedAt = time.Now().UTC()
@@ -197,6 +255,9 @@ func (s *Supervisor) run(ctx context.Context) {
 		s.mu.Unlock()
 		if done != nil {
 			close(done)
+		}
+		if restart != nil {
+			close(restart)
 		}
 	}()
 
@@ -208,6 +269,7 @@ func (s *Supervisor) run(ctx context.Context) {
 	for {
 		started := time.Now()
 		err := s.runOnce(ctx)
+
 		if ctx.Err() != nil {
 			s.setExit(StateStopping, "stopped by user", "")
 			return
@@ -268,7 +330,11 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, s.ffmpeg.Binary, args...)
+	// Use plain exec.Command (not CommandContext) so shutdown/restart can send
+	// SIGTERM before SIGKILL. Setpgid lets us signal the whole FFmpeg process
+	// group and reap it deterministically on the next startup after kill -9.
+	cmd := exec.Command(s.ffmpeg.Binary, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -278,6 +344,7 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 		return err
 	}
 
+	processStarted := time.Now()
 	if err := cmd.Start(); err != nil {
 		s.setExit(StateFailed, "", err.Error())
 		return err
@@ -292,6 +359,12 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 
 	s.mu.Lock()
 	s.status.State = StateRunning
+	s.status.StartedAt = time.Now().UTC()
+	s.status.LastProgress = Progress{}
+	s.status.LastError = ""
+	s.status.AudioRMSdB = 0
+	s.status.AudioRMSAt = time.Time{}
+	s.status.AudioDetectedAt = time.Time{}
 	s.status.UpdatedAt = time.Now().UTC()
 	s.mu.Unlock()
 
@@ -306,13 +379,64 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 		s.recordLogs(stderr)
 	}()
 
-	err = cmd.Wait()
-	wg.Wait()
-	// Clean exit (or crash we already detected): no orphan, drop the pid file.
-	if s.pidFile != nil {
-		s.pidFile.Clear()
+	// Wait for FFmpeg exit, explicit stop/restart, or stalled progress.
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	stallTicker := time.NewTicker(time.Second)
+	defer stallTicker.Stop()
+	s.mu.Lock()
+	restartCh := s.restart
+	s.mu.Unlock()
+
+	for {
+		select {
+		case err := <-waitCh:
+			wg.Wait()
+			if s.pidFile != nil {
+				s.pidFile.Clear()
+			}
+			return err
+
+		case reason := <-restartCh:
+			if reason == "" {
+				reason = "restart requested"
+			}
+			s.logger.Printf("supervisor: restarting FFmpeg: %s", reason)
+			err := terminateCommand(cmd, waitCh, 5*time.Second)
+			wg.Wait()
+			if s.pidFile != nil {
+				s.pidFile.Clear()
+			}
+			if err != nil {
+				return fmt.Errorf("%w: %s (%v)", errRestartRequested, reason, err)
+			}
+			return fmt.Errorf("%w: %s", errRestartRequested, reason)
+
+		case <-stallTicker.C:
+			if stalled, reason := s.progressStalledSince(processStarted); stalled {
+				s.logger.Printf("supervisor: restarting FFmpeg: %s", reason)
+				s.markDegraded(reason)
+				err := terminateCommand(cmd, waitCh, 5*time.Second)
+				wg.Wait()
+				if s.pidFile != nil {
+					s.pidFile.Clear()
+				}
+				if err != nil {
+					return fmt.Errorf("%w: %s (%v)", errRestartRequested, reason, err)
+				}
+				return fmt.Errorf("%w: %s", errRestartRequested, reason)
+			}
+
+		case <-ctx.Done():
+			s.logger.Printf("supervisor: stopping FFmpeg (pid %d)", cmd.Process.Pid)
+			err := terminateCommand(cmd, waitCh, 5*time.Second)
+			wg.Wait()
+			if s.pidFile != nil {
+				s.pidFile.Clear()
+			}
+			return err
+		}
 	}
-	return err
 }
 
 func (s *Supervisor) recordProgress(progress Progress) {
@@ -334,10 +458,10 @@ func (s *Supervisor) recordLogs(r io.Reader) {
 			continue
 		}
 
-		// Audio level lines look like:
-		//   [Parsed_ametadata_1 @ 0x...] lavfi.astats.Overall.RMS_level=-22.45
-		// Extract just the numeric value and update Status without spamming
-		// LastLogLine (these arrive every second).
+		// Audio level lines from ametadata file output look like:
+		//   lavfi.astats.Overall.RMS_level=-22.45
+		// When using file=/dev/stderr, ametadata also writes frame header
+		// lines like "frame:N  pts:N  pts_time:N" — skip those silently.
 		if rms, ok := parseAudioRMS(line); ok {
 			now := time.Now().UTC()
 			s.mu.Lock()
@@ -349,6 +473,10 @@ func (s *Supervisor) recordLogs(r io.Reader) {
 				s.status.AudioDetectedAt = now
 			}
 			s.mu.Unlock()
+			continue
+		}
+		// Skip ametadata frame-header lines (file=/dev/stderr output).
+		if strings.HasPrefix(line, "frame:") && strings.Contains(line, "pts_time:") {
 			continue
 		}
 
@@ -378,7 +506,9 @@ func parseAudioRMS(line string) (float64, bool) {
 		val = val[:space]
 	}
 	if val == "-inf" || val == "nan" {
-		return math.Inf(-1), true
+		// JSON cannot encode infinities/NaN. Keep the status API usable during
+		// silence by clamping FFmpeg's -inf/nan to a finite silence floor.
+		return -120, true
 	}
 	f, err := strconv.ParseFloat(val, 64)
 	if err != nil {
@@ -449,6 +579,35 @@ func sleepContext(ctx context.Context, d time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+func terminateCommand(cmd *exec.Cmd, waitCh <-chan error, grace time.Duration) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	pid := cmd.Process.Pid
+	_ = signalProcess(pid, syscall.SIGTERM)
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case err := <-waitCh:
+		return err
+	case <-timer.C:
+		_ = signalProcess(pid, syscall.SIGKILL)
+		return <-waitCh
+	}
+}
+
+func signalProcess(pid int, sig syscall.Signal) error {
+	if pid <= 0 {
+		return nil
+	}
+	// FFmpeg is started in its own process group. Signal the group first so
+	// any helper children are not orphaned; fall back to the process itself.
+	if err := syscall.Kill(-pid, sig); err == nil {
+		return nil
+	}
+	return syscall.Kill(pid, sig)
 }
 
 func withJitter(delay time.Duration) time.Duration {

@@ -5,315 +5,489 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>EasyStream</title>
     <link rel="stylesheet" href="/styles.css">
+    <link id="favicon" rel="icon" type="image/svg+xml"
+          href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230d1117'/%3E%3Cpath d='M5 4 L12 8 L5 12 Z' fill='%232f81f7'/%3E%3C/svg%3E">
+    <!-- app.js MUST load before alpine.min.js so the alpine:init listener
+         is registered before Alpine's CDN build auto-starts (via queueMicrotask). -->
+    <script src="/app.js" defer></script>
+    <script src="/alpine.min.js" defer></script>
   </head>
-  <body>
-    <main class="shell">
-      <section class="hero">
-        <div>
-          <p class="eyebrow">Campus streaming</p>
+  <body x-data="app" :class="{ 'is-live': isLive }" x-cloak>
+
+    <!-- Sticky LIVE banner -->
+    <div class="live-banner" x-show="isLive" x-transition.opacity>
+      <span class="live-dot"></span>
+      <span class="live-label">LIVE</span>
+      <span class="live-event" x-text="liveBannerEvent"></span>
+      <span class="live-time" x-text="liveBannerTime"></span>
+    </div>
+
+    <!-- =============== DASHBOARD VIEW =============== -->
+    <main class="shell" x-show="view === 'dashboard'">
+      <header class="topbar">
+        <div class="brand">
           <h1>EasyStream</h1>
         </div>
-        <div class="hero-right">
-          <div id="yt-account" class="yt-account" hidden>
-            <span id="yt-channel-name"></span>
-            <button id="yt-logout" class="button button-sm">Disconnect</button>
+        <div class="topbar-right">
+          <div class="yt-pill" x-show="youtube.authenticated && youtube.channelName">
+            <span class="yt-pill-dot"></span>
+            <span x-text="youtube.channelName"></span>
           </div>
-          <div class="state" id="state">Loading</div>
+          <button class="button button-sm" @click="view = 'settings'">⚙ Settings</button>
+        </div>
+      </header>
+
+      <section class="status-section">
+
+        <!-- Problem banner -->
+        <div class="problem-banner"
+             x-show="['degraded','restarting','failed'].includes(stream.state)"
+             :class="stream.state">
+          <strong x-text="problemTitle"></strong>
+          <span x-text="problemDetail"></span>
+        </div>
+
+        <!-- IDLE view -->
+        <div x-show="!isLive">
+          <div class="idle-header">
+            <span class="status-pill" :class="stream.state" x-text="idleLabel"></span>
+            <p class="hint" x-text="idleDetail"></p>
+          </div>
+
+          <!-- Next event card -->
+          <div class="next-event-card" x-show="nextEvent">
+            <div class="next-event-inner">
+              <p class="eyebrow">Next event</p>
+              <h2 x-text="nextEvent?.name"></h2>
+              <p class="next-event-when" x-text="nextEvent && formatEventWhen(new Date(nextEvent.startTime))"></p>
+              <p class="hint" x-text="nextEvent?.broadcastId ? 'Broadcast ready · will start automatically' : 'Broadcast will be created 30 min before · will start automatically'"></p>
+            </div>
+            <button class="button go-button"
+                    x-show="canStartScheduledNow"
+                    @click="startNow()"
+                    x-text="`Start ${nextEvent?.name} now`"></button>
+          </div>
+
+          <div class="hint no-events-card" x-show="!nextEvent && youtube.authenticated">
+            No upcoming events.
+            <button class="link-button" @click="view = 'settings'">Set up a schedule</button>
+          </div>
+
+          <!-- Primary go-live actions -->
+          <div class="actions-block">
+            <p class="eyebrow muted">Or go live now</p>
+            <div class="actions-row">
+              <div class="action-column" x-show="youtube.configured">
+                <button class="button big yt-button"
+                        :disabled="!!ytActionReason"
+                        @click="openYTModal()">Go Live on YouTube...</button>
+                <p class="action-reason" x-show="ytActionReason" x-text="ytActionReason"></p>
+              </div>
+              <div class="action-column">
+                <button class="button big"
+                        :disabled="!!customActionReason"
+                        @click="openCustomModal()">Start custom stream...</button>
+                <p class="action-reason" x-show="customActionReason" x-text="customActionReason"></p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- LIVE view -->
+        <div x-show="isLive">
+          <div class="live-card">
+            <div class="live-header-row">
+              <div class="live-header-info">
+                <h2 x-text="liveHeadline"></h2>
+                <p class="live-meta" x-text="liveMeta"></p>
+              </div>
+              <div class="actions">
+                <button class="button"
+                        x-show="showExtendButton && !stopConfirm"
+                        @click="extend()"
+                        x-text="extendLabel"></button>
+                <button class="button stop-button"
+                        x-show="!stopConfirm"
+                        @click="showStopConfirm()">Stop</button>
+                <button class="button stop-button"
+                        x-show="stopConfirm"
+                        @click="doStop()">Confirm stop</button>
+                <button class="button"
+                        x-show="stopConfirm"
+                        @click="stopConfirm = false">Cancel</button>
+              </div>
+            </div>
+
+            <p class="live-health" :class="liveHealthSeverity">
+              <template x-for="(p, i) in liveHealthParts" :key="i">
+                <span>
+                  <template x-if="i === 0"><strong x-text="p.text"></strong></template>
+                  <template x-if="i > 0"><span><span class="sep">·</span><span x-text="p.text"></span></span></template>
+                </span>
+              </template>
+            </p>
+
+            <div class="adaptive-banner" x-show="adaptive.isFallback && adaptive.activePreset">
+              <strong x-text="`Auto-reduced quality to ${presetName(adaptive.activePreset)}`"></strong>
+              <span x-text="`${adaptive.reason || 'Network conditions'} — original target was ${presetName(adaptive.originalPreset)}. Will restore when stable.`"></span>
+            </div>
+
+            <details class="tech-details" :open="isLive">
+              <summary>Technical details</summary>
+              <div class="tech-details-body">
+                <div class="confidence-panel">
+                  <template x-for="ind in confidence" :key="ind.label">
+                    <div class="confidence-item" :class="ind.status">
+                      <span class="confidence-dot" :class="ind.status"></span>
+                      <span class="confidence-info">
+                        <span class="confidence-label" x-text="ind.label"></span>
+                        <span class="confidence-detail" x-text="ind.detail || ''"></span>
+                      </span>
+                    </div>
+                  </template>
+                </div>
+                <dl class="metrics">
+                  <div><dt>Bitrate</dt><dd x-text="bitrateText"></dd></div>
+                  <div><dt>FPS</dt><dd x-text="stream.lastProgress?.fps ? stream.lastProgress.fps.toFixed(1) : '-'"></dd></div>
+                  <div><dt>Frames</dt><dd x-text="stream.lastProgress?.frame || '-'"></dd></div>
+                  <div><dt>Dropped</dt><dd x-text="stream.lastProgress?.dropped ?? '-'"></dd></div>
+                  <div><dt>Speed</dt><dd x-text="stream.lastProgress?.speed || '-'"></dd></div>
+                  <div><dt>Restarts</dt><dd x-text="stream.restartCount ?? 0"></dd></div>
+                  <div x-show="health.concurrentViewers != null"><dt>Viewers</dt><dd x-text="health.concurrentViewers ?? '-'"></dd></div>
+                </dl>
+                <p class="logline" x-text="logLineText"></p>
+              </div>
+            </details>
+          </div>
         </div>
       </section>
 
-      <!-- Live preview -->
-      <section class="panel preview-panel" id="preview-section">
+      <!-- Preview pane: always present, content varies by state -->
+      <section class="panel preview-panel">
         <div class="preview-bar">
-          <p class="eyebrow">Source preview</p>
+          <p class="eyebrow" x-text="isLive ? 'Live preview' : 'Source preview'"></p>
           <div class="preview-buttons">
-            <button id="preview-refresh" class="button button-sm" hidden>Refresh</button>
-            <button id="preview-toggle" class="button button-sm">Show Preview</button>
+            <button class="button button-sm"
+                    x-show="previewVisible"
+                    @click="refreshPreview()">Refresh</button>
+            <button class="button button-sm"
+                    @click="togglePreview()"
+                    x-text="previewVisible ? 'Hide Preview' : 'Show Preview'"></button>
           </div>
         </div>
-        <div id="preview-container" class="preview-container" hidden>
-          <video id="preview-video" class="preview-img" autoplay muted playsinline></video>
-          <p class="preview-hint">Live preview via WebRTC. Under a second of latency.</p>
+        <div class="preview-container" x-show="previewVisible">
+          <div class="preview-stage" x-show="!previewError">
+            <video x-ref="previewVideo"
+                   class="preview-img"
+                   autoplay muted playsinline></video>
+            <div class="audio-meter" :class="{ active: audioMeterActive }" aria-label="Audio level meter">
+              <div class="audio-meter-scale" aria-hidden="true">
+                <span>0</span>
+                <span>-20</span>
+                <span>-40</span>
+              </div>
+              <div class="audio-meter-track">
+                <div class="audio-meter-fill" :style="`--meter-level: ${Math.round(audioMeterLevel * 100)}%`"></div>
+                <div class="audio-meter-peak" :style="`--meter-peak: ${Math.round(audioMeterPeak * 100)}%`"></div>
+              </div>
+              <div class="audio-meter-readout">
+                <strong>Audio</strong>
+                <span x-text="audioMeterText"></span>
+              </div>
+            </div>
+          </div>
+          <p class="preview-error" x-show="previewError" x-text="previewError"></p>
+        </div>
+      </section>
+    </main>
+
+    <!-- =============== SETTINGS VIEW =============== -->
+    <main class="shell" x-show="view === 'settings'">
+      <header class="topbar">
+        <div class="brand">
+          <button class="back-button" aria-label="Back" @click="view = 'dashboard'">←</button>
+          <h1>Settings</h1>
+        </div>
+      </header>
+
+      <!-- Capture source -->
+      <section class="panel">
+        <p class="eyebrow">Capture source</p>
+        <h2>Video & audio</h2>
+        <label>
+          Video source
+          <select x-ref="videoSourceSelect" x-model="videoSourceValue" @change="onVideoSourceChange()">
+            <option value="">Select video source</option>
+            <template x-for="d in videoSourceOptions()" :key="d.key">
+              <option :value="d.value" :disabled="d.disabled" x-text="d.label"></option>
+            </template>
+          </select>
+        </label>
+        <label x-show="!isSDISource">
+          Audio source
+          <select x-ref="audioSourceSelect" x-model="audioSourceValue" @change="saveConfig()">
+            <template x-for="d in audioSourceOptions()" :key="d.key">
+              <option :value="d.value" :disabled="d.disabled" x-text="d.label"></option>
+            </template>
+          </select>
+        </label>
+        <div class="device-status-row">
+          <p class="hint" x-text="deviceStatusText"></p>
+          <button class="button button-sm" @click="scanDevices(true)">Refresh</button>
         </div>
       </section>
 
-      <!-- Stream status -->
-      <section class="panel primary">
-        <div id="problem-banner" class="problem-banner" hidden>
-          <strong id="problem-banner-title"></strong>
-          <span id="problem-banner-detail"></span>
+      <!-- Quality preset -->
+      <section class="panel" @click.away="presetMenuOpen = false">
+        <p class="eyebrow">Quality</p>
+        <h2>Video quality</h2>
+        <p class="hint">Choose the quality that matches your upload speed.</p>
+        <div class="preset-dropdown">
+          <button type="button" class="preset-trigger"
+                  :aria-expanded="presetMenuOpen"
+                  @click.stop="presetMenuOpen = !presetMenuOpen">
+            <span class="preset-trigger-content">
+              <strong x-text="currentPreset ? presetTitle(currentPreset) : '-'"></strong>
+              <span class="preset-upload" x-text="currentPreset ? `Min upload speed: ${currentPreset.uploadTarget}` : '-'"></span>
+            </span>
+            <span class="preset-caret">▾</span>
+          </button>
+          <div class="preset-menu" x-show="presetMenuOpen" @click.stop>
+            <template x-for="p in presets" :key="p.id">
+              <button type="button"
+                      class="preset-option"
+                      :class="{ active: p.id === selectedPreset }"
+                      @click="selectPreset(p.id)">
+                <strong x-text="presetTitle(p)"></strong>
+                <span class="preset-upload" x-text="`Min upload speed: ${p.uploadTarget}`"></span>
+              </button>
+            </template>
+          </div>
         </div>
-        <div class="panel-header">
-          <div>
-            <p class="eyebrow">Stream status</p>
-            <h2 id="status-title">Checking status...</h2>
-            <p id="start-reason" class="hint start-reason" hidden></p>
-          </div>
-          <div class="actions">
-            <button id="start" class="button go-button" disabled>Go Live</button>
-            <button id="extend" class="button" hidden>+15 min</button>
-            <button id="stop" class="button stop-button" disabled>Stop</button>
-            <button id="stop-confirm" class="button stop-button" hidden>Confirm stop</button>
-            <button id="stop-cancel" class="button" hidden>Cancel</button>
-          </div>
-        </div>
-        <div id="confidence-panel" class="confidence-panel"></div>
-        <dl class="metrics">
-          <div>
-            <dt>Bitrate</dt>
-            <dd id="bitrate">-</dd>
-          </div>
-          <div>
-            <dt>Frames</dt>
-            <dd id="frames">-</dd>
-          </div>
-          <div>
-            <dt>Restarts</dt>
-            <dd id="restarts">-</dd>
-          </div>
-          <div>
-            <dt>Speed</dt>
-            <dd id="speed">-</dd>
-          </div>
-        </dl>
-        <div id="adaptive-banner" class="adaptive-banner" hidden>
-          <strong id="adaptive-banner-title"></strong>
-          <span id="adaptive-banner-detail"></span>
-        </div>
-        <p class="logline" id="last-message">No stream activity yet.</p>
         <label class="adaptive-toggle">
-          <input type="checkbox" id="adaptive-enabled" checked>
+          <input type="checkbox" :checked="adaptive.enabled" @change="setAdaptive($event.target.checked)">
           <span>Auto-reduce quality if network struggles (recommended)</span>
         </label>
       </section>
 
-      <section class="grid">
-
-        <!-- Step 1: Quality -->
-        <article class="panel">
-          <p class="eyebrow">Step 1</p>
-          <h2>Quality tier</h2>
-          <p class="hint">Choose the quality that matches your upload speed.</p>
-          <div class="preset-dropdown" id="preset-dropdown">
-            <button type="button" class="preset-trigger" id="preset-trigger" aria-expanded="false">
-              <span class="preset-trigger-content">
-                <strong id="preset-info-title">-</strong>
-                <span class="preset-upload" id="preset-info-upload">-</span>
-              </span>
-              <span class="preset-caret">▾</span>
-            </button>
-            <div class="preset-menu" id="preset-menu" hidden></div>
-          </div>
-        </article>
-
-        <!-- Step 2: Destination -->
-        <article class="panel">
-          <p class="eyebrow">Step 2</p>
-          <h2>Destination</h2>
-
-          <!-- Mode tabs -->
-          <div class="tab-bar" id="dest-tabs">
-            <button class="tab active" data-mode="scheduled">Scheduled</button>
-            <button class="tab" data-mode="now">Go Live Now</button>
-            <button class="tab" data-mode="manual">Manual</button>
-          </div>
-
-          <!-- Scheduled mode -->
-          <div id="mode-scheduled" class="mode-content">
-            <div id="yt-login-prompt" class="yt-login-box">
-              <p>Connect your YouTube account to enable scheduled streaming.</p>
-              <button id="yt-login" class="button yt-button">Connect YouTube</button>
-            </div>
-            <div id="schedule-ui" hidden>
-              <div class="section-header">
-                <h3>Upcoming events</h3>
-              </div>
-              <div id="events-list" class="events-list">
-                <p class="hint">No upcoming events.</p>
-              </div>
-
-              <div class="section-header">
-                <h3>Recurring schedules</h3>
-                <button id="add-schedule-btn" class="button button-sm">+ Add</button>
-              </div>
-              <div id="schedules-list" class="schedule-list"></div>
-
-              <!-- Add schedule form -->
-              <div id="schedule-form" class="sub-form" hidden>
-                <label>Name <input id="sched-name" placeholder="Sunday Morning Service"></label>
-                <label>Days
-                  <div class="day-picker" id="sched-days">
-                    <button type="button" class="day-btn" data-day="sunday">Sun</button>
-                    <button type="button" class="day-btn" data-day="monday">Mon</button>
-                    <button type="button" class="day-btn" data-day="tuesday">Tue</button>
-                    <button type="button" class="day-btn" data-day="wednesday">Wed</button>
-                    <button type="button" class="day-btn" data-day="thursday">Thu</button>
-                    <button type="button" class="day-btn" data-day="friday">Fri</button>
-                    <button type="button" class="day-btn" data-day="saturday">Sat</button>
-                  </div>
-                </label>
-                <div class="form-row">
-                  <label>Time <input id="sched-time" type="time" value="08:45"></label>
-                  <label>Timezone
-                    <select id="sched-tz">
-                      <option value="America/Chicago">Central (CST/CDT)</option>
-                      <option value="America/New_York">Eastern (EST/EDT)</option>
-                      <option value="America/Denver">Mountain (MST/MDT)</option>
-                      <option value="America/Los_Angeles">Pacific (PST/PDT)</option>
-                      <option value="America/Phoenix">Arizona (MST)</option>
-                      <option value="Pacific/Honolulu">Hawaii (HST)</option>
-                      <option value="America/Anchorage">Alaska (AKST/AKDT)</option>
-                      <option value="UTC">UTC</option>
-                    </select>
-                  </label>
-                </div>
-                <div class="form-row">
-                  <label>Duration (min) <input id="sched-duration" type="number" value="120" min="15" max="480"></label>
-                  <label>Privacy
-                    <select id="sched-privacy">
-                      <option value="unlisted">Unlisted</option>
-                      <option value="public">Public</option>
-                      <option value="private">Private</option>
-                    </select>
-                  </label>
-                </div>
-                <label>YouTube title <input id="sched-title" placeholder="Sunday Morning Service - Live"></label>
-                <label>Description <textarea id="sched-desc" rows="2" placeholder="Join us for worship"></textarea></label>
-                <div class="form-actions">
-                  <button id="sched-save" class="button go-button">Save Schedule</button>
-                  <button id="sched-cancel" class="button">Cancel</button>
-                </div>
-              </div>
-
-              <div class="section-header">
-                <h3>Special events</h3>
-                <button id="add-override-btn" class="button button-sm">+ Add</button>
-              </div>
-              <div id="overrides-list" class="schedule-list"></div>
-
-              <!-- Add override form -->
-              <div id="override-form" class="sub-form" hidden>
-                <label>Name <input id="ovr-name" placeholder="Easter Service"></label>
-                <div class="form-row">
-                  <label>Date & time <input id="ovr-datetime" type="datetime-local"></label>
-                  <label>Duration (min) <input id="ovr-duration" type="number" value="120" min="15" max="480"></label>
-                </div>
-                <div class="form-row">
-                  <label>Timezone
-                    <select id="ovr-tz">
-                      <option value="America/Chicago">Central (CST/CDT)</option>
-                      <option value="America/New_York">Eastern (EST/EDT)</option>
-                      <option value="America/Denver">Mountain (MST/MDT)</option>
-                      <option value="America/Los_Angeles">Pacific (PST/PDT)</option>
-                      <option value="UTC">UTC</option>
-                    </select>
-                  </label>
-                  <label>Privacy
-                    <select id="ovr-privacy">
-                      <option value="unlisted">Unlisted</option>
-                      <option value="public">Public</option>
-                      <option value="private">Private</option>
-                    </select>
-                  </label>
-                </div>
-                <label>YouTube title <input id="ovr-title" placeholder="Easter Sunday Service - Live"></label>
-                <label>Description <textarea id="ovr-desc" rows="2"></textarea></label>
-                <div class="form-actions">
-                  <button id="ovr-save" class="button go-button">Save Event</button>
-                  <button id="ovr-cancel" class="button">Cancel</button>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- Go Live Now mode -->
-          <div id="mode-now" class="mode-content" hidden>
-            <div id="now-yt-login" class="yt-login-box">
-              <p>Connect your YouTube account to go live instantly.</p>
-              <button class="button yt-button" onclick="loginYouTube()">Connect YouTube</button>
-            </div>
-            <div id="now-ui" hidden>
-              <label>Broadcast title <input id="now-title" value="Live Stream"></label>
-              <label>Privacy
-                <select id="now-privacy">
-                  <option value="unlisted">Unlisted</option>
-                  <option value="public">Public</option>
-                  <option value="private">Private</option>
-                </select>
-              </label>
-              <p class="hint">Creates a YouTube broadcast, sets up the stream, and goes live immediately.</p>
-              <button id="now-go-live" class="button go-button full">Go Live Now on YouTube</button>
-            </div>
-          </div>
-
-          <!-- Manual mode -->
-          <div id="mode-manual" class="mode-content" hidden>
-            <label>
-              Output type
-              <select id="output-mode">
-                <option value="rtmp">RTMP/RTMPS push (YouTube, Twitch, Cloudflare, etc.)</option>
-                <option value="hls">HLS (m3u8 — for CDN pull or direct playback)</option>
-              </select>
-            </label>
-
-            <div id="rtmp-fields">
-              <p class="hint">Paste the ingest URL and stream key from your destination platform.</p>
-              <div class="quick-fill">
-                <span class="quick-fill-label">Quick fill:</span>
-                <button class="button button-sm" data-preset="youtube">YouTube</button>
-                <button class="button button-sm" data-preset="cloudflare">Cloudflare</button>
-                <button class="button button-sm" data-preset="twitch">Twitch</button>
-              </div>
-              <label>
-                Ingest URL
-                <input id="ingest-url" autocomplete="off" spellcheck="false">
-              </label>
-              <label>
-                Stream key
-                <input id="stream-name" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your stream key here">
-              </label>
-            </div>
-
-            <div id="hls-fields" hidden>
-              <p class="hint">EasyStream will output HLS segments locally and serve them over HTTP. Give the playlist URL below to a CDN or HLS player. For Cloudflare push, use RTMP/RTMPS mode above instead.</p>
-              <div class="hls-url-box">
-                <label>Playlist URL</label>
-                <div class="hls-url-row">
-                  <code id="hls-url">http://127.0.0.1:8080/hls/stream.m3u8</code>
-                  <button id="copy-hls-url" class="button button-sm">Copy</button>
-                </div>
-                <p class="hint">Make sure your machine is reachable from the internet (port forwarding, Cloudflare Tunnel, or reverse proxy).</p>
-              </div>
-            </div>
-          </div>
-        </article>
-
-        <!-- Step 3: Capture source -->
-        <article class="panel">
-          <p class="eyebrow">Step 3</p>
-          <h2>Capture source</h2>
-          <p class="hint">Pick a video source and (optionally) an audio source.</p>
-          <label>
-            Video source
-            <select id="video-source">
-              <option value="">Scanning...</option>
-            </select>
-          </label>
-          <label id="audio-source-label">
-            Audio source
-            <select id="audio-source">
-              <option value="">None</option>
-            </select>
-          </label>
-          <div class="device-status-row">
-            <p class="hint" id="device-status">Scanning for devices...</p>
-            <button id="refresh-devices" class="button button-sm">Refresh</button>
-          </div>
-        </article>
+      <!-- YouTube account -->
+      <section class="panel">
+        <p class="eyebrow">YouTube</p>
+        <h2>Account</h2>
+        <div class="yt-login-box" x-show="!youtube.configured">
+          <p>YouTube integration not configured. Set YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET to enable.</p>
+        </div>
+        <div class="yt-login-box" x-show="youtube.configured && !youtube.authenticated">
+          <p>Connect your YouTube account to enable scheduled streaming and one-click broadcasts.</p>
+          <button class="button yt-button" @click="loginYouTube()">Connect YouTube</button>
+        </div>
+        <div class="yt-connected-box" x-show="youtube.authenticated">
+          <p>Connected as <strong x-text="youtube.channelName"></strong>.</p>
+          <button class="button button-sm" @click="logoutYouTube()">Disconnect</button>
+        </div>
       </section>
 
-      <div id="save-notice" class="save-toast"></div>
+      <!-- Schedules -->
+      <section class="panel" x-show="youtube.authenticated">
+        <p class="eyebrow">Schedule</p>
+        <h2>Recurring events</h2>
+        <p class="hint">EasyStream creates a YouTube broadcast 30 min ahead and auto-starts at showtime.</p>
+
+        <div class="schedule-list">
+          <template x-if="schedules.length === 0">
+            <p class="hint">No recurring schedules yet.</p>
+          </template>
+          <template x-for="s in schedules" :key="s.id">
+            <div class="sched-card">
+              <div class="sched-info">
+                <strong x-text="s.name"></strong>
+                <span x-text="`${formatDays(s.days)} at ${s.time} (${shortTZ(s.timezone)})`"></span>
+              </div>
+              <div class="sched-actions">
+                <span class="badge" :class="s.enabled ? 'badge-ready' : 'badge-pending'" x-text="s.enabled ? 'Active' : 'Off'"></span>
+                <button class="button button-sm button-danger" @click="deleteSchedule(s.id)">Delete</button>
+              </div>
+            </div>
+          </template>
+        </div>
+        <button class="button button-sm" @click="openSchedForm()">+ Add recurring schedule</button>
+
+        <!-- Schedule form -->
+        <div class="sub-form" x-show="schedFormOpen">
+          <label>Name <input x-model="schedForm.name" placeholder="Sunday Morning Service"></label>
+          <label>Days
+            <div class="day-picker">
+              <template x-for="d in dayList" :key="d.value">
+                <button type="button" class="day-btn"
+                        :class="{ selected: schedForm.days.includes(d.value) }"
+                        @click="toggleDay(d.value)" x-text="d.label"></button>
+              </template>
+            </div>
+          </label>
+          <div class="form-row">
+            <label>Time <input type="time" x-model="schedForm.time"></label>
+            <label>Timezone
+              <select x-model="schedForm.timezone">
+                <template x-for="tz in tzList" :key="tz.value">
+                  <option :value="tz.value" x-text="tz.label"></option>
+                </template>
+              </select>
+            </label>
+          </div>
+          <div class="form-row">
+            <label>Duration (min) <input type="number" x-model.number="schedForm.durationMin" min="15" max="480"></label>
+            <label>Privacy
+              <select x-model="schedForm.privacy">
+                <option value="unlisted">Unlisted</option>
+                <option value="public">Public</option>
+                <option value="private">Private</option>
+              </select>
+            </label>
+          </div>
+          <label>YouTube title <input x-model="schedForm.title" placeholder="Sunday Morning Service - Live"></label>
+          <label>Description <textarea rows="2" x-model="schedForm.description" placeholder="Join us for worship"></textarea></label>
+          <div class="form-actions">
+            <button class="button go-button" @click="saveSchedule()">Save schedule</button>
+            <button class="button" @click="schedFormOpen = false">Cancel</button>
+          </div>
+        </div>
+
+        <h2 class="section-heading-2">Special events</h2>
+        <p class="hint">One-off events like holiday services.</p>
+        <div class="schedule-list">
+          <template x-if="overrides.length === 0">
+            <p class="hint">No special events.</p>
+          </template>
+          <template x-for="o in overrides" :key="o.id">
+            <div class="sched-card">
+              <div class="sched-info">
+                <strong x-text="o.name"></strong>
+                <span x-text="formatDateTime(new Date(o.startTime))"></span>
+              </div>
+              <div class="sched-actions">
+                <button class="button button-sm button-danger" @click="deleteOverride(o.id)">Delete</button>
+              </div>
+            </div>
+          </template>
+        </div>
+        <button class="button button-sm" @click="openOvrForm()">+ Add special event</button>
+
+        <div class="sub-form" x-show="ovrFormOpen">
+          <label>Name <input x-model="ovrForm.name" placeholder="Easter Service"></label>
+          <div class="form-row">
+            <label>Date & time <input type="datetime-local" x-model="ovrForm.wallClock"></label>
+            <label>Duration (min) <input type="number" x-model.number="ovrForm.durationMin" min="15" max="480"></label>
+          </div>
+          <div class="form-row">
+            <label>Timezone
+              <select x-model="ovrForm.timezone">
+                <template x-for="tz in tzListShort" :key="tz.value">
+                  <option :value="tz.value" x-text="tz.label"></option>
+                </template>
+              </select>
+            </label>
+            <label>Privacy
+              <select x-model="ovrForm.privacy">
+                <option value="unlisted">Unlisted</option>
+                <option value="public">Public</option>
+                <option value="private">Private</option>
+              </select>
+            </label>
+          </div>
+          <label>YouTube title <input x-model="ovrForm.title" placeholder="Easter Sunday Service - Live"></label>
+          <label>Description <textarea rows="2" x-model="ovrForm.description"></textarea></label>
+          <div class="form-actions">
+            <button class="button go-button" @click="saveOverride()">Save event</button>
+            <button class="button" @click="ovrFormOpen = false">Cancel</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Custom destination -->
+      <section class="panel">
+        <p class="eyebrow">Destination</p>
+        <h2>Custom stream destination</h2>
+        <p class="hint">For Twitch, Cloudflare, Facebook, or any other streaming service. Used by "Start custom stream" on the dashboard. YouTube users can ignore this — connect your account above instead.</p>
+
+        <label>
+          Where should the stream go?
+          <select x-model="outputMode" @change="saveConfig()">
+            <option value="rtmp">Send to another streaming service (RTMP/RTMPS)</option>
+            <option value="hls">Create a local playlist URL (HLS / m3u8)</option>
+          </select>
+        </label>
+
+        <div x-show="outputMode === 'rtmp'">
+          <div class="quick-fill">
+            <span class="quick-fill-label">Quick fill:</span>
+            <button class="button button-sm" @click="quickFill('youtube')">YouTube</button>
+            <button class="button button-sm" @click="quickFill('cloudflare')">Cloudflare</button>
+            <button class="button button-sm" @click="quickFill('twitch')">Twitch</button>
+          </div>
+          <label>
+            Server URL
+            <input x-model="ingestUrl" @blur="saveConfig()" autocomplete="off" spellcheck="false">
+          </label>
+          <label>
+            Stream key
+            <input type="password"
+                   x-model="streamKey"
+                   @blur="saveConfig()"
+                   autocomplete="off"
+                   spellcheck="false"
+                   :placeholder="hasStreamKey ? 'Stream key is set (enter a new one to replace)' : 'Paste your stream key here'">
+          </label>
+        </div>
+
+        <div x-show="outputMode === 'hls'">
+          <p class="hint">EasyStream writes HLS segments and serves them over HTTP.</p>
+          <div class="hls-url-box">
+            <label>Playlist URL</label>
+            <div class="hls-url-row">
+              <code x-text="hlsUrl"></code>
+              <button class="button button-sm" @click="copyHLSUrl()">Copy</button>
+            </div>
+            <p class="hint">Make sure your machine is reachable from the internet (port forwarding, Cloudflare Tunnel, etc.).</p>
+          </div>
+        </div>
+      </section>
     </main>
-    <script src="/app.js"></script>
+
+    <!-- =============== MODALS =============== -->
+    <div class="modal" x-show="ytModal.open" @click.self="ytModal.open = false" x-transition.opacity>
+      <div class="modal-card">
+        <h2>Go Live on YouTube</h2>
+        <p class="hint">Creates a YouTube broadcast and starts streaming immediately.</p>
+        <label>Title <input x-model="ytModal.title"></label>
+        <label>Privacy
+          <select x-model="ytModal.privacy">
+            <option value="unlisted">Unlisted</option>
+            <option value="public">Public</option>
+            <option value="private">Private</option>
+          </select>
+        </label>
+        <p class="modal-warn" x-show="ytModal.warn" x-text="ytModal.warn"></p>
+        <div class="form-actions">
+          <button class="button go-button" @click="goLiveYouTube()" :disabled="ytModal.busy">Start streaming</button>
+          <button class="button" @click="ytModal.open = false">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal" x-show="customModal.open" @click.self="customModal.open = false" x-transition.opacity>
+      <div class="modal-card">
+        <h2>Start custom stream</h2>
+        <p class="hint">Streaming to:</p>
+        <p class="custom-dest" x-text="customDestLabel"></p>
+        <p class="modal-warn" x-show="customModal.warn" x-text="customModal.warn"></p>
+        <div class="form-actions">
+          <button class="button go-button" @click="startCustom()" :disabled="customModal.busy">Start streaming</button>
+          <button class="button" @click="customModal.open = false">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast -->
+    <div class="save-toast" :class="{ visible: !!toast }" x-text="toast"></div>
   </body>
 </html>

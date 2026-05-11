@@ -140,6 +140,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	if s.adaptive != nil {
 		s.adaptive.OnStreamStart(config.Preset.ID)
 	}
+	s.resetDestinationBadCount()
 	s.markLive("manual", "", "")
 	writeJSON(w, http.StatusAccepted, s.supervisor.Status())
 }
@@ -148,6 +149,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler != nil {
 		s.scheduler.StopActive()
 	}
+	s.cancelTransitionGoroutine()
 	s.supervisor.Stop()
 	if s.adaptive != nil {
 		s.adaptive.OnStreamStop()
@@ -164,6 +166,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	s.activeBroadcastID = ""
 	s.activeStreamID = ""
 	s.streamHealth = streamHealthSnapshot{}
+	s.destinationBad = 0
 	s.mu.Unlock()
 	if broadcastID != "" && s.ytClient != nil && s.ytAuth.IsAuthenticated() {
 		go func(id string) {

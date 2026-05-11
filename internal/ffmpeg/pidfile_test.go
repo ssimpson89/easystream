@@ -91,3 +91,19 @@ func TestPidFile_WriteAndClear(t *testing.T) {
 	// Clear is idempotent.
 	p.Clear()
 }
+
+func TestIsEasyStreamCommandLineRequiresAllMarkers(t *testing.T) {
+	line := "ffmpeg -hide_banner -progress pipe:1 -af astats=metadata=1:reset=1:length=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr -f rtp rtp://127.0.0.1:52001?pkt_size=1200 -f rtp rtp://127.0.0.1:52002?pkt_size=1200"
+	if !isFFmpegCommandLine(line) {
+		t.Fatal("expected ffmpeg command line")
+	}
+	if !isEasyStreamCommandLine(line) {
+		t.Fatal("expected EasyStream FFmpeg markers")
+	}
+	if isEasyStreamCommandLine("ffmpeg -i input.mov output.mp4") {
+		t.Fatal("unrelated FFmpeg command should not match EasyStream markers")
+	}
+	if isFFmpegCommandLine("ffmpeg.test -test.run TestSomething") {
+		t.Fatal("test binary should not match ffmpeg executable")
+	}
+}
