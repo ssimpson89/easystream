@@ -140,6 +140,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	if s.adaptive != nil {
 		s.adaptive.OnStreamStart(config.Preset.ID)
 	}
+	s.markLive("manual", "", "")
 	writeJSON(w, http.StatusAccepted, s.supervisor.Status())
 }
 
@@ -154,6 +155,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if s.preview != nil {
 		s.preview.Unblock()
 	}
+	s.markIdle()
 	// If a YouTube broadcast was bound to this stream, transition it to
 	// "complete" so viewers see "stream ended" instead of "reconnecting"
 	// followed by a YouTube-side timeout.

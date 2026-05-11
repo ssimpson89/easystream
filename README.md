@@ -22,6 +22,10 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in your browser.
 - **Go 1.22+**
 - **FFmpeg** installed and available on `PATH` (`brew install ffmpeg` on macOS, `apt install ffmpeg` on Linux)
 
+### Production deployment
+
+Run EasyStream under **launchd** (macOS) or **systemd** (Linux) with restart-on-crash enabled. EasyStream persists operator intent to disk, so if the supervisor crashes mid-broadcast and the service manager restarts it, the stream picks up where it left off — the platform sees a brief reconnect rather than a stream end. Installable releases via `goreleaser` are planned.
+
 ## Features
 
 - **Volunteer-friendly web UI** — step-by-step workflow: choose quality, set destination, pick capture source, go live

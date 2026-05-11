@@ -146,6 +146,7 @@ func (s *Server) handleGoLiveNow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "start ffmpeg: "+err.Error())
 		return
 	}
+	s.markLive("go-live-now", broadcast.ID, stream.ID)
 
 	// Transition in background.
 	go func() {
@@ -196,6 +197,7 @@ func (s *Server) handleCompleteBroadcast(w http.ResponseWriter, r *http.Request)
 	if s.preview != nil {
 		s.preview.Unblock()
 	}
+	s.markIdle()
 
 	if body.BroadcastID != "" {
 		if err := s.ytClient.TransitionBroadcast(body.BroadcastID, "complete"); err != nil {

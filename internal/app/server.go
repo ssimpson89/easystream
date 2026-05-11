@@ -46,6 +46,7 @@ type Server struct {
 	scheduler  *schedule.Scheduler
 	logger     *log.Logger
 	configPath string // disk persistence for stream config
+	intentPath string // disk persistence for operator intent (crash resume)
 
 	mu                sync.Mutex
 	config            ffmpeg.Config
@@ -53,6 +54,35 @@ type Server struct {
 	activeBroadcastID string // YouTube broadcast bound to the current stream
 	activeStreamID    string // YouTube stream resource bound to the current broadcast
 	streamHealth      streamHealthSnapshot
+}
+
+// markLive persists the operator's intent to be live. Called from every
+// successful Go Live path. The intent file's presence is the signal that
+// drives auto-resume on the next boot.
+func (s *Server) markLive(mode, broadcastID, streamID string) {
+	if s.intentPath == "" {
+		return
+	}
+	intent := streamIntent{
+		Live:        true,
+		Mode:        mode,
+		BroadcastID: broadcastID,
+		StreamID:    streamID,
+		StartedAt:   time.Now().UTC(),
+	}
+	if err := saveStreamIntent(s.intentPath, intent); err != nil {
+		s.logger.Printf("intent: failed to persist live intent: %v", err)
+	}
+}
+
+// markIdle clears the operator's intent. Called from every Stop path
+// (manual, scheduler auto-stop, broadcast complete). Absent intent file
+// means "no auto-resume on next boot."
+func (s *Server) markIdle() {
+	if s.intentPath == "" {
+		return
+	}
+	clearStreamIntent(s.intentPath)
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -79,9 +109,11 @@ func NewServer(cfg ServerConfig) *Server {
 	// tab) from disk so it survives restarts. Falls back to defaults if
 	// missing/corrupt.
 	configPath := ""
+	intentPath := ""
 	destinationMode := "scheduled" // default tab
 	if cfg.DataDir != "" {
 		configPath = filepath.Join(cfg.DataDir, "stream-config.json")
+		intentPath = filepath.Join(cfg.DataDir, "intent.json")
 		if persisted, err := loadPersistedConfig(configPath); err == nil {
 			if persisted.PresetID != "" {
 				if preset, ok := quality.ByID(persisted.PresetID); ok {
@@ -122,6 +154,7 @@ func NewServer(cfg ServerConfig) *Server {
 		schedStore:      cfg.ScheduleStore,
 		logger:          cfg.Logger,
 		configPath:      configPath,
+		intentPath:      intentPath,
 		config:          defaultCfg,
 		destinationMode: destinationMode,
 	}
@@ -150,6 +183,13 @@ func NewServer(cfg ServerConfig) *Server {
 	// active stream, we poll YouTube every 15s for streamStatus/healthStatus
 	// so the UI can show "Receiving" / "noData" / "bad" indicators.
 	go server.runHealthPoller()
+
+	// If the previous session was live (crashed mid-stream and got restarted
+	// by launchd/systemd), resume the broadcast automatically. The PID
+	// reaper above has already killed any zombie FFmpeg; this spawns a
+	// fresh one with the same destination so the platform sees a brief
+	// reconnect rather than a stream end.
+	server.resumeIfNeeded()
 
 	server.httpServer = &http.Server{
 		Addr:              cfg.Addr,
@@ -228,6 +268,74 @@ func (s *Server) Close() {
 	if s.adaptive != nil {
 		s.adaptive.Stop()
 	}
+}
+
+// resumeIfNeeded checks the on-disk intent file. If the previous session
+// was live and the record is fresh (under maxIntentAge), spawn FFmpeg with
+// the persisted config so the broadcast picks up where it left off.
+//
+// Called from NewServer after the PID reaper has killed any zombie
+// FFmpeg from the previous crash. The platform (YouTube, Cloudflare)
+// sees a brief reconnect — both explicitly support this.
+//
+// If the resume attempt fails (stream key revoked, ingest URL broken),
+// clear the intent so subsequent boots don't keep retrying.
+func (s *Server) resumeIfNeeded() {
+	if s.intentPath == "" {
+		return
+	}
+	intent, err := loadStreamIntent(s.intentPath)
+	if err != nil {
+		// No intent file = nothing to resume. Quiet success.
+		return
+	}
+	if !intent.Live {
+		// Idle intent recorded explicitly — caller chose not to be live.
+		return
+	}
+	if !intent.fresh() {
+		s.logger.Printf("resume: intent file is stale (started %s ago) — clearing without resuming",
+			time.Since(intent.StartedAt).Round(time.Minute))
+		clearStreamIntent(s.intentPath)
+		return
+	}
+
+	s.mu.Lock()
+	config := s.config
+	s.activeBroadcastID = intent.BroadcastID
+	s.activeStreamID = intent.StreamID
+	s.mu.Unlock()
+
+	// Validate that we have enough config to actually resume.
+	if err := config.Validate(); err != nil {
+		s.logger.Printf("resume: persisted config invalid (%v) — clearing intent without resuming", err)
+		clearStreamIntent(s.intentPath)
+		return
+	}
+
+	if config.OutputMode == ffmpeg.OutputHLS && s.hlsServer != nil {
+		_ = s.hlsServer.Clean()
+	}
+	if s.preview != nil && config.Input.Kind != ffmpeg.InputTestVideo {
+		s.preview.Block()
+	}
+	if err := s.supervisor.Start(config); err != nil {
+		s.logger.Printf("resume: failed to restart stream (%v) — clearing intent", err)
+		if s.preview != nil {
+			s.preview.Unblock()
+		}
+		clearStreamIntent(s.intentPath)
+		return
+	}
+	if s.adaptive != nil {
+		s.adaptive.OnStreamStart(config.Preset.ID)
+	}
+	mode := intent.Mode
+	if mode == "" {
+		mode = "unknown"
+	}
+	s.logger.Printf("resume: restarted stream from previous session (mode=%s broadcast=%q, started %s ago)",
+		mode, intent.BroadcastID, time.Since(intent.StartedAt).Round(time.Second))
 }
 
 // --- Shared helpers ---

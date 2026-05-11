@@ -41,6 +41,7 @@ func (a *streamControllerAdapter) StartWithIngest(presetID, ingestURL, streamKey
 		}
 		return err
 	}
+	a.server.markLive("scheduled", broadcastID, streamID)
 	return nil
 }
 
@@ -49,6 +50,7 @@ func (a *streamControllerAdapter) StopStream() {
 	if a.server.preview != nil {
 		a.server.preview.Unblock()
 	}
+	a.server.markIdle()
 	// Caller (scheduler) already calls TransitionBroadcast itself; just clear local state.
 	a.server.mu.Lock()
 	a.server.activeBroadcastID = ""
