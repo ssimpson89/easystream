@@ -1,49 +1,65 @@
 package youtube
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"golang.org/x/oauth2"
 )
 
-const (
-	authEndpoint  = "https://accounts.google.com/o/oauth2/v2/auth"
-	tokenEndpoint = "https://oauth2.googleapis.com/token"
-	ytScope       = "https://www.googleapis.com/auth/youtube"
-)
+const ytScope = "https://www.googleapis.com/auth/youtube"
 
-// Token holds OAuth 2.0 credentials persisted to disk.
-type Token struct {
+// googleEndpoint is Google's OAuth 2.0 endpoint. Hard-coded so we don't pull
+// in golang.org/x/oauth2/google (which would add the entire google package).
+var googleEndpoint = oauth2.Endpoint{
+	AuthURL:   "https://accounts.google.com/o/oauth2/v2/auth",
+	TokenURL:  "https://oauth2.googleapis.com/token",
+	AuthStyle: oauth2.AuthStyleInParams,
+}
+
+// storedToken is the on-disk representation. We store the oauth2.Token fields
+// plus channel info we cached from the YouTube API.
+type storedToken struct {
 	AccessToken  string    `json:"accessToken"`
 	RefreshToken string    `json:"refreshToken"`
 	TokenType    string    `json:"tokenType"`
-	ExpiresAt    time.Time `json:"expiresAt"`
+	Expiry       time.Time `json:"expiry"`
 	ChannelName  string    `json:"channelName,omitempty"`
 	ChannelID    string    `json:"channelId,omitempty"`
 }
 
-func (t *Token) expired() bool {
-	return t == nil || time.Now().After(t.ExpiresAt.Add(-30*time.Second))
+func (s *storedToken) toOauth2() *oauth2.Token {
+	if s == nil {
+		return nil
+	}
+	return &oauth2.Token{
+		AccessToken:  s.AccessToken,
+		RefreshToken: s.RefreshToken,
+		TokenType:    s.TokenType,
+		Expiry:       s.Expiry,
+	}
 }
 
-// Auth manages YouTube OAuth tokens.
+// Auth manages YouTube OAuth tokens via golang.org/x/oauth2.
+//
+// The library handles the access-token refresh dance automatically when we
+// call cfg.Client(ctx, token). We wrap its TokenSource with a persistTokenSource
+// so refreshed tokens get written back to disk.
 type Auth struct {
-	ClientID     string
-	ClientSecret string
-	RedirectURI  string
-	TokenFile    string
+	cfg       *oauth2.Config
+	tokenFile string
 
-	mu    sync.Mutex
-	token *Token
-	state string // CSRF state for current auth flow
+	mu          sync.Mutex
+	token       *storedToken
+	state       string // CSRF state for the current consent flow
 }
 
 // NewAuth creates an Auth that stores tokens at tokenFile.
@@ -53,10 +69,14 @@ func NewAuth(clientID, clientSecret, redirectURI, tokenFile string) *Auth {
 		return nil
 	}
 	a := &Auth{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		RedirectURI:  redirectURI,
-		TokenFile:    tokenFile,
+		cfg: &oauth2.Config{
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			RedirectURL:  redirectURI,
+			Scopes:       []string{ytScope},
+			Endpoint:     googleEndpoint,
+		},
+		tokenFile: tokenFile,
 	}
 	_ = a.loadToken()
 	return a
@@ -64,10 +84,10 @@ func NewAuth(clientID, clientSecret, redirectURI, tokenFile string) *Auth {
 
 // Configured returns true if YouTube OAuth credentials are set.
 func (a *Auth) Configured() bool {
-	return a != nil && a.ClientID != ""
+	return a != nil && a.cfg != nil
 }
 
-// IsAuthenticated returns true if we have a valid refresh token.
+// IsAuthenticated returns true if we have a refresh token.
 func (a *Auth) IsAuthenticated() bool {
 	if a == nil {
 		return false
@@ -95,7 +115,8 @@ func (a *Auth) AuthStatus() map[string]any {
 	return result
 }
 
-// AuthURL returns the Google consent URL. Opens this in the user's browser.
+// AuthURL returns the Google consent URL. Open this in the user's browser.
+// Includes offline access + force-consent so we always get a refresh token.
 func (a *Auth) AuthURL() string {
 	if a == nil {
 		return ""
@@ -105,16 +126,10 @@ func (a *Auth) AuthURL() string {
 	state := a.state
 	a.mu.Unlock()
 
-	params := url.Values{
-		"client_id":     {a.ClientID},
-		"redirect_uri":  {a.RedirectURI},
-		"response_type": {"code"},
-		"scope":         {ytScope},
-		"access_type":   {"offline"},
-		"prompt":        {"consent"},
-		"state":         {state},
-	}
-	return authEndpoint + "?" + params.Encode()
+	return a.cfg.AuthCodeURL(state,
+		oauth2.AccessTypeOffline,
+		oauth2.ApprovalForce, // alias for prompt=consent
+	)
 }
 
 // Exchange trades an authorization code for tokens.
@@ -129,49 +144,46 @@ func (a *Auth) Exchange(code, state string) error {
 		return fmt.Errorf("invalid state parameter")
 	}
 
-	data := url.Values{
-		"code":          {code},
-		"client_id":     {a.ClientID},
-		"client_secret": {a.ClientSecret},
-		"redirect_uri":  {a.RedirectURI},
-		"grant_type":    {"authorization_code"},
-	}
-	tok, err := postToken(data)
+	tok, err := a.cfg.Exchange(context.Background(), code)
 	if err != nil {
 		return fmt.Errorf("token exchange failed: %w", err)
 	}
 
 	a.mu.Lock()
-	a.token = tok
+	a.token = &storedToken{
+		AccessToken:  tok.AccessToken,
+		RefreshToken: tok.RefreshToken,
+		TokenType:    tok.TokenType,
+		Expiry:       tok.Expiry,
+	}
 	a.state = ""
 	a.mu.Unlock()
 
-	// Fetch channel info with the new token.
-	if err := a.fetchChannelInfo(); err != nil {
-		// Non-fatal; token still valid.
-		_ = err
-	}
+	// Fetch channel info with the new token (non-fatal if it fails).
+	_ = a.fetchChannelInfo()
 
 	return a.saveToken()
 }
 
-// HTTPClient returns an *http.Client that injects the access token.
-// Automatically refreshes expired tokens.
+// HTTPClient returns an *http.Client with automatic token refresh.
+// The oauth2 library transparently refreshes the access token when it's
+// near expiry. We wrap its TokenSource so refreshed tokens get persisted.
 func (a *Auth) HTTPClient() (*http.Client, error) {
 	if a == nil {
 		return nil, fmt.Errorf("youtube auth not configured")
 	}
-	if err := a.ensureFreshToken(); err != nil {
-		return nil, err
-	}
 	a.mu.Lock()
-	accessToken := a.token.AccessToken
+	stored := a.token
 	a.mu.Unlock()
+	if stored == nil || stored.RefreshToken == "" {
+		return nil, fmt.Errorf("not authenticated with YouTube")
+	}
 
-	return &http.Client{
-		Transport: &bearerTransport{token: accessToken, base: http.DefaultTransport},
-		Timeout:   30 * time.Second,
-	}, nil
+	src := a.cfg.TokenSource(context.Background(), stored.toOauth2())
+	persistSrc := &persistTokenSource{src: src, auth: a}
+	client := oauth2.NewClient(context.Background(), persistSrc)
+	client.Timeout = 30 * time.Second
+	return client, nil
 }
 
 // Logout clears stored tokens.
@@ -182,43 +194,49 @@ func (a *Auth) Logout() error {
 	a.mu.Lock()
 	a.token = nil
 	a.mu.Unlock()
-	_ = os.Remove(a.TokenFile)
+	_ = os.Remove(a.tokenFile)
 	return nil
 }
 
-func (a *Auth) ensureFreshToken() error {
-	a.mu.Lock()
-	tok := a.token
-	a.mu.Unlock()
+// persistTokenSource wraps an oauth2.TokenSource so that refreshed tokens
+// get written to disk and to the Auth's in-memory cache.
+type persistTokenSource struct {
+	src  oauth2.TokenSource
+	auth *Auth
+}
 
-	if tok == nil || tok.RefreshToken == "" {
-		return fmt.Errorf("not authenticated with YouTube")
-	}
-	if !tok.expired() {
-		return nil
-	}
-
-	data := url.Values{
-		"refresh_token": {tok.RefreshToken},
-		"client_id":     {a.ClientID},
-		"client_secret": {a.ClientSecret},
-		"grant_type":    {"refresh_token"},
-	}
-	newTok, err := postToken(data)
+func (p *persistTokenSource) Token() (*oauth2.Token, error) {
+	tok, err := p.src.Token()
 	if err != nil {
-		return fmt.Errorf("token refresh failed: %w", err)
+		return nil, err
 	}
-	// Refresh responses don't include a new refresh token; keep the old one.
-	if newTok.RefreshToken == "" {
-		newTok.RefreshToken = tok.RefreshToken
+	p.auth.mu.Lock()
+	prev := p.auth.token
+	// Only re-save if the access token actually changed (refresh happened).
+	if prev == nil || prev.AccessToken != tok.AccessToken {
+		channelName, channelID := "", ""
+		if prev != nil {
+			channelName, channelID = prev.ChannelName, prev.ChannelID
+		}
+		// Refresh responses sometimes omit refresh_token; preserve the existing one.
+		refresh := tok.RefreshToken
+		if refresh == "" && prev != nil {
+			refresh = prev.RefreshToken
+		}
+		p.auth.token = &storedToken{
+			AccessToken:  tok.AccessToken,
+			RefreshToken: refresh,
+			TokenType:    tok.TokenType,
+			Expiry:       tok.Expiry,
+			ChannelName:  channelName,
+			ChannelID:    channelID,
+		}
+		p.auth.mu.Unlock()
+		_ = p.auth.saveToken()
+	} else {
+		p.auth.mu.Unlock()
 	}
-	newTok.ChannelName = tok.ChannelName
-	newTok.ChannelID = tok.ChannelID
-
-	a.mu.Lock()
-	a.token = newTok
-	a.mu.Unlock()
-	return a.saveToken()
+	return tok, nil
 }
 
 func (a *Auth) fetchChannelInfo() error {
@@ -250,18 +268,20 @@ func (a *Auth) fetchChannelInfo() error {
 	}
 
 	a.mu.Lock()
-	a.token.ChannelName = result.Items[0].Snippet.Title
-	a.token.ChannelID = result.Items[0].ID
+	if a.token != nil {
+		a.token.ChannelName = result.Items[0].Snippet.Title
+		a.token.ChannelID = result.Items[0].ID
+	}
 	a.mu.Unlock()
 	return a.saveToken()
 }
 
 func (a *Auth) loadToken() error {
-	data, err := os.ReadFile(a.TokenFile)
+	data, err := os.ReadFile(a.tokenFile)
 	if err != nil {
 		return err
 	}
-	var tok Token
+	var tok storedToken
 	if err := json.Unmarshal(data, &tok); err != nil {
 		return err
 	}
@@ -278,60 +298,14 @@ func (a *Auth) saveToken() error {
 	if tok == nil {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(a.TokenFile), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(a.tokenFile), 0700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(tok, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(a.TokenFile, data, 0600)
-}
-
-// postToken exchanges credentials at the Google token endpoint.
-func postToken(data url.Values) (*Token, error) {
-	resp, err := http.PostForm(tokenEndpoint, data)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, body)
-	}
-
-	var raw struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		TokenType    string `json:"token_type"`
-		ExpiresIn    int    `json:"expires_in"`
-		Error        string `json:"error"`
-		ErrorDesc    string `json:"error_description"`
-	}
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, err
-	}
-	if raw.Error != "" {
-		return nil, fmt.Errorf("%s: %s", raw.Error, raw.ErrorDesc)
-	}
-	return &Token{
-		AccessToken:  raw.AccessToken,
-		RefreshToken: raw.RefreshToken,
-		TokenType:    raw.TokenType,
-		ExpiresAt:    time.Now().Add(time.Duration(raw.ExpiresIn) * time.Second),
-	}, nil
-}
-
-type bearerTransport struct {
-	token string
-	base  http.RoundTripper
-}
-
-func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	r := req.Clone(req.Context())
-	r.Header.Set("Authorization", "Bearer "+t.token)
-	return t.base.RoundTrip(r)
+	return os.WriteFile(a.tokenFile, data, 0600)
 }
 
 func randomState() string {

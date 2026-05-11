@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/robfig/cron/v3"
 )
 
 // Schedule defines a recurring live stream event.
@@ -337,6 +339,14 @@ func EventKey(id string, startTime time.Time) string {
 	return id + ":" + startTime.UTC().Format(time.RFC3339)
 }
 
+// nextOccurrences computes the next firings of a recurring schedule using
+// robfig/cron/v3. We build a standard 5-field cron expression
+// ("min hour * * dow") from our days+time+timezone model and walk Next()
+// until we pass the horizon.
+//
+// robfig/cron handles DST transitions, leap days, and timezone math
+// correctly — things our previous hand-rolled implementation had to be
+// trusted on without test coverage.
 func nextOccurrences(sched Schedule, after, horizon time.Time) []time.Time {
 	loc, err := time.LoadLocation(sched.Timezone)
 	if err != nil {
@@ -349,25 +359,35 @@ func nextOccurrences(sched Schedule, after, horizon time.Time) []time.Time {
 	hour, _ := strconv.Atoi(parts[0])
 	minute, _ := strconv.Atoi(parts[1])
 
-	daySet := make(map[time.Weekday]bool)
+	// Build the day-of-week field. robfig/cron accepts 0-6 (Sun-Sat),
+	// matching our parsed time.Weekday values.
+	var days []string
 	for _, d := range sched.Days {
 		if wd, ok := parseWeekday(d); ok {
-			daySet[wd] = true
+			days = append(days, strconv.Itoa(int(wd)))
 		}
+	}
+	if len(days) == 0 {
+		return nil
+	}
+	expr := fmt.Sprintf("%d %d * * %s", minute, hour, strings.Join(days, ","))
+
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	schedule, err := parser.Parse(expr)
+	if err != nil {
+		return nil
 	}
 
+	// Walk Next() in the schedule's timezone. Cron's Next interprets the
+	// passed time in its zone, so we hand it a time anchored to loc.
 	var times []time.Time
-	// Start from the day of 'after' in the schedule's timezone.
-	start := after.In(loc)
-	day := time.Date(start.Year(), start.Month(), start.Day(), hour, minute, 0, 0, loc)
-	if day.Before(after) {
-		day = day.AddDate(0, 0, 1)
-	}
-	for day.Before(horizon) {
-		if daySet[day.Weekday()] {
-			times = append(times, day.UTC())
+	t := after.In(loc)
+	for {
+		t = schedule.Next(t)
+		if t.IsZero() || !t.Before(horizon) {
+			break
 		}
-		day = day.AddDate(0, 0, 1)
+		times = append(times, t.UTC())
 	}
 	return times
 }
