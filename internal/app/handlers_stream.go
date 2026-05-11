@@ -146,6 +146,17 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
+	// Capture the active broadcast ID before anything clears it.
+	// scheduler.StopActive → adapter.StopStream clears activeBroadcastID,
+	// so we must read it first to transition the YouTube broadcast.
+	s.mu.Lock()
+	broadcastID := s.activeBroadcastID
+	s.activeBroadcastID = ""
+	s.activeStreamID = ""
+	s.streamHealth = streamHealthSnapshot{}
+	s.destinationBad = 0
+	s.mu.Unlock()
+
 	if s.scheduler != nil {
 		s.scheduler.StopActive()
 	}
@@ -158,16 +169,9 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		s.preview.Unblock()
 	}
 	s.markIdle()
-	// If a YouTube broadcast was bound to this stream, transition it to
-	// "complete" so viewers see "stream ended" instead of "reconnecting"
-	// followed by a YouTube-side timeout.
-	s.mu.Lock()
-	broadcastID := s.activeBroadcastID
-	s.activeBroadcastID = ""
-	s.activeStreamID = ""
-	s.streamHealth = streamHealthSnapshot{}
-	s.destinationBad = 0
-	s.mu.Unlock()
+
+	// Transition the YouTube broadcast to "complete" so viewers see
+	// "stream ended" instead of spinning indefinitely.
 	if broadcastID != "" && s.ytClient != nil && s.ytAuth.IsAuthenticated() {
 		go func(id string) {
 			if err := s.ytClient.TransitionBroadcast(id, "complete"); err != nil {
