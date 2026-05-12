@@ -283,6 +283,10 @@
                 </template>
               </select>
             </label>
+            <label class="checkbox-row" x-show="videoSourceValue !== '' && videoSourceValue !== 'test-video::'">
+              <input type="checkbox" x-model="sourceIsHDR" @change="onHDRToggle()">
+              Source is HDR (PQ/HLG) — tone-map to SDR
+            </label>
             <div class="device-status-row">
               <p class="hint" x-text="deviceStatusText"></p>
               <button class="button button-sm" @click="scanDevices(true)">Refresh</button>

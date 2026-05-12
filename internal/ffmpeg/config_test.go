@@ -226,6 +226,40 @@ func TestNetworkInputValidateRequiresURL(t *testing.T) {
 	}
 }
 
+func TestHDRSourceAddsTonemapChain(t *testing.T) {
+	cfg := networkInputCfg("rtsp://hdr-camera.local/feed")
+	cfg.Input.SourceIsHDR = true
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "zscale=t=linear:npl=100") {
+		t.Errorf("expected HDR tonemap chain when SourceIsHDR set: %s", joined)
+	}
+	if !strings.Contains(joined, "tonemap=tonemap=hable") {
+		t.Errorf("expected hable tonemap when SourceIsHDR set: %s", joined)
+	}
+	if !strings.Contains(joined, "zscale=t=bt709:m=bt709:r=tv") {
+		t.Errorf("expected BT.709 SDR conversion when SourceIsHDR set: %s", joined)
+	}
+}
+
+func TestSDRSourceSkipsTonemap(t *testing.T) {
+	cfg := networkInputCfg("rtsp://sdr-camera.local/feed")
+	cfg.Input.SourceIsHDR = false
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "zscale=t=linear") {
+		t.Errorf("did not expect tonemap chain on SDR source: %s", joined)
+	}
+}
+
 func TestArgsSRTOutput(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.OutputMode = OutputSRT
