@@ -85,6 +85,11 @@ document.addEventListener("alpine:init", () => {
     _dirtyAudio:     false,
     _dirtyVideo:     false,
 
+    // Tracks the previous videoSourceValue so onVideoSourceChange
+    // can detect a kind transition (e.g. webcam → network) and
+    // reset kind-specific defaults.
+    _lastVideoSourceValue: "",
+
     schedForm: { id: "", name: "", days: [], time: "09:00", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted", enabled: true },
     ovrForm:   { id: "", name: "", wallClock: "", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted" },
 
@@ -748,8 +753,20 @@ document.addEventListener("alpine:init", () => {
     },
 
     onVideoSourceChange() {
+      const prevKind = S.decodeSourceValue(this._lastVideoSourceValue)?.kind || "";
+      const nextKind = S.decodeSourceValue(this.videoSourceValue)?.kind || "";
+      this._lastVideoSourceValue = this.videoSourceValue;
       this._dirtyVideo = true;
       if (this.isSDISource) this.audioSourceValue = "";
+      // Reset network-only flags when switching INTO network from a
+      // different source kind. NoAudio defaults to false: most network
+      // sources (RTSP cameras, SRT pulls, HLS streams) carry audio, so
+      // assume the source has audio until the operator says otherwise.
+      // Without this reset, a stale checked state from a previous
+      // session could carry over via the dirty flag.
+      if (nextKind === "network" && prevKind !== "network") {
+        this.networkNoAudio = false;
+      }
       // Picking "Network stream" without a URL would POST invalid
       // config (backend requires Input.URL) and show a save-failed
       // toast. Defer save until the operator types a URL.
