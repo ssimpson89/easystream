@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -46,12 +47,20 @@ type Input struct {
 	Format          string    `json:"format"`
 }
 
-// OutputMode selects where FFmpeg sends the encoded stream.
+// OutputMode selects the *primary* destination FFmpeg sends to.
+// HLS is no longer one of the mutually-exclusive primaries — it is an
+// independent toggle (Config.EnableHLS) that runs alongside any primary
+// for local monitoring. The legacy "hls" value is accepted on input
+// solely for backwards-compat migration; new code emits only "rtmp"
+// (or future "srt").
 type OutputMode string
 
 const (
-	OutputRTMP OutputMode = "rtmp" // RTMP/RTMPS push to YouTube/etc
-	OutputHLS  OutputMode = "hls"  // Write HLS segments to local dir
+	OutputRTMP OutputMode = "rtmp" // RTMP/RTMPS push (YouTube, Twitch, etc.)
+	OutputSRT  OutputMode = "srt"  // SRT push (Cloudflare Stream, custom receivers)
+	// Legacy "hls" value is recognised on the load path (server.go,
+	// handleConfigUpdate, configResponse) for migrating older configs.
+	// New code should not emit it as a primary mode.
 )
 
 // Encoder selects which H.264 video encoder FFmpeg uses.
@@ -120,9 +129,13 @@ type Config struct {
 	OutputMode OutputMode     `json:"outputMode"`
 	IngestURL  string         `json:"ingestUrl"`
 	StreamName string         `json:"streamName"`
-	HLSDir     string         `json:"hlsDir,omitempty"`
-	Network    Network        `json:"network"`
-	LogLevel   string         `json:"logLevel"`
+	// EnableHLS writes a local HLS playlist alongside the primary
+	// destination. Independent of OutputMode — operators can have both
+	// a YouTube broadcast and a local HLS playlist for monitoring.
+	EnableHLS bool    `json:"enableHls"`
+	HLSDir    string  `json:"hlsDir,omitempty"`
+	Network   Network `json:"network"`
+	LogLevel  string  `json:"logLevel"`
 }
 
 type Network struct {
@@ -159,17 +172,29 @@ func (c Config) Validate() error {
 	if c.Input.Kind != InputTestVideo && strings.TrimSpace(c.Input.VideoDevice) == "" {
 		return errors.New("video device is required")
 	}
-	switch c.OutputMode {
-	case OutputHLS:
-		if strings.TrimSpace(c.HLSDir) == "" {
-			return errors.New("HLS output directory is required")
-		}
-	default: // rtmp
-		if strings.TrimSpace(c.IngestURL) == "" {
-			return errors.New("ingest URL is required")
+	if c.EnableHLS && strings.TrimSpace(c.HLSDir) == "" {
+		return errors.New("HLS output directory is required when EnableHLS is true")
+	}
+	// At least one runnable output must exist.
+	primary := c.primaryRunnable()
+	if !primary && !c.EnableHLS {
+		return errors.New("no output configured — set a destination URL+key or enable HLS")
+	}
+	if primary {
+		switch c.OutputMode {
+		case OutputRTMP, OutputSRT, "":
+		default:
+			return fmt.Errorf("unsupported primary output mode %q", c.OutputMode)
 		}
 	}
 	return nil
+}
+
+// primaryRunnable reports whether the primary destination has enough
+// config to actually run. Used by Args() to decide whether to append
+// the primary output muxer, and by Validate() to permit HLS-only runs.
+func (c Config) primaryRunnable() bool {
+	return strings.TrimSpace(c.IngestURL) != "" && strings.TrimSpace(c.StreamName) != ""
 }
 
 // EffectiveEncoder returns the encoder to use, defaulting to libx264.
@@ -181,12 +206,47 @@ func (c Config) EffectiveEncoder() Encoder {
 }
 
 func (c Config) OutputURL() string {
+	if c.OutputMode == OutputSRT {
+		return c.srtOutputURL()
+	}
+	// RTMP: append stream key as a path segment.
 	base := strings.TrimRight(c.IngestURL, "/")
 	name := strings.TrimLeft(c.StreamName, "/")
 	if name == "" {
 		return base
 	}
 	return base + "/" + name
+}
+
+// srtOutputURL renders an SRT URL with sensible defaults injected via
+// query parameters. The user-supplied URL is authoritative for any
+// param the user already set; we only add what's missing.
+//
+//   - streamid:   StreamName wins if set (replaces any URL value);
+//     otherwise URL value is preserved.
+//   - mode:       defaults to "caller" (we push, receiver listens).
+//   - pkt_size:   1316 bytes (7×188 TS packets — fits one SRT payload).
+//   - latency:    200 ms (libsrt's documented sweet spot for internet).
+func (c Config) srtOutputURL() string {
+	u, err := url.Parse(c.IngestURL)
+	if err != nil {
+		return c.IngestURL
+	}
+	q := u.Query()
+	if sn := strings.TrimSpace(c.StreamName); sn != "" {
+		q.Set("streamid", sn)
+	}
+	if q.Get("mode") == "" {
+		q.Set("mode", "caller")
+	}
+	if q.Get("pkt_size") == "" {
+		q.Set("pkt_size", "1316")
+	}
+	if q.Get("latency") == "" {
+		q.Set("latency", "200")
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func (c Config) Args() ([]string, error) {
@@ -204,7 +264,10 @@ func (c Config) Args() ([]string, error) {
 		"-stats_period", "1",
 	}
 
-	inputs := c.buildInputs()
+	inputs, err := c.buildInputs()
+	if err != nil {
+		return nil, err
+	}
 	args = append(args, inputs.args...)
 	args = append(args, "-map", inputs.videoMap, "-map", inputs.audioMap)
 
@@ -268,9 +331,40 @@ func (c Config) Args() ([]string, error) {
 		"-ac", "2",
 	)
 
-	switch c.OutputMode {
-	case OutputHLS:
+	// Primary destination: appended only if runnable (URL + key set).
+	// Allowing this to be skipped lets the operator do HLS-only runs.
+	if c.primaryRunnable() {
+		switch c.OutputMode {
+		case OutputSRT:
+			args = append(args,
+				"-f", "mpegts",
+				// resend_headers: re-emit PAT/PMT periodically so a
+				// receiver joining mid-stream (or reconnecting after a
+				// blip) can decode without waiting for a full keyframe
+				// interval. initial_discontinuity primes the receiver.
+				"-mpegts_flags", "+resend_headers+initial_discontinuity",
+				"-flush_packets", "1",
+				c.OutputURL(),
+			)
+		default: // OutputRTMP and "" both go here
+			args = append(args, "-f", "flv")
+			if c.Network.TCPKeepalive {
+				args = append(args, "-tcp_keepalive", "1")
+			}
+			if c.Network.RWTimeout > 0 {
+				args = append(args, "-rw_timeout", fmt.Sprintf("%d", c.Network.RWTimeout.Microseconds()))
+			}
+			args = append(args, c.OutputURL())
+		}
+	}
+
+	// Optional HLS local-monitoring output. Re-maps the already-encoded
+	// streams with -c copy so we don't pay a second encode. Independent
+	// of the primary destination — runs alongside RTMP/SRT, or alone.
+	if c.EnableHLS && strings.TrimSpace(c.HLSDir) != "" {
 		args = append(args,
+			"-map", inputs.videoMap, "-map", inputs.audioMap,
+			"-c", "copy",
 			"-f", "hls",
 			"-hls_time", "6",
 			"-hls_list_size", "10",
@@ -278,15 +372,6 @@ func (c Config) Args() ([]string, error) {
 			"-hls_segment_filename", fmt.Sprintf("%s/seg%%d.ts", c.HLSDir),
 			fmt.Sprintf("%s/stream.m3u8", c.HLSDir),
 		)
-	default: // rtmp
-		args = append(args, "-f", "flv")
-		if c.Network.TCPKeepalive {
-			args = append(args, "-tcp_keepalive", "1")
-		}
-		if c.Network.RWTimeout > 0 {
-			args = append(args, "-rw_timeout", fmt.Sprintf("%d", c.Network.RWTimeout.Microseconds()))
-		}
-		args = append(args, c.OutputURL())
 	}
 
 	// Secondary output: low-res H.264 RTP for live browser preview.
@@ -465,7 +550,14 @@ const silentAudio = "anullsrc=channel_layout=stereo:sample_rate=48000"
 // audio (or audio isn't applicable), it adds a silent audio track as a
 // second input. RTMP streams require an audio track; YouTube rejects video-
 // only streams.
-func (c Config) buildInputs() inputBuild {
+//
+// Fail-closed: for AVFoundation, if the persisted VideoDeviceName cannot
+// be located in the current device listing (camera unplugged, renamed,
+// AVFoundation indexes shifted), returns ErrDeviceNotFound rather than
+// silently spawning FFmpeg against whichever device is at the stale
+// persisted index. Picking the wrong source on Sunday morning is a
+// worse failure than refusing to start with a clear error.
+func (c Config) buildInputs() (inputBuild, error) {
 	if c.Input.Kind == InputTestVideo {
 		return inputBuild{
 			args: []string{
@@ -477,7 +569,7 @@ func (c Config) buildInputs() inputBuild {
 			},
 			videoMap: "0:v",
 			audioMap: "1:a",
-		}
+		}, nil
 	}
 
 	backend := defaultString(c.Input.Backend, PlatformBackend())
@@ -487,24 +579,41 @@ func (c Config) buildInputs() inputBuild {
 
 	switch backend {
 	case "avfoundation":
-		device := ResolveAVFoundationDeviceIndex(c.Binary, c.Input.VideoDevice, c.Input.VideoDeviceName, "video")
-		audio := ResolveAVFoundationDeviceIndex(c.Binary, c.Input.AudioDevice, c.Input.AudioDeviceName, "audio")
+		// Video device: require strict name resolution. If the user
+		// picked a device whose name is persisted, that name MUST
+		// match something in the current listing.
+		device := c.Input.VideoDevice
+		if c.Input.VideoDeviceName != "" {
+			resolved, err := ResolveAVFoundationDeviceIndexStrict(c.Binary, c.Input.VideoDeviceName, "video", c.Input.VideoDevice)
+			if err != nil {
+				return inputBuild{}, fmt.Errorf("video source: %w", err)
+			}
+			device = resolved
+		}
+		// Audio device: same strictness when a name is persisted. An
+		// empty audio device is legitimate (silent audio fallback).
+		audio := c.Input.AudioDevice
+		if c.Input.AudioDeviceName != "" {
+			resolved, err := ResolveAVFoundationDeviceIndexStrict(c.Binary, c.Input.AudioDeviceName, "audio", c.Input.AudioDevice)
+			if err != nil {
+				return inputBuild{}, fmt.Errorf("audio source: %w", err)
+			}
+			audio = resolved
+		}
 		fps := ProbeAVFoundationFramerate(c.Binary, device, c.Preset.FPS)
 		if audio != "" {
-			// Both video and audio in one avfoundation input.
 			return inputBuild{
 				args:     []string{"-f", "avfoundation", "-framerate", fps, "-i", device + ":" + audio},
 				videoMap: "0:v", audioMap: "0:a",
-			}
+			}, nil
 		}
-		// Video only; mix in a silent audio track.
 		return inputBuild{
 			args: []string{
 				"-f", "avfoundation", "-framerate", fps, "-i", device + ":none",
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
-		}
+		}, nil
 
 	case "dshow":
 		device := "video=" + c.Input.VideoDevice
@@ -512,7 +621,7 @@ func (c Config) buildInputs() inputBuild {
 			return inputBuild{
 				args:     []string{"-f", "dshow", "-i", device + ":audio=" + c.Input.AudioDevice},
 				videoMap: "0:v", audioMap: "0:a",
-			}
+			}, nil
 		}
 		return inputBuild{
 			args: []string{
@@ -520,10 +629,9 @@ func (c Config) buildInputs() inputBuild {
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
-		}
+		}, nil
 
 	case "v4l2":
-		// v4l2 is video-only. Audio comes from ALSA (separate input) or silent.
 		if c.Input.AudioDevice != "" {
 			return inputBuild{
 				args: []string{
@@ -531,7 +639,7 @@ func (c Config) buildInputs() inputBuild {
 					"-f", "alsa", "-i", c.Input.AudioDevice,
 				},
 				videoMap: "0:v", audioMap: "1:a",
-			}
+			}, nil
 		}
 		return inputBuild{
 			args: []string{
@@ -539,14 +647,13 @@ func (c Config) buildInputs() inputBuild {
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
-		}
+		}, nil
 
 	case "decklink":
-		// SDI carries embedded audio in the same signal.
 		return inputBuild{
 			args:     []string{"-f", "decklink", "-audio_input", "embedded", "-i", c.Input.VideoDevice},
 			videoMap: "0:v", audioMap: "0:a",
-		}
+		}, nil
 
 	default:
 		return inputBuild{
@@ -555,7 +662,7 @@ func (c Config) buildInputs() inputBuild {
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
-		}
+		}, nil
 	}
 }
 
@@ -612,41 +719,91 @@ func chooseAVFoundationFramerate(output string, targetFPS int) (string, bool) {
 	return "", false
 }
 
+// ErrDeviceNotFound is returned when an AVFoundation device cannot be
+// resolved by name. The configured source's index has likely shifted
+// (USB replug, reboot) AND the persisted name no longer matches anything
+// FFmpeg is reporting. Critically, this is returned INSTEAD of silently
+// using the stale index — picking the wrong device on Sunday morning
+// is a worse failure than refusing to start.
+var ErrDeviceNotFound = errors.New("configured AVFoundation device not found")
+
 // ResolveAVFoundationDeviceIndex resolves a device name to its current
-// AVFoundation index. If deviceName is empty or the probe fails, it falls
-// back to fallbackIndex. This handles the AVFoundation problem where
-// device indices shift between system boots or when USB devices are
-// plugged/unplugged — persisting the name gives stable device selection.
+// AVFoundation index. Best-effort variant used for UI/listing where
+// "almost right" is acceptable. For start-time resolution, callers
+// must use ResolveAVFoundationDeviceIndexStrict.
+//
+// If deviceName is empty or the probe fails, it falls back to
+// fallbackIndex. This handles AVFoundation index drift between boots.
 func ResolveAVFoundationDeviceIndex(binary, fallbackIndex, deviceName, kind string) string {
 	if deviceName == "" {
 		return fallbackIndex
 	}
+	idx, err := resolveAVFoundationDeviceIndex(binary, deviceName, kind, fallbackIndex)
+	if err != nil {
+		return fallbackIndex
+	}
+	return idx
+}
+
+// ResolveAVFoundationDeviceIndexStrict is fail-closed: it returns
+// ErrDeviceNotFound when the named device isn't present in FFmpeg's
+// device listing. Callers about to spawn FFmpeg must use this variant
+// so a missing/renamed device aborts the start instead of silently
+// picking whatever sits at the stale persisted index.
+//
+// fallbackIndex is used only as a tie-breaker when multiple devices
+// share the same name (rare but possible: two HDMI capture cards both
+// named "USB Capture HDMI"). The candidate matching fallbackIndex wins;
+// otherwise ambiguity is an error so we don't pick the wrong twin.
+func ResolveAVFoundationDeviceIndexStrict(binary, deviceName, kind, fallbackIndex string) (string, error) {
+	if deviceName == "" {
+		return "", fmt.Errorf("%w: empty device name", ErrDeviceNotFound)
+	}
+	return resolveAVFoundationDeviceIndex(binary, deviceName, kind, fallbackIndex)
+}
+
+func resolveAVFoundationDeviceIndex(binary, deviceName, kind, fallbackIndex string) (string, error) {
 	if binary == "" {
 		binary = "ffmpeg"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	out, _ := exec.CommandContext(ctx, binary, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "").CombinedOutput()
-	if idx, ok := chooseAVFoundationDeviceIndex(string(out), deviceName, kind); ok {
-		return idx
+	matches := matchAVFoundationDevices(string(out), deviceName, kind)
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("%w: %q not in current AVFoundation %s list", ErrDeviceNotFound, deviceName, kind)
+	case 1:
+		return matches[0], nil
+	default:
+		// Multiple devices share this name. Prefer the one whose index
+		// matches the saved fallbackIndex — that's the operator's most
+		// recent successful pick. If no match, fail rather than guess.
+		for _, m := range matches {
+			if m == fallbackIndex {
+				return m, nil
+			}
+		}
+		return "", fmt.Errorf("%w: %q is ambiguous (%d devices share this name, none at saved index %q)",
+			ErrDeviceNotFound, deviceName, len(matches), fallbackIndex)
 	}
-	return fallbackIndex
 }
 
-// chooseAVFoundationDeviceIndex scans FFmpeg's AVFoundation device list output
-// for a device matching the given name in the correct section (video or audio).
-// Returns the device index and true if found.
-func chooseAVFoundationDeviceIndex(output, deviceName, kind string) (string, bool) {
+// matchAVFoundationDevices returns every index whose device name matches
+// (case-insensitive, trimmed) in the requested kind's section. Returning
+// a slice — not the first hit — lets the strict resolver detect
+// duplicates and avoid the "wrong twin" bug.
+func matchAVFoundationDevices(output, deviceName, kind string) []string {
 	if deviceName == "" {
-		return "", false
+		return nil
 	}
 	targetName := strings.TrimSpace(strings.ToLower(deviceName))
 	inCorrectSection := false
 	wantAudio := kind == "audio"
+	var out []string
 
 	for _, line := range strings.Split(output, "\n") {
 		lower := strings.ToLower(line)
-		// Detect section headers in FFmpeg's device listing.
 		if strings.Contains(lower, "avfoundation video devices") {
 			inCorrectSection = !wantAudio
 			continue
@@ -661,9 +818,19 @@ func chooseAVFoundationDeviceIndex(output, deviceName, kind string) (string, boo
 		if m := avfoundationDeviceRE.FindStringSubmatch(line); len(m) == 3 {
 			name := strings.TrimSpace(strings.ToLower(m[2]))
 			if name == targetName {
-				return m[1], true
+				out = append(out, m[1])
 			}
 		}
 	}
-	return "", false
+	return out
+}
+
+// chooseAVFoundationDeviceIndex is the legacy best-effort wrapper kept
+// for callers that don't need strict semantics (currently only tests).
+func chooseAVFoundationDeviceIndex(output, deviceName, kind string) (string, bool) {
+	matches := matchAVFoundationDevices(output, deviceName, kind)
+	if len(matches) == 0 {
+		return "", false
+	}
+	return matches[0], true
 }

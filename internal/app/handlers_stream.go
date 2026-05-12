@@ -77,6 +77,7 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		OutputMode   *ffmpeg.OutputMode `json:"outputMode"`
 		IngestURL    *string            `json:"ingestUrl"`
 		StreamName   *string            `json:"streamName"`
+		EnableHLS    *bool              `json:"enableHls"`
 		Input        *ffmpeg.Input      `json:"input"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
@@ -98,7 +99,16 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		s.config.Preset = preset
 	}
 	if patch.OutputMode != nil {
-		s.config.OutputMode = *patch.OutputMode
+		// Migrate legacy "hls" payloads from older UIs to the new shape.
+		if *patch.OutputMode == "hls" {
+			s.config.OutputMode = ffmpeg.OutputRTMP
+			s.config.EnableHLS = true
+		} else {
+			s.config.OutputMode = *patch.OutputMode
+		}
+	}
+	if patch.EnableHLS != nil {
+		s.config.EnableHLS = *patch.EnableHLS
 	}
 	if patch.IngestURL != nil {
 		s.config.IngestURL = strings.TrimSpace(*patch.IngestURL)
@@ -107,7 +117,24 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		s.config.StreamName = strings.TrimSpace(*patch.StreamName)
 	}
 	if patch.Input != nil {
-		s.config.Input = *patch.Input
+		// Reject saves that drop the device name for backends where
+		// indexes shift between boots. The persisted name is what makes
+		// "go live on the right source" robust; saving without it is
+		// the silent failure mode that caused Sunday's wrong-source bug.
+		in := *patch.Input
+		needsName := in.Kind != ffmpeg.InputTestVideo && in.Kind != ""
+		platformBackend := in.Backend
+		if platformBackend == "" {
+			platformBackend = ffmpeg.PlatformBackend()
+		}
+		stableNeeded := platformBackend == "avfoundation" || platformBackend == "dshow"
+		if needsName && stableNeeded && in.VideoDevice != "" && in.VideoDeviceName == "" {
+			s.mu.Unlock()
+			writeError(w, http.StatusBadRequest,
+				"video device name is required (capture device unplugged when this save was made? refresh devices and try again)")
+			return
+		}
+		s.config.Input = in
 	}
 	if patch.Encoder != nil {
 		s.config.Encoder = *patch.Encoder
@@ -136,7 +163,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	// Clean old HLS segments before starting a new stream.
-	if config.OutputMode == ffmpeg.OutputHLS && s.hlsServer != nil {
+	if config.EnableHLS && s.hlsServer != nil {
 		_ = s.hlsServer.Clean()
 	}
 
@@ -264,7 +291,10 @@ func (s *Server) handleEncoders(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) configResponse(config ffmpeg.Config) map[string]any {
 	outputMode := string(config.OutputMode)
-	if outputMode == "" {
+	if outputMode == "" || outputMode == "hls" {
+		// Normalise away the legacy "hls" value so clients only ever
+		// see the new shape (outputMode is the primary; enableHls is a
+		// separate boolean).
 		outputMode = "rtmp"
 	}
 	result := map[string]any{
@@ -275,6 +305,7 @@ func (s *Server) configResponse(config ffmpeg.Config) map[string]any {
 		"outputMode":   outputMode,
 		"ingestUrl":    config.IngestURL,
 		"hasStreamKey": config.StreamName != "",
+		"enableHls":    config.EnableHLS,
 		"network":      config.Network,
 	}
 	if s.hlsServer != nil {

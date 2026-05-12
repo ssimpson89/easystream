@@ -29,6 +29,7 @@ type persistedConfig struct {
 	OutputMode ffmpeg.OutputMode `json:"outputMode"`
 	IngestURL  string            `json:"ingestUrl"`
 	StreamName string            `json:"streamName"`
+	EnableHLS  bool              `json:"enableHls"`
 	Input      ffmpeg.Input      `json:"input"`
 }
 
@@ -49,6 +50,7 @@ func savePersistedConfig(path string, cfg ffmpeg.Config) error {
 		OutputMode: cfg.OutputMode,
 		IngestURL:  cfg.IngestURL,
 		StreamName: cfg.StreamName,
+		EnableHLS:  cfg.EnableHLS,
 		Input:      cfg.Input,
 	}
 	data, err := json.MarshalIndent(p, "", "  ")

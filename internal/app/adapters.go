@@ -76,6 +76,23 @@ func (a *streamControllerAdapter) IsStreaming() bool {
 	return status.State == ffmpeg.StateRunning || status.State == ffmpeg.StateDegraded || status.State == ffmpeg.StateStarting
 }
 
+// Preflight validates the FFmpeg config — most importantly the strict
+// AVFoundation device-by-name resolution — without spawning FFmpeg.
+// Surfaces "wrong / missing source" before the scheduler creates any
+// YouTube broadcast.
+func (a *streamControllerAdapter) Preflight() error {
+	a.server.mu.Lock()
+	cfg := a.server.config
+	a.server.mu.Unlock()
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if _, err := cfg.Args(); err != nil {
+		return err
+	}
+	return nil
+}
+
 // broadcastControllerAdapter implements schedule.BroadcastController on
 // top of the Server's YouTube client + Auth + transition state. The
 // scheduler delegates all YouTube lifecycle work here so it never has to

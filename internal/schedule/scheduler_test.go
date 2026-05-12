@@ -2,6 +2,7 @@ package schedule
 
 import (
 	"context"
+	"errors"
 	"log"
 	"strings"
 	"sync"
@@ -10,14 +11,16 @@ import (
 )
 
 type fakeStreamController struct {
-	mu          sync.Mutex
-	started     bool
-	presetID    string
-	ingestURL   string
-	streamKey   string
-	broadcastID string
-	streamID    string
-	startCalls  int
+	mu             sync.Mutex
+	started        bool
+	presetID       string
+	ingestURL      string
+	streamKey      string
+	broadcastID    string
+	streamID       string
+	startCalls     int
+	preflightErr   error
+	preflightCalls int
 }
 
 func (f *fakeStreamController) StartWithIngest(presetID, ingestURL, streamKey, broadcastID, streamID string) error {
@@ -43,6 +46,13 @@ func (f *fakeStreamController) IsStreaming() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.started
+}
+
+func (f *fakeStreamController) Preflight() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.preflightCalls++
+	return f.preflightErr
 }
 
 type fakeBroadcastController struct {
@@ -394,6 +404,50 @@ func TestSchedulerBacksOffOnPrepFailure(t *testing.T) {
 	}
 	if attempts < 1 {
 		t.Fatalf("expected at least one attempt, got %d", attempts)
+	}
+}
+
+func TestSchedulerRefusesToGoLiveWhenPreflightFails(t *testing.T) {
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.CreateOverride(Override{
+		Name:        "Wrong source",
+		StartTime:   time.Now().UTC().Add(-1 * time.Minute),
+		DurationMin: 30,
+		PresetID:    "recommended",
+		Title:       "Wrong source",
+		Privacy:     "unlisted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stream := &fakeStreamController{
+		preflightErr: errors.New("video source: configured AVFoundation device not found"),
+	}
+	yt := &fakeBroadcastController{}
+	s := newTestScheduler(t, store, stream, yt)
+	s.tick(context.Background())
+
+	// FFmpeg must NOT have been started, because the configured source
+	// is missing. The whole point of the preflight fix.
+	if stream.IsStreaming() {
+		t.Fatal("expected stream NOT to start when preflight fails")
+	}
+	if stream.startCalls != 0 {
+		t.Fatalf("expected 0 StartWithIngest calls, got %d", stream.startCalls)
+	}
+	stream.mu.Lock()
+	pc := stream.preflightCalls
+	stream.mu.Unlock()
+	if pc == 0 {
+		t.Fatal("expected scheduler to call Preflight before going live")
+	}
+	// Status should surface the error so the operator sees what's wrong.
+	if got := s.Status().LastError; got == "" {
+		t.Fatal("expected scheduler status to report the preflight error")
 	}
 }
 

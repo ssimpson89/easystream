@@ -148,6 +148,127 @@ func TestChooseAVFoundationDeviceIndex(t *testing.T) {
 	}
 }
 
+func TestArgsSRTOutput(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.OutputMode = OutputSRT
+	cfg.IngestURL = "srt://example.com:9999"
+	cfg.StreamName = "abc"
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, expected := range []string{
+		"-f mpegts",
+		"+resend_headers+initial_discontinuity",
+		"-flush_packets 1",
+		"streamid=abc",
+		"mode=caller",
+		"latency=200",
+		"pkt_size=1316",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Errorf("expected %q in args: %s", expected, joined)
+		}
+	}
+	if strings.Contains(joined, "-f flv") {
+		t.Errorf("did not expect RTMP flags in SRT output: %s", joined)
+	}
+}
+
+func TestArgsSRTPreservesUserQueryParams(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.OutputMode = OutputSRT
+	cfg.IngestURL = "srt://example.com:9999?latency=500&passphrase=secret"
+	cfg.StreamName = "abc"
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "latency=500") {
+		t.Errorf("user-set latency=500 was overridden: %s", joined)
+	}
+	if !strings.Contains(joined, "passphrase=secret") {
+		t.Errorf("user-set passphrase=secret was dropped: %s", joined)
+	}
+}
+
+func TestArgsHLSToggleAlongsideRTMP(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.IngestURL = "rtmp://x"
+	cfg.StreamName = "abc"
+	cfg.EnableHLS = true
+	cfg.HLSDir = "/tmp/hls"
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-f flv") {
+		t.Errorf("expected primary RTMP output: %s", joined)
+	}
+	if !strings.Contains(joined, "-f hls") {
+		t.Errorf("expected secondary HLS output: %s", joined)
+	}
+	if !strings.Contains(joined, "-c copy") {
+		t.Errorf("expected HLS to use -c copy (no re-encode): %s", joined)
+	}
+}
+
+func TestArgsHLSOnly(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.IngestURL = ""
+	cfg.StreamName = ""
+	cfg.EnableHLS = true
+	cfg.HLSDir = "/tmp/hls"
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "-f flv") {
+		t.Errorf("did not expect RTMP output for HLS-only: %s", joined)
+	}
+	if !strings.Contains(joined, "-f hls") {
+		t.Errorf("expected HLS output: %s", joined)
+	}
+}
+
+func TestValidateRequiresAnyOutput(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.IngestURL = ""
+	cfg.StreamName = ""
+	cfg.EnableHLS = false
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validate to fail when no output is configured")
+	}
+}
+
+func TestMatchAVFoundationDevicesDetectsDuplicateNames(t *testing.T) {
+	// Two HDMI capture cards both reporting the same name — a real-world
+	// AVFoundation case that the old chooseAVFoundationDeviceIndex would
+	// silently resolve to the first match, picking the wrong twin.
+	output := `[AVFoundation indev] AVFoundation video devices:
+[AVFoundation indev] [0] FaceTime HD Camera
+[AVFoundation indev] [1] USB Capture HDMI
+[AVFoundation indev] [2] USB Capture HDMI
+[AVFoundation indev] AVFoundation audio devices:
+[AVFoundation indev] [0] MacBook Air Microphone`
+
+	matches := matchAVFoundationDevices(output, "USB Capture HDMI", "video")
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 matches, got %d (%v)", len(matches), matches)
+	}
+	if matches[0] != "1" || matches[1] != "2" {
+		t.Fatalf("expected indexes 1,2, got %v", matches)
+	}
+}
+
 func TestEncoderArgsVideoToolbox(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Encoder = EncoderVideoToolbox

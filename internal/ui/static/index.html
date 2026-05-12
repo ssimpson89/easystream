@@ -244,6 +244,7 @@
           <button class="nav-btn" :class="{ active: settingsTab === 'youtube' }"     @click="settingsTab='youtube'">YouTube</button>
           <button class="nav-btn" :class="{ active: settingsTab === 'schedule' }"    @click="settingsTab='schedule'" x-show="youtube.authenticated">Schedule</button>
           <button class="nav-btn" :class="{ active: settingsTab === 'destination' }" @click="settingsTab='destination'">Custom destination</button>
+          <button class="nav-btn" :class="{ active: settingsTab === 'monitoring' }"  @click="settingsTab='monitoring'">Local monitoring</button>
         </nav>
 
         <!-- Section content -->
@@ -468,10 +469,10 @@
             <p class="hint">For Twitch, Cloudflare, Facebook, or any other streaming service. YouTube users can ignore this — connect your account on the YouTube tab.</p>
 
             <label>
-              Where should the stream go?
+              Protocol
               <select x-model="outputMode" @change="saveConfig()">
-                <option value="rtmp">Send to another streaming service (RTMP/RTMPS)</option>
-                <option value="hls">Create a local playlist URL (HLS / m3u8)</option>
+                <option value="rtmp">RTMP / RTMPS</option>
+                <option value="srt">SRT (low-latency, packet-loss resilient)</option>
               </select>
             </label>
 
@@ -493,16 +494,43 @@
               </label>
             </div>
 
-            <div x-show="outputMode === 'hls'">
-              <p class="hint">EasyStream writes HLS segments and serves them over HTTP.</p>
-              <div class="hls-url-box">
-                <label>Playlist URL</label>
-                <div class="hls-url-row">
-                  <code x-text="hlsUrl"></code>
-                  <button class="button button-sm" @click="copyHLSUrl()">Copy</button>
-                </div>
-                <p class="hint">Make sure your machine is reachable from the internet (port forwarding, Cloudflare Tunnel, etc.).</p>
+            <div x-show="outputMode === 'srt'">
+              <div class="quick-fill">
+                <span class="quick-fill-label">Quick fill:</span>
+                <button class="button button-sm" @click="quickFill('srt-cloudflare')">Cloudflare Stream</button>
               </div>
+              <label>SRT URL
+                <input x-model="ingestUrl" @input="onIngestChange()" @blur="onIngestBlur()"
+                       autocomplete="off" spellcheck="false"
+                       placeholder="srt://ingest.example.com:9999?latency=200">
+              </label>
+              <label>Stream ID (optional)
+                <input type="password" x-model="streamKey"
+                       @input="onStreamKeyChange()" @blur="onStreamKeyBlur()"
+                       autocomplete="off" spellcheck="false"
+                       :placeholder="hasStreamKey ? 'Stream ID is set (enter a new one to replace)' : 'If your URL already contains streamid=, leave this blank'">
+              </label>
+              <p class="hint">EasyStream pushes MPEG-TS over SRT. <code>mode=caller</code>, <code>latency=200</code> and <code>pkt_size=1316</code> are injected if missing. For encryption, append <code>&amp;passphrase=...</code> to the URL.</p>
+            </div>
+          </section>
+
+          <!-- ----- Local monitoring (HLS) — independent of the primary destination ----- -->
+          <section class="panel" x-show="settingsTab === 'monitoring'">
+            <h2>Local monitoring</h2>
+            <p class="hint">A local HLS playlist that runs alongside your primary destination. Useful for monitoring the stream from another device on your network without involving YouTube. Independent of the primary destination — leave it on and forget it.</p>
+
+            <label class="adaptive-toggle">
+              <input type="checkbox" :checked="enableHls" @change="setEnableHLS($event.target.checked)">
+              <span>Always run a local HLS playlist</span>
+            </label>
+
+            <div class="hls-url-box" x-show="enableHls">
+              <label>Playlist URL</label>
+              <div class="hls-url-row">
+                <code x-text="hlsUrl"></code>
+                <button class="button button-sm" @click="copyHLSUrl()">Copy</button>
+              </div>
+              <p class="hint">Open this URL in VLC, Safari, or any HLS-capable player on your network. EasyStream writes segments to disk and serves them over HTTP from this same daemon.</p>
             </div>
           </section>
         </div>

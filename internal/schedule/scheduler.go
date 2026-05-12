@@ -37,6 +37,12 @@ type StreamController interface {
 	StartWithIngest(presetID, ingestURL, streamKey, broadcastID, streamID string) error
 	StopStream()
 	IsStreaming() bool
+	// Preflight verifies the configured capture source is present and
+	// the config is valid for FFmpeg, without spawning anything. The
+	// scheduler runs this just before goLive so a missing source aborts
+	// the scheduled event with a clear error instead of going live on
+	// whatever device happens to be at the stale persisted index.
+	Preflight() error
 }
 
 // BroadcastController is the YouTube-side lifecycle the scheduler drives.
@@ -276,8 +282,15 @@ func (s *Scheduler) advanceEvent(ctx context.Context, event Event, now time.Time
 
 	// Phase 1: prepare. Create the broadcast + stream once the prep
 	// window opens and persist the IDs so a restart finds them.
+	// Pre-flight the capture source first so we don't create an orphan
+	// YouTube broadcast for an event whose camera isn't connected.
 	if !now.Before(prepAt) && event.BroadcastID == "" {
 		if !s.canTryPrep(event) {
+			return
+		}
+		if err := s.stream.Preflight(); err != nil {
+			s.setError(fmt.Sprintf("preflight failed for %q: %v", event.Name, err))
+			s.recordPrepFailure(eventKey(event))
 			return
 		}
 		if prepared, ok := s.prepareBroadcast(ctx, event); ok {
@@ -405,6 +418,19 @@ func (s *Scheduler) clearIngest(eventKey string) {
 }
 
 func (s *Scheduler) goLive(parent context.Context, event Event) {
+	// Preflight the capture source BEFORE creating any YouTube resources
+	// or starting FFmpeg. If the configured camera is unplugged or its
+	// AVFoundation name no longer matches, refuse to go live rather
+	// than streaming from whatever device sits at the stale index.
+	if err := s.stream.Preflight(); err != nil {
+		s.setError(fmt.Sprintf("preflight failed for %q: %v", event.Name, err))
+		s.logger.Printf("scheduler: REFUSING to go live for %q — %v", event.Name, err)
+		// Back off this event for 30 s so we don't loop on every tick
+		// while the operator fixes the source.
+		s.recordPrepFailure(eventKey(event))
+		return
+	}
+
 	key := eventKey(event)
 	ingestURL, streamKey, ok := s.lookupIngest(key)
 	if !ok {

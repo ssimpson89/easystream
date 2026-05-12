@@ -70,6 +70,7 @@ document.addEventListener("alpine:init", () => {
     ingestUrl:        "",
     streamKey:        "",
     hasStreamKey:     false,
+    enableHls:        false,
     hlsUrl:           "http://127.0.0.1:8080/hls/stream.m3u8",
 
     // Dirty flags — set when the user is actively editing a field.
@@ -261,7 +262,12 @@ document.addEventListener("alpine:init", () => {
       this.selectedPreset  = config.preset?.id || this.selectedPreset;
       this.selectedEncoder = config.encoder || "libx264";
       this.hasStreamKey    = !!config.hasStreamKey;
-      this.outputMode      = config.outputMode || "rtmp";
+      // Migrate legacy outputMode=hls (older daemons or saved configs)
+      // to the new shape: primary=rtmp + enableHls=true.
+      let mode = config.outputMode || "rtmp";
+      if (mode === "hls") { mode = "rtmp"; this.enableHls = true; }
+      this.outputMode      = mode;
+      this.enableHls       = !!config.enableHls || this.enableHls;
       if (config.hlsUrl) this.hlsUrl = config.hlsUrl;
       // Free-text fields: respect dirty flag so an SSE push doesn't
       // overwrite what the user is actively typing or selecting.
@@ -427,16 +433,44 @@ document.addEventListener("alpine:init", () => {
     // failure (e.g. color-blind operator on a sanctuary projector) never
     // hides the signal.
     get preflightRows() {
-      const conf = (this.confidence || []).reduce((a, c) => (a[c.label] = c, a), {});
-      const status = (s) => ({ green: "green", yellow: "yellow", red: "red" }[s] || "unknown");
-      // Video source
-      const v = this.videoOK
-        ? { icon: "video", label: "Video", status: "green", detail: this.deviceLabel(this.videoSourceValue) }
-        : { icon: "video", label: "Video", status: "red",   detail: "No video source picked" };
+      // Video source: verify the saved device name is actually present
+      // in the live device list. If not, surface RED so the operator
+      // sees the problem BEFORE the scheduled go-live silently fails
+      // its preflight server-side. This is layer 1 of the
+      // sticky-source defense.
+      let v;
+      if (!this.videoOK) {
+        v = { icon: "video", label: "Video", status: "red", detail: "No video source picked" };
+      } else if (this.videoSourceValue === "test-video::") {
+        v = { icon: "video", label: "Video", status: "green", detail: "Test pattern" };
+      } else {
+        const presence = this.devicePresence("video");
+        if (presence.connected) {
+          v = { icon: "video", label: "Video", status: "green", detail: presence.label };
+        } else if (presence.label) {
+          v = { icon: "video", label: "Video", status: "red",
+                detail: `${presence.label} not detected — plug it in or pick a different source` };
+        } else {
+          v = { icon: "video", label: "Video", status: "yellow", detail: "Saved source not in current device list" };
+        }
+      }
       // Audio source
-      const aSource = (this.audioSourceValue || this.isSDISource)
-        ? { icon: "mic", label: "Audio", status: "green", detail: this.isSDISource ? "Embedded SDI audio" : "Mic configured" }
-        : { icon: "mic", label: "Audio", status: "yellow", detail: "No audio source — silence will be sent" };
+      let aSource;
+      if (this.isSDISource) {
+        aSource = { icon: "mic", label: "Audio", status: "green", detail: "Embedded SDI audio" };
+      } else if (!this.audioSourceValue) {
+        aSource = { icon: "mic", label: "Audio", status: "yellow", detail: "No audio source — silence will be sent" };
+      } else {
+        const presence = this.devicePresence("audio");
+        if (presence.connected) {
+          aSource = { icon: "mic", label: "Audio", status: "green", detail: presence.label };
+        } else if (presence.label) {
+          aSource = { icon: "mic", label: "Audio", status: "red",
+                      detail: `${presence.label} not detected` };
+        } else {
+          aSource = { icon: "mic", label: "Audio", status: "yellow", detail: "Saved audio source not in current device list" };
+        }
+      }
       // YouTube
       const yt = !this.youtube.configured
         ? { icon: "yt", label: "YouTube", status: "off", detail: "Not configured" }
@@ -445,6 +479,32 @@ document.addEventListener("alpine:init", () => {
           : { icon: "yt", label: "YouTube", status: "yellow", detail: "Not signed in" };
       return [v, aSource, yt];
     },
+
+    // devicePresence checks whether the saved video/audio device is
+    // currently visible in /api/devices. Returns the persisted name as
+    // the label so the operator sees what they picked, and a boolean
+    // for green/red status. Names are matched against the server's
+    // device scan so unplugged hardware shows red.
+    devicePresence(kind) {
+      const cfg = this.config?.input;
+      if (!cfg) return { connected: false, label: "" };
+      const wantName = kind === "video" ? cfg.videoDeviceName : cfg.audioDeviceName;
+      const idx      = kind === "video" ? cfg.videoDevice     : cfg.audioDevice;
+      const backend  = cfg.backend;
+      const list = (this.devices[kind] || []);
+      // Name-based match (the source of truth).
+      if (wantName) {
+        const byName = list.find((d) => d.name === wantName && (!backend || d.backend === backend));
+        if (byName) return { connected: true, label: wantName };
+      }
+      // Fall back to index match for legacy configs without a name.
+      if (idx && !wantName) {
+        const byIndex = list.find((d) => String(d.index) === String(idx) && (!backend || d.backend === backend));
+        if (byIndex) return { connected: true, label: byIndex.name };
+      }
+      return { connected: false, label: wantName || "" };
+    },
+
     deviceLabel(value) {
       if (!value || value === "test-video::") return "Test pattern";
       const parts = value.split(":");
@@ -580,6 +640,11 @@ document.addEventListener("alpine:init", () => {
       } catch (e) { this.showToast(e.message); }
     },
 
+    setEnableHLS(enabled) {
+      this.enableHls = enabled;
+      this.saveConfig().then(() => this.showToast(enabled ? "HLS monitoring on" : "HLS monitoring off"));
+    },
+
     // ============================================================
     // CONFIG SAVE
     // ============================================================
@@ -601,6 +666,7 @@ document.addEventListener("alpine:init", () => {
         encoder: this.selectedEncoder,
         ingestUrl: (this.ingestUrl || "").trim(),
         outputMode: this.outputMode,
+        enableHls: this.enableHls,
         input: {
           kind: decoded.kind,
           backend: decoded.backend,
@@ -796,17 +862,27 @@ document.addEventListener("alpine:init", () => {
     // QUICK FILL + UTIL
     // ============================================================
     quickFill(platform) {
-      const URLS = {
-        youtube: "rtmps://a.rtmps.youtube.com/live2",
+      // RTMP presets switch outputMode to rtmp; SRT presets switch to srt.
+      const RTMP = {
+        youtube:    "rtmps://a.rtmps.youtube.com/live2",
         cloudflare: "rtmps://live.cloudflare.com:443/live/",
-        twitch: "rtmp://live.twitch.tv/app",
+        twitch:     "rtmp://live.twitch.tv/app",
       };
-      const url = URLS[platform];
-      if (!url) return;
-      this.ingestUrl = url;
+      const SRT = {
+        "srt-cloudflare": "srt://live.cloudflare.com:778",
+      };
+      if (RTMP[platform]) {
+        this.outputMode = "rtmp";
+        this.ingestUrl = RTMP[platform];
+      } else if (SRT[platform]) {
+        this.outputMode = "srt";
+        this.ingestUrl = SRT[platform];
+      } else {
+        return;
+      }
       this._dirtyIngest = true;
       this.saveConfig();
-      this.showToast(`${platform} URL filled — paste your stream key.`);
+      this.showToast(`URL filled — paste your stream key/ID.`);
     },
     copyHLSUrl() {
       window.EasyStreamClipboard(this.hlsUrl).then((ok) => {

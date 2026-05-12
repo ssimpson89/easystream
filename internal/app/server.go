@@ -138,8 +138,19 @@ func NewServer(cfg ServerConfig) *Server {
 					defaultCfg.Preset = preset
 				}
 			}
-			if persisted.OutputMode != "" {
+			// Migrate legacy OutputMode="hls" (when HLS was the sole
+			// primary destination) to the new shape: primary RTMP +
+			// independent HLS toggle. After this load+save round-trip
+			// the file on disk has the new shape.
+			if persisted.OutputMode == "hls" {
+				defaultCfg.OutputMode = ffmpeg.OutputRTMP
+				defaultCfg.EnableHLS = true
+				cfg.Logger.Printf("config: migrated legacy outputMode=hls to enableHls=true + outputMode=rtmp")
+			} else if persisted.OutputMode != "" {
 				defaultCfg.OutputMode = persisted.OutputMode
+				defaultCfg.EnableHLS = persisted.EnableHLS
+			} else {
+				defaultCfg.EnableHLS = persisted.EnableHLS
 			}
 			if persisted.IngestURL != "" {
 				defaultCfg.IngestURL = persisted.IngestURL
@@ -431,7 +442,7 @@ func (s *Server) resumeIfNeeded() {
 
 	// Start fresh. The platform may see a brief reconnect, but EasyStream keeps
 	// full observability and recovery control over the new FFmpeg process.
-	if config.OutputMode == ffmpeg.OutputHLS && s.hlsServer != nil {
+	if config.EnableHLS && s.hlsServer != nil {
 		_ = s.hlsServer.Clean()
 	}
 	if s.preview != nil && config.Input.Kind != ffmpeg.InputTestVideo {
