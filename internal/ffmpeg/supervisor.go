@@ -71,6 +71,14 @@ type Supervisor struct {
 	// to be restarted by the supervisor. Used by the adaptive controller
 	// to detect restart storms.
 	onRestart func()
+
+	// onStateChange is called after every transition of status.State
+	// (Starting → Running → Degraded → Restarting → Idle/Failed).
+	// Used by app.Server to publish an SSE state event so open browser
+	// tabs reflect the transition immediately. Without this hook, the
+	// UI would stick on the initial Starting/Waiting snapshot until
+	// some unrelated event triggers a publish.
+	onStateChange func()
 }
 
 var errRestartRequested = errors.New("supervisor restart requested")
@@ -86,6 +94,31 @@ func (s *Supervisor) SetOnRestart(fn func()) {
 	s.mu.Lock()
 	s.onRestart = fn
 	s.mu.Unlock()
+}
+
+// SetOnStateChange installs a callback invoked whenever status.State
+// transitions. Same lock contract as SetOnRestart: invoked without
+// the supervisor lock held, may re-enter Status().
+//
+// The supervisor calls this on every state-mutating method. Callers
+// don't need to deduplicate — the SSE hub coalesces rapid publishes
+// into one wire frame.
+func (s *Supervisor) SetOnStateChange(fn func()) {
+	s.mu.Lock()
+	s.onStateChange = fn
+	s.mu.Unlock()
+}
+
+// emitStateChange is called after every state mutation. Reads the
+// callback under the lock, then invokes it outside the lock to honor
+// the contract documented on SetOnStateChange.
+func (s *Supervisor) emitStateChange() {
+	s.mu.Lock()
+	fn := s.onStateChange
+	s.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // CurrentConfig returns a copy of the currently configured FFmpeg config.
@@ -142,8 +175,8 @@ func (s *Supervisor) Start(config Config) error {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.cancel != nil {
+		s.mu.Unlock()
 		return errors.New("stream is already running")
 	}
 
@@ -158,7 +191,12 @@ func (s *Supervisor) Start(config Config) error {
 		UpdatedAt:      time.Now().UTC(),
 		ActivePresetID: config.Preset.ID,
 	}
+	s.mu.Unlock()
 
+	// Publish the Starting state so the UI flips to "Connecting..."
+	// immediately instead of staying on whatever state was visible
+	// before (Idle/Failed).
+	s.emitStateChange()
 	go s.run(ctx)
 	return nil
 }
@@ -167,8 +205,8 @@ func (s *Supervisor) Start(config Config) error {
 // the stream intent active. It returns false when there is no active stream.
 func (s *Supervisor) Restart(reason string) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.cancel == nil || s.restart == nil {
+		s.mu.Unlock()
 		return false
 	}
 	if reason == "" {
@@ -181,6 +219,8 @@ func (s *Supervisor) Restart(reason string) bool {
 	case s.restart <- reason:
 	default:
 	}
+	s.mu.Unlock()
+	s.emitStateChange()
 	return true
 }
 
@@ -188,12 +228,17 @@ func (s *Supervisor) Stop() {
 	s.mu.Lock()
 	cancel := s.cancel
 	done := s.done
+	changed := false
 	if cancel != nil {
 		s.status.State = StateStopping
 		s.status.UpdatedAt = time.Now().UTC()
+		changed = true
 	}
 	s.mu.Unlock()
 
+	if changed {
+		s.emitStateChange()
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -240,10 +285,11 @@ func (s *Supervisor) progressStalledSince(started time.Time) (bool, string) {
 
 func (s *Supervisor) markDegraded(reason string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.status.State = StateDegraded
 	s.status.LastError = reason
 	s.status.UpdatedAt = time.Now().UTC()
+	s.mu.Unlock()
+	s.emitStateChange()
 }
 
 func (s *Supervisor) run(ctx context.Context) {
@@ -254,11 +300,16 @@ func (s *Supervisor) run(ctx context.Context) {
 		s.cancel = nil
 		s.done = nil
 		s.restart = nil
+		changed := false
 		if s.status.State == StateStopping {
 			s.status.State = StateIdle
 			s.status.UpdatedAt = time.Now().UTC()
+			changed = true
 		}
 		s.mu.Unlock()
+		if changed {
+			s.emitStateChange()
+		}
 		if done != nil {
 			close(done)
 		}
@@ -378,6 +429,10 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 		outputMode = OutputRTMP
 	}
 	s.mu.Unlock()
+	// Tell the UI we've actually reached Running. Without this, the
+	// dashboard stays stuck on the initial Starting/Waiting snapshot
+	// from handleStart until something else triggers a publish.
+	s.emitStateChange()
 	s.logger.Printf("stream-start: preset=%s output=%s pid=%d", preset, outputMode, cmd.Process.Pid)
 
 	var wg sync.WaitGroup
@@ -455,12 +510,16 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 
 func (s *Supervisor) recordProgress(progress Progress) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.status.LastProgress = progress
 	s.status.UpdatedAt = time.Now().UTC()
-	if s.status.State == StateDegraded {
+	recovered := s.status.State == StateDegraded
+	if recovered {
 		s.status.State = StateRunning
 		s.status.LastError = ""
+	}
+	s.mu.Unlock()
+	if recovered {
+		s.emitStateChange()
 	}
 }
 
@@ -595,7 +654,6 @@ func classifyFFmpegError(line string) string {
 
 func (s *Supervisor) setRestarting(lastExit string, delay time.Duration) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.status.State = StateRestarting
 	s.status.LastExit = lastExit
 	// Preserve the classified reason from recordLogs (e.g. "Destination
@@ -607,15 +665,18 @@ func (s *Supervisor) setRestarting(lastExit string, delay time.Duration) {
 		s.status.LastError = fmt.Sprintf("restarting FFmpeg in %s", delay.Round(time.Second))
 	}
 	s.status.UpdatedAt = time.Now().UTC()
+	s.mu.Unlock()
+	s.emitStateChange()
 }
 
 func (s *Supervisor) setExit(state State, lastExit, lastError string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.status.State = state
 	s.status.LastExit = lastExit
 	s.status.LastError = lastError
 	s.status.UpdatedAt = time.Now().UTC()
+	s.mu.Unlock()
+	s.emitStateChange()
 }
 
 func exitMessage(err error) string {

@@ -279,6 +279,13 @@ func NewServer(cfg ServerConfig) *Server {
 		adaptive.OnRestart()
 		server.publishState()
 	})
+	// Every supervisor state transition (Starting → Running → Degraded
+	// → Restarting → Idle/Failed) fans out to SSE subscribers. Without
+	// this the dashboard sticks on the initial Starting/"Waiting for
+	// level..." snapshot from handleStart until something unrelated
+	// (health poll change, schedule tick, user save) triggers a publish.
+	// The hub coalesces rapid transitions into a single wire frame.
+	supervisor.SetOnStateChange(server.publishState)
 	adaptive.Start()
 
 	// Initialize preview with the default config so it knows the input source.
