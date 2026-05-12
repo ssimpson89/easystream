@@ -140,27 +140,43 @@ func (s *Scanner) scanAll() DeviceList {
 }
 
 // classifyVideoDevice categorizes a video device based on backend and name.
+//
+// Anything that registers as a v4l2 or AVFoundation device works for
+// capture regardless of how we group it in the UI — this classification
+// only affects which dropdown group the device shows up in. The keyword
+// list below covers the SDI/HDMI capture cards we expect to encounter
+// (UVC-class devices that show up as a normal capture endpoint, not
+// the BlackMagic DeckLink dedicated backend).
 func classifyVideoDevice(d Device) DeviceType {
 	if d.Backend == "decklink" {
 		return TypeSDI
 	}
 	name := strings.ToLower(d.Name)
 
-	// Screen capture detection (must come before camera since "screen" is unambiguous).
-	if strings.Contains(name, "screen") || strings.Contains(name, "display") {
+	// Screen capture detection. "Capture screen 0" is the canonical
+	// AVFoundation screen-capture name. Don't match "display" — Apple's
+	// Studio Display Camera contains that substring but is a camera.
+	if strings.Contains(name, "screen") {
 		return TypeScreen
 	}
 
-	// USB HDMI capture cards — known vendor/product names.
+	// SDI / HDMI capture cards that present as UVC (v4l2 / AVFoundation /
+	// dshow). Grouped together under "Capture cards" in the UI.
 	captureKeywords := []string{
 		"cam link", "camlink",
 		"elgato",
 		"hd60", "hd 60",
 		"avermedia", "live gamer",
 		"magewell",
+		"inogeni", // SDI / HDMI USB converters
+		"aja",     // U-TAP HDMI/SDI USB
+		"yuan",    // SDI capture cards
+		"datavideo",
+		"deltacast",
 		"epiphan",
 		"capture", // generic "capture" devices (not "screen capture")
 		"hdmi",
+		"sdi", // explicit SDI keyword catches anything self-identifying
 		"usb video",
 	}
 	for _, kw := range captureKeywords {
