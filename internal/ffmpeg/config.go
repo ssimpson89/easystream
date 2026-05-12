@@ -74,6 +74,19 @@ const (
 	EncoderQSV          Encoder = "h264_qsv"          // Intel QuickSync
 )
 
+// keyframeIntervalSec is the 2-second cadence used for primary-output
+// GOP boundaries (preset.GOP returns FPS*2) and for the VideoToolbox
+// -force_key_frames expression. Keeping these derived from the same
+// constant prevents the encoder's GOP and VT's keyframe-forcing
+// expression from drifting if we ever pick a different live cadence.
+const keyframeIntervalSec = 2
+
+// previewFPS is the framerate for the secondary low-res preview leg.
+// 15 fps is plenty for a thumbnail preview and lets us decimate the
+// source before scaling — halving the scaler workload on a 30 fps
+// preset, more on higher-FPS sources.
+const previewFPS = 15
+
 // EncoderInfo describes a detected encoder for the UI.
 type EncoderInfo struct {
 	ID          Encoder `json:"id"`
@@ -411,11 +424,15 @@ func (c Config) Args() ([]string, error) {
 	if encoder == EncoderVideoToolbox {
 		deint = ""
 	}
+	// Preview chain: fps decimation comes BEFORE the scale so we only
+	// pay the scale cost on the frames we'll actually keep. Halving
+	// 30→15 in front of scale saves ~50% of the preview-leg scaler
+	// work — on a high-FPS source like a 60p capture, much more.
 	videoChain := fmt.Sprintf(
 		"[%s]%sscale=%d:%d:force_original_aspect_ratio=decrease,"+
 			"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,split=2[v][v_pre_src];"+
-			"[v_pre_src]scale=640:360:force_original_aspect_ratio=decrease,fps=15[v_preview]",
-		inputs.videoMap, deint, w, h, w, h,
+			"[v_pre_src]fps=%d,scale=640:360:force_original_aspect_ratio=decrease[v_preview]",
+		inputs.videoMap, deint, w, h, w, h, previewFPS,
 	)
 	audioChain := fmt.Sprintf(
 		"[%s]aresample=async=1:min_hard_comp=0.100000:osr=48000,asplit=3[a_enc][a_preview][a_stats];"+
@@ -492,7 +509,11 @@ func (c Config) Args() ([]string, error) {
 	args = append(args, "-map", "[v_preview]")
 	args = append(args, c.previewEncoderArgs(encoder)...)
 	args = append(args,
-		"-g", "30", "-keyint_min", "15",
+		// GOP = previewFPS * 2 for a 2-second keyframe interval that
+		// matches the preset's cadence; keyint_min = previewFPS gates
+		// scenecut closer to GOP boundaries.
+		"-g", strconv.Itoa(previewFPS*2),
+		"-keyint_min", strconv.Itoa(previewFPS),
 		"-b:v", "800k",
 		"-flush_packets", "1", "-muxdelay", "0", "-muxpreload", "0",
 		"-payload_type", "96",
@@ -543,7 +564,7 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 			"-allow_sw", "1",
 			"-realtime", "1",
 			"-constant_bit_rate", "1",
-			"-force_key_frames", "expr:gte(t,n_forced*2)",
+			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", keyframeIntervalSec),
 		}
 
 	case EncoderNVENC:
