@@ -64,6 +64,10 @@ type Server struct {
 	// healthPollerStop signals the background health poller to exit on
 	// Shutdown. Without this, polling continues past server close.
 	healthPollerStop chan struct{}
+
+	// hub is the SSE pub/sub: every mutator calls s.publishState() so all
+	// open browser tabs see changes in real time without polling.
+	hub *hub
 }
 
 // markLive persists the operator's intent to be live. Called from every
@@ -200,8 +204,14 @@ func NewServer(cfg ServerConfig) *Server {
 		intentPath:       intentPath,
 		config:           defaultCfg,
 		healthPollerStop: make(chan struct{}),
+		hub:              newHub(),
 	}
-	supervisor.SetOnRestart(adaptive.OnRestart)
+	// Supervisor restart events drive both the adaptive controller and an
+	// SSE push so the UI flips to "Reconnecting" instantly.
+	supervisor.SetOnRestart(func() {
+		adaptive.OnRestart()
+		server.publishState()
+	})
 	adaptive.Start()
 
 	// Initialize preview with the default config so it knows the input source.
@@ -251,6 +261,10 @@ func (s *Server) routes(webFS fs.FS) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		fileServer.ServeHTTP(w, r)
 	}))
+
+	// Real-time state push (SSE). All open UIs receive every state change
+	// immediately; the REST endpoints below remain as control/fallback.
+	mux.HandleFunc("GET /api/stream/state", s.handleEventStream)
 
 	// Stream control.
 	mux.HandleFunc("GET /api/status", s.handleStatus)

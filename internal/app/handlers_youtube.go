@@ -61,6 +61,7 @@ func (s *Server) handleYTLogout(w http.ResponseWriter, r *http.Request) {
 	if s.ytAuth != nil {
 		_ = s.ytAuth.Logout()
 	}
+	s.publishState()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
 }
 
@@ -184,6 +185,7 @@ func (s *Server) handleGoLiveNow(w http.ResponseWriter, r *http.Request) {
 	// cancelled (user stops or starts a new broadcast).
 	s.startTransitionGoroutine(broadcast.ID, stream.ID)
 
+	s.publishState()
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"broadcast": broadcast,
 		"stream":    stream,
@@ -243,6 +245,7 @@ func (s *Server) handleCompleteBroadcast(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	s.publishState()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "completed"})
 }
 

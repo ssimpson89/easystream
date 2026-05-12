@@ -78,10 +78,39 @@ func (s *Server) pollStreamHealth() {
 	}
 
 	s.mu.Lock()
+	prev := s.streamHealth
 	s.streamHealth = snap
 	s.mu.Unlock()
 
+	// Only push if something visible changed (StreamStatus, HealthStatus,
+	// or viewer count). Avoids pushing every 15s for a stable stream.
+	if healthChanged(prev, snap) {
+		s.publishState()
+	}
+
 	s.applyDestinationHealth(snap)
+}
+
+// healthChanged returns true if any field visible to the UI changed.
+func healthChanged(a, b streamHealthSnapshot) bool {
+	if a.StreamStatus != b.StreamStatus || a.HealthStatus != b.HealthStatus {
+		return true
+	}
+	if (a.ConcurrentViewers == nil) != (b.ConcurrentViewers == nil) {
+		return true
+	}
+	if a.ConcurrentViewers != nil && b.ConcurrentViewers != nil && *a.ConcurrentViewers != *b.ConcurrentViewers {
+		return true
+	}
+	if len(a.Issues) != len(b.Issues) {
+		return true
+	}
+	for i := range a.Issues {
+		if a.Issues[i] != b.Issues[i] {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) applyDestinationHealth(snap streamHealthSnapshot) {

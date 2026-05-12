@@ -34,6 +34,8 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.publishSchedules()
+	s.publishState()
 	writeJSON(w, http.StatusCreated, result)
 }
 
@@ -57,6 +59,8 @@ func (s *Server) handleUpdateSchedule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err.Error())
 		return
 	}
+	s.publishSchedules()
+	s.publishState()
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -70,6 +74,8 @@ func (s *Server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	s.publishSchedules()
+	s.publishState()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -98,6 +104,8 @@ func (s *Server) handleCreateOverride(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.publishOverrides()
+	s.publishState()
 	writeJSON(w, http.StatusCreated, result)
 }
 
@@ -121,6 +129,8 @@ func (s *Server) handleUpdateOverride(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err.Error())
 		return
 	}
+	s.publishOverrides()
+	s.publishState()
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -134,6 +144,8 @@ func (s *Server) handleDeleteOverride(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	s.publishOverrides()
+	s.publishState()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 

@@ -47,6 +47,7 @@ func (a *streamControllerAdapter) StartWithIngest(presetID, ingestURL, streamKey
 	if a.server.adaptive != nil {
 		a.server.adaptive.OnStreamStart(config.Preset.ID)
 	}
+	a.server.publishState()
 	return nil
 }
 
@@ -67,6 +68,7 @@ func (a *streamControllerAdapter) StopStream() {
 	a.server.streamHealth = streamHealthSnapshot{}
 	a.server.destinationBad = 0
 	a.server.mu.Unlock()
+	a.server.publishState()
 }
 
 func (a *streamControllerAdapter) IsStreaming() bool {

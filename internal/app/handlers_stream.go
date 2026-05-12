@@ -14,6 +14,13 @@ import (
 // --- Status ---
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.statusSnapshot())
+}
+
+// statusSnapshot builds the full state object returned by /api/status and
+// pushed over SSE. Single source of truth so the polled and pushed views
+// stay identical.
+func (s *Server) statusSnapshot() map[string]any {
 	s.mu.Lock()
 	config := s.config
 	health := s.streamHealth
@@ -45,7 +52,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if s.schedStore != nil {
 		result["nextEvents"] = s.schedStore.NextEvents(5, time.Now().UTC())
 	}
-	writeJSON(w, http.StatusOK, result)
+	return result
 }
 
 // --- Config ---
@@ -113,6 +120,10 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			s.logger.Printf("failed to persist stream config: %v", err)
 		}
 	}
+	// Push to every open UI so a source/preset change in tab A propagates
+	// to tab B immediately. The preview reconnects client-side once the
+	// status event lands.
+	s.publishState()
 	writeJSON(w, http.StatusOK, s.configResponse(config))
 }
 
@@ -147,6 +158,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	s.resetDestinationBadCount()
 	s.markLive("manual", "", "")
+	s.publishState()
 	writeJSON(w, http.StatusAccepted, s.supervisor.Status())
 }
 
@@ -186,6 +198,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 			}
 		}(broadcastID)
 	}
+	s.publishState()
 	writeJSON(w, http.StatusOK, s.supervisor.Status())
 }
 
@@ -207,6 +220,7 @@ func (s *Server) handleExtend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.publishState()
 	writeJSON(w, http.StatusOK, map[string]any{"endsAt": endsAt})
 }
 
@@ -223,6 +237,7 @@ func (s *Server) handleAdaptiveToggle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.adaptive.SetEnabled(body.Enabled)
+	s.publishState()
 	writeJSON(w, http.StatusOK, s.adaptive.State())
 }
 
