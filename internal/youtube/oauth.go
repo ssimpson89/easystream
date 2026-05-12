@@ -68,11 +68,17 @@ type Auth struct {
 
 // SetLogger installs a logger so token-refresh persistence failures surface
 // somewhere instead of being silently dropped on disk-full / permission errors.
+//
+// Takes a.mu because persistTokenSource.Token reads a.logger under the same
+// lock; an unlocked write here is a data race even though in practice we
+// only call SetLogger at startup.
 func (a *Auth) SetLogger(l *log.Logger) {
 	if a == nil {
 		return
 	}
+	a.mu.Lock()
 	a.logger = l
+	a.mu.Unlock()
 }
 
 // NewAuth creates an Auth that stores tokens at tokenFile.

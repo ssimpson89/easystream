@@ -285,6 +285,76 @@ func (c Config) OutputURL() string {
 	return base + "/" + name
 }
 
+// primaryOutputArgs returns the direct-output args (no tee) for the
+// primary destination — used when HLS sidecar is disabled.
+func (c Config) primaryOutputArgs() []string {
+	switch c.OutputMode {
+	case OutputSRT:
+		// -flush_packets 1 + -muxdelay 0 -muxpreload 0 keep the muxer
+		// low-latency: each packet is flushed immediately and the
+		// muxer doesn't hold audio waiting for video PTS (default
+		// muxdelay is 0.7 s).
+		return []string{
+			"-f", "mpegts",
+			"-flush_packets", "1",
+			"-muxdelay", "0",
+			"-muxpreload", "0",
+			c.OutputURL(),
+		}
+	default: // OutputRTMP and "" both go here
+		out := []string{"-f", "flv"}
+		if c.Network.TCPKeepalive {
+			out = append(out, "-tcp_keepalive", "1")
+		}
+		if c.Network.RWTimeout > 0 {
+			out = append(out, "-rw_timeout", fmt.Sprintf("%d", c.Network.RWTimeout.Microseconds()))
+		}
+		return append(out, c.OutputURL())
+	}
+}
+
+// hlsOutputArgs returns the direct-output args for the HLS sidecar
+// when there's no primary destination configured.
+func (c Config) hlsOutputArgs() []string {
+	return []string{
+		"-f", "hls",
+		"-hls_time", "6",
+		"-hls_list_size", "10",
+		"-hls_flags", "delete_segments+append_list+independent_segments",
+		"-hls_segment_filename", fmt.Sprintf("%s/seg%%d.ts", c.HLSDir),
+		fmt.Sprintf("%s/stream.m3u8", c.HLSDir),
+	}
+}
+
+// primaryTeeSlave returns the tee-muxer slave spec for the primary
+// destination. Slave options inside [...] are colon-separated; the
+// URL follows after ']' and may contain any character except '|'.
+func (c Config) primaryTeeSlave() (string, error) {
+	switch c.OutputMode {
+	case OutputSRT:
+		return "[f=mpegts:flush_packets=1:muxdelay=0:muxpreload=0]" + c.OutputURL(), nil
+	case OutputRTMP, "":
+		opts := []string{"f=flv"}
+		if c.Network.TCPKeepalive {
+			opts = append(opts, "tcp_keepalive=1")
+		}
+		if c.Network.RWTimeout > 0 {
+			opts = append(opts, fmt.Sprintf("rw_timeout=%d", c.Network.RWTimeout.Microseconds()))
+		}
+		return "[" + strings.Join(opts, ":") + "]" + c.OutputURL(), nil
+	default:
+		return "", fmt.Errorf("unsupported output mode for tee: %q", c.OutputMode)
+	}
+}
+
+// hlsTeeSlave returns the tee-muxer slave spec for the HLS sidecar.
+func (c Config) hlsTeeSlave() string {
+	return fmt.Sprintf(
+		"[f=hls:hls_time=6:hls_list_size=10:hls_flags=delete_segments+append_list+independent_segments:hls_segment_filename=%s/seg%%d.ts]%s/stream.m3u8",
+		c.HLSDir, c.HLSDir,
+	)
+}
+
 func (c Config) Args() ([]string, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -385,48 +455,26 @@ func (c Config) Args() ([]string, error) {
 		"-ac", "2",
 	)
 
-	// Primary destination: appended only if runnable (URL + key set).
-	// Allowing this to be skipped lets the operator do HLS-only runs.
-	if c.primaryRunnable() {
-		switch c.OutputMode {
-		case OutputSRT:
-			// MPEG-TS over SRT. -flush_packets 1 + -muxdelay 0
-			// -muxpreload 0 keep the muxer low-latency: each packet
-			// is flushed immediately and the muxer doesn't hold
-			// audio waiting for video PTS (default muxdelay 0.7 s).
-			args = append(args,
-				"-f", "mpegts",
-				"-flush_packets", "1",
-				"-muxdelay", "0",
-				"-muxpreload", "0",
-				c.OutputURL(),
-			)
-		default: // OutputRTMP and "" both go here
-			args = append(args, "-f", "flv")
-			if c.Network.TCPKeepalive {
-				args = append(args, "-tcp_keepalive", "1")
-			}
-			if c.Network.RWTimeout > 0 {
-				args = append(args, "-rw_timeout", fmt.Sprintf("%d", c.Network.RWTimeout.Microseconds()))
-			}
-			args = append(args, c.OutputURL())
+	// Primary destination + optional HLS sidecar.
+	//
+	// When both are enabled we use ffmpeg's tee muxer so a single
+	// encoder feeds both outputs — re-encoding twice would double
+	// CPU, and -c copy on the raw input streams produces invalid
+	// HLS (the inputs are uyvy422 / PCM, not H.264 / AAC).
+	hlsEnabled := c.EnableHLS && strings.TrimSpace(c.HLSDir) != ""
+	switch {
+	case c.primaryRunnable() && hlsEnabled:
+		primary, err := c.primaryTeeSlave()
+		if err != nil {
+			return nil, err
 		}
-	}
-
-	// Optional HLS local-monitoring output. Re-maps the already-encoded
-	// streams with -c copy so we don't pay a second encode. Independent
-	// of the primary destination — runs alongside RTMP/SRT, or alone.
-	if c.EnableHLS && strings.TrimSpace(c.HLSDir) != "" {
-		args = append(args,
-			"-map", inputs.videoMap, "-map", inputs.audioMap,
-			"-c", "copy",
-			"-f", "hls",
-			"-hls_time", "6",
-			"-hls_list_size", "10",
-			"-hls_flags", "delete_segments+append_list+independent_segments",
-			"-hls_segment_filename", fmt.Sprintf("%s/seg%%d.ts", c.HLSDir),
-			fmt.Sprintf("%s/stream.m3u8", c.HLSDir),
-		)
+		args = append(args, "-f", "tee", primary+"|"+c.hlsTeeSlave())
+	case c.primaryRunnable():
+		args = append(args, c.primaryOutputArgs()...)
+	case hlsEnabled:
+		// HLS-only run. Same encoded output as the primary path
+		// would have used, just muxed to HLS instead.
+		args = append(args, c.hlsOutputArgs()...)
 	}
 
 	// Secondary output: low-res H.264 RTP for live browser preview.

@@ -222,14 +222,23 @@ func TestArgsHLSToggleAlongsideRTMP(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "-f flv") {
-		t.Errorf("expected primary RTMP output: %s", joined)
+	// Primary + HLS sidecar share one encoder via the tee muxer —
+	// so the args should NOT have separate -f flv / -f hls outputs,
+	// they should be a single -f tee with two bracketed targets.
+	if !strings.Contains(joined, "-f tee ") {
+		t.Errorf("expected tee muxer to fan out one encoder to RTMP+HLS: %s", joined)
 	}
-	if !strings.Contains(joined, "-f hls") {
-		t.Errorf("expected secondary HLS output: %s", joined)
+	if !strings.Contains(joined, "[f=flv:tcp_keepalive=1") {
+		t.Errorf("expected tee primary slave spec: %s", joined)
 	}
-	if !strings.Contains(joined, "-c copy") {
-		t.Errorf("expected HLS to use -c copy (no re-encode): %s", joined)
+	if !strings.Contains(joined, "[f=hls:hls_time=6") {
+		t.Errorf("expected tee HLS slave spec: %s", joined)
+	}
+	// HLS must NOT use -c copy on raw input — that produces invalid
+	// HLS because inputs are uyvy422/PCM, not H.264/AAC. tee shares
+	// the global -c:v libx264 / -c:a aac_at across both targets.
+	if strings.Contains(joined, "-c copy") {
+		t.Errorf("HLS must not use -c copy on raw inputs: %s", joined)
 	}
 }
 
