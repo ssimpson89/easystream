@@ -417,10 +417,18 @@ func (s *Supervisor) run(ctx context.Context) {
 }
 
 func (s *Supervisor) runOnce(ctx context.Context) error {
-	args, err := s.ffmpeg.Args()
+	// Use Build (not Args) so the inputBuild fallback metadata flows
+	// here in one shot. A separate later probe could see a different
+	// answer than buildInputs did — e.g. mic reappeared between
+	// buildInputs running and supervisor probing — leaving the
+	// recovery watcher unstarted while ffmpeg is silently running on
+	// the lavfi silent input.
+	built, err := s.ffmpeg.Build()
 	if err != nil {
 		return err
 	}
+	args := built.Args
+	audioFallback := built.AudioFallbackDevice
 
 	// Use plain exec.Command (not CommandContext) so shutdown/restart can send
 	// SIGTERM before SIGKILL. Setpgid lets us signal the whole FFmpeg process
@@ -449,7 +457,6 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 		}
 	}
 
-	audioFallback := s.ffmpeg.AudioFallbackTarget()
 	s.mu.Lock()
 	s.status.State = StateRunning
 	s.status.StartedAt = time.Now().UTC()

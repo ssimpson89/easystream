@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -84,6 +85,78 @@ var networkInputSchemes = map[string]bool{
 	"rtp":   true,
 	"http":  true,
 	"https": true,
+}
+
+// RedactedCredentialSentinel is the placeholder substituted for URL
+// credentials when an Input.URL is serialised for API responses. The
+// configUpdate handler treats incoming URLs containing this sentinel
+// as "operator didn't change credentials" and preserves the stored
+// value, so the round-trip never exposes secrets to the UI.
+const RedactedCredentialSentinel = "REDACTED"
+
+// secretQueryParams names URL query parameters whose values are
+// always sensitive. Their values are scrubbed alongside any
+// userinfo (user:pass@) component when an Input.URL is serialised.
+var secretQueryParams = map[string]bool{
+	"passphrase": true,
+	"password":   true,
+	"token":      true,
+	"key":        true,
+	"secret":     true,
+}
+
+// RedactURLCredentials returns u with any embedded credentials
+// replaced by RedactedCredentialSentinel. Specifically:
+//   - userinfo (rtsp://user:pass@host/path → rtsp://REDACTED:REDACTED@host/path)
+//   - secret query parameters (srt://host:port?passphrase=X → ?passphrase=REDACTED)
+//
+// Used to scrub network-input URLs before sending them to UI clients
+// or writing to logs, so RTSP camera passwords and SRT passphrases
+// don't leak to anyone watching the dashboard SSE stream.
+func RedactURLCredentials(u string) string {
+	if u == "" {
+		return u
+	}
+	parsed, err := neturl.Parse(u)
+	if err != nil {
+		// Couldn't parse — fall back to substring stripping for
+		// the obvious user:pass@ form.
+		return redactRawURL(u)
+	}
+	if parsed.User != nil {
+		parsed.User = neturl.UserPassword(RedactedCredentialSentinel, RedactedCredentialSentinel)
+	}
+	if parsed.RawQuery != "" {
+		q := parsed.Query()
+		changed := false
+		for k := range q {
+			if secretQueryParams[strings.ToLower(k)] {
+				q.Set(k, RedactedCredentialSentinel)
+				changed = true
+			}
+		}
+		if changed {
+			parsed.RawQuery = q.Encode()
+		}
+	}
+	return parsed.String()
+}
+
+// redactRawURL strips userinfo from a URL we couldn't fully parse.
+// Used only as a fallback; the parsed path handles everything we
+// expect to see.
+func redactRawURL(u string) string {
+	schemeIdx := strings.Index(u, "://")
+	if schemeIdx < 0 {
+		return u
+	}
+	rest := u[schemeIdx+3:]
+	atIdx := strings.Index(rest, "@")
+	slashIdx := strings.Index(rest, "/")
+	if atIdx < 0 || (slashIdx >= 0 && atIdx > slashIdx) {
+		return u
+	}
+	return u[:schemeIdx+3] + RedactedCredentialSentinel + ":" + RedactedCredentialSentinel + rest[atIdx:]
 }
 
 // OutputMode selects the *primary* destination FFmpeg sends to.
@@ -429,7 +502,20 @@ func (c Config) Args() ([]string, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
+	inputs, err := c.buildInputs()
+	if err != nil {
+		return nil, err
+	}
+	return c.argsWithInputs(inputs)
+}
 
+// argsWithInputs builds the full argv given an already-resolved
+// inputBuild. Used by both Args (which calls buildInputs internally)
+// and Build (which exposes the inputBuild's fallback metadata to
+// the supervisor). Splitting keeps buildInputs's silent-audio fallback
+// decision and the supervisor's recovery-watcher target perfectly in
+// sync.
+func (c Config) argsWithInputs(inputs inputBuild) ([]string, error) {
 	args := []string{
 		"-hide_banner",
 		"-nostdin",
@@ -438,11 +524,6 @@ func (c Config) Args() ([]string, error) {
 		"-flags", "low_delay",
 		"-progress", "pipe:1",
 		"-stats_period", "1",
-	}
-
-	inputs, err := c.buildInputs()
-	if err != nil {
-		return nil, err
 	}
 	args = append(args, inputs.args...)
 
@@ -789,6 +870,12 @@ type inputBuild struct {
 	args     []string // -f / -i / etc. for each input
 	videoMap string   // e.g. "0:v" or "0:v:0"
 	audioMap string   // e.g. "0:a" or "1:a"
+	// audioFallbackDevice is set when buildInputs substituted silent
+	// audio because the configured audio device couldn't be resolved.
+	// Names the missing device so the supervisor can watch for it to
+	// come back. Empty when audio was resolved normally or when the
+	// input path doesn't support silent-audio fallback.
+	audioFallbackDevice string
 }
 
 const silentAudio = "anullsrc=channel_layout=stereo:sample_rate=48000"
@@ -896,10 +983,12 @@ func (c Config) buildInputs() (inputBuild, error) {
 		// recoverable (the supervisor watches for the device to come
 		// back and restarts); losing the whole stream is not.
 		audio := c.Input.AudioDevice
+		audioFallback := ""
 		if c.Input.AudioDeviceName != "" {
 			resolved, err := ResolveAVFoundationDeviceIndexStrict(c.Binary, c.Input.AudioDeviceName, "audio", c.Input.AudioDevice)
 			if err != nil {
 				audio = "" // triggers silent-audio branch below
+				audioFallback = c.Input.AudioDeviceName
 			} else {
 				audio = resolved
 			}
@@ -917,6 +1006,7 @@ func (c Config) buildInputs() (inputBuild, error) {
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
+			audioFallbackDevice: audioFallback,
 		}, nil
 
 	case "dshow":
@@ -1045,37 +1135,35 @@ func chooseAVFoundationFramerate(output string, targetFPS int) (string, bool) {
 	return "", false
 }
 
-// AudioFallbackTarget returns the persisted audio-device name if the
-// configured device is currently missing AND the input path is one
-// where silent audio is substituted (today: AVFoundation). Returns ""
-// when no fallback is active (device present, or the input path
-// doesn't support fallback, or no audio device is configured).
-//
-// The supervisor calls this after building args to know whether to
-// start an audio-device watcher that signals a restart when the
-// device reappears. Probing here is purely informational; the actual
-// silent-audio substitution happens inside buildInputs.
-func (c Config) AudioFallbackTarget() string {
-	if c.Input.Kind == InputTestVideo || c.Input.Kind == InputNetwork {
-		return ""
+// BuildResult bundles Args's command-line output with metadata about
+// what buildInputs actually did. The supervisor uses this metadata
+// (e.g. AudioFallbackDevice) to drive recovery watchers consistent
+// with the FFmpeg invocation we just started — not a separate later
+// probe whose answer could differ from what buildInputs decided.
+type BuildResult struct {
+	Args                []string
+	AudioFallbackDevice string
+}
+
+// Build is the supervisor-facing entry point. It runs buildInputs +
+// Args in one call and returns both the argv FFmpeg will see and the
+// fallback metadata buildInputs produced. Consistency is the point:
+// if buildInputs substituted silent audio, BuildResult.AudioFallbackDevice
+// names the missing mic — and that mic is the one we should watch for,
+// not whatever a later re-probe happens to find.
+func (c Config) Build() (BuildResult, error) {
+	if err := c.Validate(); err != nil {
+		return BuildResult{}, err
 	}
-	backend := strings.ToLower(c.Input.Backend)
-	if backend == "" {
-		backend = PlatformBackend()
+	inputs, err := c.buildInputs()
+	if err != nil {
+		return BuildResult{}, err
 	}
-	if backend != "avfoundation" {
-		// v4l2 and dshow paths still fail closed on missing audio.
-		// Extending the fallback to those is a follow-up.
-		return ""
+	args, err := c.argsWithInputs(inputs)
+	if err != nil {
+		return BuildResult{}, err
 	}
-	name := strings.TrimSpace(c.Input.AudioDeviceName)
-	if name == "" {
-		return ""
-	}
-	if _, err := ResolveAVFoundationDeviceIndexStrict(c.Binary, name, "audio", c.Input.AudioDevice); err != nil {
-		return name
-	}
-	return ""
+	return BuildResult{Args: args, AudioFallbackDevice: inputs.audioFallbackDevice}, nil
 }
 
 // ErrDeviceNotFound is returned when an AVFoundation device cannot be

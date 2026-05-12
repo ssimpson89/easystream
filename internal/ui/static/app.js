@@ -750,16 +750,31 @@ document.addEventListener("alpine:init", () => {
     onVideoSourceChange() {
       this._dirtyVideo = true;
       if (this.isSDISource) this.audioSourceValue = "";
+      // Picking "Network stream" without a URL would POST invalid
+      // config (backend requires Input.URL) and show a save-failed
+      // toast. Defer save until the operator types a URL.
+      if (this.isNetworkSource && !(this.networkUrl || "").trim()) {
+        this.preview?.refresh();
+        return;
+      }
       this.saveConfig().then(() => this.preview?.refresh());
     },
     onNetworkUrlChange()    { this._dirtyVideo = true; },
-    onNetworkUrlBlur()      { this.saveConfig(); },
+    onNetworkUrlBlur()      {
+      // Blank URL means nothing valid to save yet. Skip.
+      if (!(this.networkUrl || "").trim()) return;
+      this.saveConfig();
+    },
     onNetworkNoAudioToggle() {
       this._dirtyVideo = true;
+      // NoAudio is only meaningful once a URL exists.
+      if (!(this.networkUrl || "").trim()) return;
       this.saveConfig();
     },
     onHDRToggle() {
       this._dirtyVideo = true;
+      // Same guard for network sources without a URL yet.
+      if (this.isNetworkSource && !(this.networkUrl || "").trim()) return;
       this.saveConfig();
     },
     onAudioSourceChange()   { this._dirtyAudio = true; this.saveConfig(); },
