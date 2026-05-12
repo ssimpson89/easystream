@@ -87,7 +87,9 @@ document.addEventListener("alpine:init", () => {
 
     // Tracks the previous videoSourceValue so onVideoSourceChange
     // can detect a kind transition (e.g. webcam → network) and
-    // reset kind-specific defaults.
+    // reset kind-specific defaults. Synced both on user-driven
+    // changes (in onVideoSourceChange) and on SSE-driven updates
+    // (in applyState) so the baseline never drifts.
     _lastVideoSourceValue: "",
 
     schedForm: { id: "", name: "", days: [], time: "09:00", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted", enabled: true },
@@ -298,6 +300,12 @@ document.addEventListener("alpine:init", () => {
             cur.kind === next.kind && cur.backend === next.backend && cur.videoDevice === next.videoDevice;
           if (!sameTriple) {
             this.videoSourceValue = encoded;
+            // Keep _lastVideoSourceValue in sync with programmatic
+            // changes too — otherwise onVideoSourceChange's kind-
+            // transition detection would compare against a stale
+            // "" baseline and falsely fire the network-default
+            // reset on the next user-initiated change.
+            this._lastVideoSourceValue = encoded;
             this.$nextTick(() => this.syncSelectElements());
           }
         }

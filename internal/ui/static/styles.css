@@ -657,9 +657,15 @@ dd { margin: 4px 0 0; font-size: 20px; font-weight: 700; font-variant-numeric: t
 /* =========== FORMS =========== */
 /* The uppercase "eyebrow" label style applies to form-row labels —
  * those wrapping a single <input>/<select>/<textarea>. Inline-control
- * variants (.checkbox-row, .switch-row) opt out via :not() so a
- * label wrapping a checkbox doesn't pick up the all-caps treatment. */
-label:not(.checkbox-row) {
+ * variants (.checkbox-row, .switch-row) opt out so a label wrapping
+ * a checkbox doesn't pick up the all-caps treatment.
+ *
+ * Wrapped in :where() so the exclusion contributes zero specificity:
+ * the bare `label` rule still matches at 0-1-0, identical to before,
+ * and other label-class variants (.adaptive-toggle, etc.) with a
+ * single-class selector cleanly override without our :not() bumping
+ * specificity above theirs. */
+label:where(:not(.checkbox-row)) {
   display: block;
   margin-top: 14px;
   color: var(--muted);
