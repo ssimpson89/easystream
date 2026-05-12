@@ -62,6 +62,15 @@ type Input struct {
 	// FFmpeg errors at startup. When set, a silent stereo track
 	// is substituted instead.
 	NoAudio bool `json:"noAudio,omitempty"`
+	// SourceIsHDR signals that the input carries HDR transfer
+	// characteristics (PQ/HLG, BT.2020 primaries). When set, the
+	// video filter graph prepends a tone-map chain that converts
+	// to SDR Rec.709 before scaling. Without it, the encoder
+	// outputs SDR-tagged frames with HDR pixel data — colors
+	// clip ugly on YouTube and most playback paths. Opt-in
+	// because the tone-map chain costs CPU and is wrong for
+	// SDR sources (where it'd compress contrast unnecessarily).
+	SourceIsHDR bool `json:"sourceIsHdr,omitempty"`
 }
 
 // networkInputSchemes is the allowlist of URL schemes we accept for
@@ -476,11 +485,27 @@ func (c Config) Args() ([]string, error) {
 	// pay the scale cost on the frames we'll actually keep. Halving
 	// 30→15 in front of scale saves ~50% of the preview-leg scaler
 	// work — on a high-FPS source like a 60p capture, much more.
+	//
+	// HDR→SDR tone-map chain. Converts PQ/HLG (BT.2020) source pixels
+	// to Rec.709 SDR before downstream scaling. Skipped for SDR
+	// sources because the linear-light conversion costs real CPU and
+	// compresses contrast on already-SDR material.
+	//
+	// Chain: zscale to linear (npl=100 SDR target), float32 for
+	// tonemap precision, primaries to bt709, hable tonemap with
+	// desat=0 (preserve saturation), zscale back to bt709/limited,
+	// format to yuv420p for the encoder.
+	tonemap := ""
+	if c.Input.SourceIsHDR {
+		tonemap = "zscale=t=linear:npl=100,format=gbrpf32le," +
+			"zscale=p=bt709,tonemap=tonemap=hable:desat=0," +
+			"zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
+	}
 	videoChain := fmt.Sprintf(
-		"[%s]%sscale=%d:%d:force_original_aspect_ratio=decrease,"+
+		"[%s]%s%sscale=%d:%d:force_original_aspect_ratio=decrease,"+
 			"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,split=2[v][v_pre_src];"+
 			"[v_pre_src]fps=%d,scale=640:360:force_original_aspect_ratio=decrease[v_preview]",
-		inputs.videoMap, deint, w, h, w, h, previewFPS,
+		inputs.videoMap, deint, tonemap, w, h, w, h, previewFPS,
 	)
 	audioChain := fmt.Sprintf(
 		"[%s]aresample=async=1:min_hard_comp=0.100000:osr=48000,asplit=3[a_enc][a_preview][a_stats];"+

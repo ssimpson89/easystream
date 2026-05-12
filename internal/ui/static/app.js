@@ -67,6 +67,7 @@ document.addEventListener("alpine:init", () => {
     audioSourceValue: "",
     networkUrl:       "",
     networkNoAudio:   false,
+    sourceIsHDR:      false,
     selectedPreset:   "recommended",
     selectedEncoder:  "libx264",
     outputMode:       "rtmp",
@@ -304,6 +305,7 @@ document.addEventListener("alpine:init", () => {
       if (!this._dirtyVideo) {
         this.networkUrl = config.input?.url || "";
         this.networkNoAudio = !!config.input?.noAudio;
+        this.sourceIsHDR = !!config.input?.sourceIsHdr;
       }
     },
 
@@ -713,6 +715,10 @@ document.addEventListener("alpine:init", () => {
         payload.input.url = (this.networkUrl || "").trim();
         payload.input.noAudio = !!this.networkNoAudio;
       }
+      // HDR flag applies to any non-test source.
+      if (decoded.kind !== "test-video") {
+        payload.input.sourceIsHdr = !!this.sourceIsHDR;
+      }
       // Persist device names so the backend can resolve stable
       // AVFoundation indexes even when indexes shift between reboots.
       const vDev = (this.devices.video || []).find(
@@ -749,6 +755,10 @@ document.addEventListener("alpine:init", () => {
     onNetworkUrlChange()    { this._dirtyVideo = true; },
     onNetworkUrlBlur()      { this.saveConfig(); },
     onNetworkNoAudioToggle() {
+      this._dirtyVideo = true;
+      this.saveConfig();
+    },
+    onHDRToggle() {
       this._dirtyVideo = true;
       this.saveConfig();
     },
