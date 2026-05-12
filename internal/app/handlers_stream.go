@@ -37,6 +37,7 @@ func (s *Server) statusSnapshot() map[string]any {
 		"config":            s.configResponse(config),
 		"presets":           quality.Selectable(),
 		"platform":          ffmpeg.PlatformBackend(),
+		"capabilities":      s.ffmpegCaps,
 		"health":            health,
 		"confidence":        confidence,
 		"activeBroadcastId": broadcastID,
@@ -103,6 +104,13 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		if *patch.OutputMode == "hls" {
 			s.config.OutputMode = ffmpeg.OutputRTMP
 			s.config.EnableHLS = true
+		} else if *patch.OutputMode == ffmpeg.OutputSRT && !s.ffmpegCaps.SRT {
+			// Don't let the operator silently set SRT when FFmpeg
+			// can't actually push it — they'd find out at go-live.
+			s.mu.Unlock()
+			writeError(w, http.StatusBadRequest,
+				"this FFmpeg build does not support SRT — see README for install instructions.")
+			return
 		} else {
 			s.config.OutputMode = *patch.OutputMode
 		}

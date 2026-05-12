@@ -472,9 +472,13 @@
               Protocol
               <select x-model="outputMode" @change="saveConfig()">
                 <option value="rtmp">RTMP / RTMPS</option>
-                <option value="srt">SRT (low-latency, packet-loss resilient)</option>
+                <option value="srt" :disabled="!capabilities.srt"
+                        x-text="capabilities.srt ? 'SRT (low-latency, packet-loss resilient)' : 'SRT — not available in this FFmpeg build (see README)'"></option>
               </select>
             </label>
+            <p class="hint" x-show="!capabilities.srt && outputMode === 'srt'">
+              This FFmpeg build does not include libsrt. See the README "FFmpeg with SRT support" section for install instructions.
+            </p>
 
             <div x-show="outputMode === 'rtmp'">
               <div class="quick-fill">

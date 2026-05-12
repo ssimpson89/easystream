@@ -22,6 +22,30 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in your browser.
 - **Go 1.22+**
 - **FFmpeg** installed and available on `PATH` (`brew install ffmpeg` on macOS, `apt install ffmpeg` on Linux)
 
+#### Optional: FFmpeg with SRT support
+
+To stream via SRT (Cloudflare Stream, MediaMTX, custom SRT receivers), FFmpeg must be built with `libsrt`. **Homebrew's default `ffmpeg` formula on macOS does NOT include libsrt.** EasyStream will detect this at startup, log a warning, and grey out the SRT option in the destination picker.
+
+To enable SRT:
+
+**macOS — Homebrew tap** (recommended):
+
+```bash
+brew uninstall ffmpeg
+brew tap homebrew-ffmpeg/ffmpeg
+brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-srt
+```
+
+**Linux — distribution packages**: most distros ship `ffmpeg` with libsrt enabled. Verify with:
+
+```bash
+ffmpeg -protocols 2>&1 | grep '^ *srt$'
+```
+
+If that prints `srt` you're good. If not, install `libsrt-dev` (or your distro's equivalent) and either rebuild ffmpeg with `--enable-libsrt` or grab a static build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases).
+
+EasyStream picks up the new ffmpeg automatically on next restart (it probes `exec.LookPath("ffmpeg")` plus the standard Homebrew/MacPorts/Linux install paths).
+
 ### Production deployment
 
 Run EasyStream under **launchd** (macOS) or **systemd** (Linux) with restart-on-crash enabled. EasyStream persists operator intent to disk, so if the supervisor crashes mid-broadcast and the service manager restarts it, the stream picks up where it left off — the platform sees a brief reconnect rather than a stream end.

@@ -35,6 +35,7 @@ document.addEventListener("alpine:init", () => {
     schedules:         [],
     overrides:         [],
     encoders:          [],
+    capabilities:      { srt: true }, // assume yes until /api/status disabuses us
 
     // -------- UI state --------
     view:            "dashboard",    // "dashboard" | "settings"
@@ -251,6 +252,7 @@ document.addEventListener("alpine:init", () => {
       this.confidence        = data.confidence || [];
       this.adaptive          = data.adaptive   || this.adaptive;
       this.health            = data.health     || {};
+      this.capabilities      = data.capabilities || this.capabilities;
       this.activeBroadcastId = data.activeBroadcastId || "";
       this.syncFormFromConfig(data.config);
     },

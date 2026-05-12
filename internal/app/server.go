@@ -73,6 +73,11 @@ type Server struct {
 	// hub is the SSE pub/sub: every mutator calls s.publishState() so all
 	// open browser tabs see changes in real time without polling.
 	hub *hub
+
+	// ffmpegCaps is probed once at startup; the UI uses it to disable
+	// destination options that this FFmpeg build doesn't support
+	// (notably SRT, which Homebrew's default formula omits).
+	ffmpegCaps ffmpeg.Capabilities
 }
 
 // markLive persists the operator's intent to be live. Called from every
@@ -240,6 +245,16 @@ func NewServer(cfg ServerConfig) *Server {
 	devScanner := devices.NewScanner(defaultCfg.Binary)
 	adaptive := ffmpeg.NewAdaptiveController(supervisor, ffmpeg.DefaultAdaptiveConfig(), cfg.Logger)
 
+	// Probe optional FFmpeg features once at startup. The UI uses this
+	// to grey out destinations the binary can't actually push to
+	// (Homebrew's default FFmpeg ships without libsrt, so SRT pushes
+	// fail at runtime with a confusing "Protocol not found" — better
+	// to disable the option upfront with a clear hint).
+	ffmpegCaps := ffmpeg.DetectCapabilities(defaultCfg.Binary)
+	if !ffmpegCaps.SRT {
+		cfg.Logger.Printf("ffmpeg: SRT not supported by this build — see README for how to install ffmpeg with libsrt")
+	}
+
 	server := &Server{
 		addr:             cfg.Addr,
 		supervisor:       supervisor,
@@ -256,6 +271,7 @@ func NewServer(cfg ServerConfig) *Server {
 		config:           defaultCfg,
 		healthPollerStop: make(chan struct{}),
 		hub:              newHub(),
+		ffmpegCaps:       ffmpegCaps,
 	}
 	// Supervisor restart events drive both the adaptive controller and an
 	// SSE push so the UI flips to "Reconnecting" instantly.

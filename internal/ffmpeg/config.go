@@ -91,6 +91,49 @@ var knownEncoders = []EncoderInfo{
 	{EncoderQSV, "Intel QuickSync", "Intel GPU hardware encoder", false},
 }
 
+// Capabilities reports which optional FFmpeg features this build
+// supports. Probed once at startup; the UI uses it to gate features
+// (e.g. don't let the operator pick SRT if FFmpeg can't speak it).
+type Capabilities struct {
+	SRT bool `json:"srt"`
+}
+
+// DetectCapabilities runs `ffmpeg -protocols` and reports which
+// optional protocols the binary was built with. Homebrew's default
+// FFmpeg formula on macOS doesn't link against libsrt — without this
+// check the operator only finds out when the stream fails with
+// "Protocol not found" at the wrong moment.
+func DetectCapabilities(binary string) Capabilities {
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, binary, "-hide_banner", "-protocols").CombinedOutput()
+	if err != nil {
+		return Capabilities{}
+	}
+	// `ffmpeg -protocols` prints sections "Input:" and "Output:" with
+	// one protocol per line. We need SRT in the Output section.
+	caps := Capabilities{}
+	inOutput := false
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "Output:" {
+			inOutput = true
+			continue
+		}
+		if trimmed == "Input:" {
+			inOutput = false
+			continue
+		}
+		if inOutput && trimmed == "srt" {
+			caps.SRT = true
+		}
+	}
+	return caps
+}
+
 // DetectEncoders probes ffmpeg for available hardware encoders.
 func DetectEncoders(binary string) []EncoderInfo {
 	if binary == "" {
