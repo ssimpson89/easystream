@@ -6,13 +6,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
+
+	"github.com/ssimpson89/easystream/internal/atomicfile"
 )
 
 const ytScope = "https://www.googleapis.com/auth/youtube"
@@ -56,10 +58,27 @@ func (s *storedToken) toOauth2() *oauth2.Token {
 type Auth struct {
 	cfg       *oauth2.Config
 	tokenFile string
+	logger    *log.Logger // optional; when set, refresh-persistence failures are logged
 
-	mu          sync.Mutex
-	token       *storedToken
-	state       string // CSRF state for the current consent flow
+	mu     sync.Mutex
+	token  *storedToken
+	state  string // CSRF state for the current consent flow
+	client *http.Client
+}
+
+// SetLogger installs a logger so token-refresh persistence failures surface
+// somewhere instead of being silently dropped on disk-full / permission errors.
+//
+// Takes a.mu because persistTokenSource.Token reads a.logger under the same
+// lock; an unlocked write here is a data race even though in practice we
+// only call SetLogger at startup.
+func (a *Auth) SetLogger(l *log.Logger) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.logger = l
+	a.mu.Unlock()
 }
 
 // NewAuth creates an Auth that stores tokens at tokenFile.
@@ -80,11 +99,6 @@ func NewAuth(clientID, clientSecret, redirectURI, tokenFile string) *Auth {
 	}
 	_ = a.loadToken()
 	return a
-}
-
-// Configured returns true if YouTube OAuth credentials are set.
-func (a *Auth) Configured() bool {
-	return a != nil && a.cfg != nil
 }
 
 // IsAuthenticated returns true if we have a refresh token.
@@ -157,6 +171,10 @@ func (a *Auth) Exchange(code, state string) error {
 		Expiry:       tok.Expiry,
 	}
 	a.state = ""
+	// Invalidate the cached HTTP client. It holds a TokenSource bound to
+	// the old token snapshot; using it after re-auth would keep talking
+	// to YouTube as the previous identity until the next Logout.
+	a.client = nil
 	a.mu.Unlock()
 
 	// Fetch channel info with the new token (non-fatal if it fails).
@@ -165,24 +183,31 @@ func (a *Auth) Exchange(code, state string) error {
 	return a.saveToken()
 }
 
-// HTTPClient returns an *http.Client with automatic token refresh.
-// The oauth2 library transparently refreshes the access token when it's
-// near expiry. We wrap its TokenSource so refreshed tokens get persisted.
+// HTTPClient returns an *http.Client with automatic token refresh. The
+// oauth2 library refreshes near expiry; persistTokenSource writes the
+// refreshed token to disk. The client is cached for the lifetime of the
+// stored token so we don't rebuild the OAuth pipeline on every API call.
 func (a *Auth) HTTPClient() (*http.Client, error) {
 	if a == nil {
 		return nil, fmt.Errorf("youtube auth not configured")
 	}
 	a.mu.Lock()
 	stored := a.token
+	cached := a.client
 	a.mu.Unlock()
 	if stored == nil || stored.RefreshToken == "" {
 		return nil, fmt.Errorf("not authenticated with YouTube")
 	}
-
+	if cached != nil {
+		return cached, nil
+	}
 	src := a.cfg.TokenSource(context.Background(), stored.toOauth2())
 	persistSrc := &persistTokenSource{src: src, auth: a}
 	client := oauth2.NewClient(context.Background(), persistSrc)
 	client.Timeout = 30 * time.Second
+	a.mu.Lock()
+	a.client = client
+	a.mu.Unlock()
 	return client, nil
 }
 
@@ -219,6 +244,7 @@ func (a *Auth) Logout() error {
 	}
 	a.mu.Lock()
 	a.token = nil
+	a.client = nil
 	a.mu.Unlock()
 	_ = os.Remove(a.tokenFile)
 	return nil
@@ -257,8 +283,11 @@ func (p *persistTokenSource) Token() (*oauth2.Token, error) {
 			ChannelName:  channelName,
 			ChannelID:    channelID,
 		}
+		logger := p.auth.logger
 		p.auth.mu.Unlock()
-		_ = p.auth.saveToken()
+		if err := p.auth.saveToken(); err != nil && logger != nil {
+			logger.Printf("youtube: failed to persist refreshed token: %v", err)
+		}
 	} else {
 		p.auth.mu.Unlock()
 	}
@@ -324,14 +353,11 @@ func (a *Auth) saveToken() error {
 	if tok == nil {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(a.tokenFile), 0700); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(tok, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(a.tokenFile, data, 0600)
+	return atomicfile.Write(a.tokenFile, data, 0600)
 }
 
 func randomState() string {

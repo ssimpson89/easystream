@@ -53,13 +53,13 @@ func DefaultAdaptiveConfig() AdaptiveConfig {
 
 // AdaptiveState is the controller's externally visible status.
 type AdaptiveState struct {
-	Enabled         bool      `json:"enabled"`
-	OriginalPreset  string    `json:"originalPreset,omitempty"`
-	ActivePreset    string    `json:"activePreset,omitempty"`
-	Reason          string    `json:"reason,omitempty"`
-	DowngradeCount  int       `json:"downgradeCount"`
-	LastTransition  time.Time `json:"lastTransition,omitempty"`
-	IsFallback      bool      `json:"isFallback"`
+	Enabled        bool      `json:"enabled"`
+	OriginalPreset string    `json:"originalPreset,omitempty"`
+	ActivePreset   string    `json:"activePreset,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	DowngradeCount int       `json:"downgradeCount"`
+	LastTransition time.Time `json:"lastTransition,omitempty"`
+	IsFallback     bool      `json:"isFallback"`
 }
 
 // AdaptiveController watches a Supervisor's progress and adjusts quality.

@@ -1,100 +1,107 @@
-// EasyStream — Alpine.js front-end.
+// EasyStream — Alpine.js component.
 //
-// Single reactive component holds all state. Polls /api/status every 2s and
-// mirrors the result into reactive properties. The DOM binds declaratively
-// via x-show, x-bind, x-text, x-model etc., so we never call querySelector
-// from rendering code.
+// State model:
+//   - Server-sourced state lives in this.server.* (read-only from UI POV).
+//     It is replaced atomically by SSE pushes, never patched in place.
+//   - The "form" inputs (selectedPreset, ingestUrl, etc.) mirror server
+//     state but track their own dirty flag so an SSE push from another
+//     tab doesn't clobber what the user is actively typing.
+//   - Pure formatting helpers live in format.js; capture-source helpers
+//     in sources.js; WebRTC preview in preview.js.
 //
-// WebRTC and the clipboard API stay imperative — they're exposed as methods
-// on the component and called from Alpine event handlers.
+// Real-time:
+//   /api/stream/state is an SSE stream. We subscribe once on init and
+//   replace local state when frames arrive. A small "safety net" full
+//   reload every 30 s catches any pathological cases.
+const F = window.EasyStreamFormat;
+const S = window.EasyStreamSources;
 
 document.addEventListener("alpine:init", () => {
   Alpine.data("app", () => ({
 
-    // ============================================================
-    // SERVER-SOURCED STATE (refreshed every 2s)
-    // ============================================================
-    stream: { state: "idle", lastProgress: {}, restartCount: 0 },
-    app: { version: "dev", commit: "", date: "" },
-    config: null,
-    youtube: { authenticated: false, configured: false, channelName: "" },
-    scheduler: null,
-    nextEvents: [],
-    presets: [],
-    confidence: [],
-    adaptive: { enabled: true, isFallback: false },
-    health: {},
+    // -------- Server-sourced state (replaced wholesale by SSE) --------
+    stream:            { state: "idle", lastProgress: {}, restartCount: 0 },
+    app:               { version: "dev" },
+    config:            null,
+    youtube:           { authenticated: false, configured: false, channelName: "" },
+    scheduler:         null,
+    nextEvents:        [],
+    presets:           [],
+    confidence:        [],
+    adaptive:          { enabled: true, isFallback: false },
+    health:            {},
     activeBroadcastId: "",
-    devices: { video: [], audio: [] },
-    schedules: [],
-    overrides: [],
+    devices:           { video: [], audio: [] },
+    schedules:         [],
+    overrides:         [],
+    encoders:          [],
+    capabilities:      { srt: true }, // assume yes until /api/status disabuses us
 
-    // ============================================================
-    // UI STATE
-    // ============================================================
-    view: "dashboard",
-    presetMenuOpen: false,
-    schedFormOpen: false,
-    ovrFormOpen: false,
-    stopConfirm: false,
-    toast: "",
+    // -------- UI state --------
+    view:            "dashboard",    // "dashboard" | "settings"
+    settingsTab:     "source",       // "source" | "quality" | "youtube" | "schedule" | "destination"
+    presetMenuOpen:  false,
+    schedFormOpen:   false,
+    ovrFormOpen:     false,
+    stopConfirm:     false,
+    advancedOpen:    false,
+    toast:           "",
     deviceStatusText: "Scanning for devices...",
+    connectionOK:    true,
+    nowTick:         Date.now(),     // refreshed every second for live timers
 
-    ytModal: { open: false, title: "Live Stream", privacy: "unlisted", warn: "", busy: false },
+    ytModal:     { open: false, title: "Live Stream", privacy: "unlisted", warn: "", busy: false },
     customModal: { open: false, warn: "", busy: false },
 
-    // Preview
-    previewVisible: true,        // user wants the preview pane open
-    previewError: "",
-    previewSuppressed: false,    // user explicitly hid it
-    audioMeterLevel: 0,
-    audioMeterPeak: 0,
-    audioMeterText: "No audio",
+    // Preview controller (instance assigned in init)
+    preview:        null,
+    previewVisible: true,
+    previewError:   "",
+    audioMeterLevel:  0,
+    audioMeterPeak:   0,
+    audioMeterText:   "No audio",
     audioMeterActive: false,
 
-    // Form mirror of server config (auto-saved on change)
+    // Form mirror — kept in sync with server unless dirty=true.
     videoSourceValue: "",
     audioSourceValue: "",
-    selectedPreset: "recommended",
-    selectedEncoder: "libx264",
-    encoders: [],
-    outputMode: "rtmp",
-    ingestUrl: "",
-    streamKey: "",
-    hasStreamKey: false,
-    hlsUrl: "http://127.0.0.1:8080/hls/stream.m3u8",
+    selectedPreset:   "recommended",
+    selectedEncoder:  "libx264",
+    outputMode:       "rtmp",
+    ingestUrl:        "",
+    streamKey:        "",
+    hasStreamKey:     false,
+    enableHls:        false,
+    hlsUrl:           "http://127.0.0.1:8080/hls/stream.m3u8",
 
-    schedForm: { name: "", days: [], time: "08:45", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted" },
-    ovrForm: { name: "", wallClock: "", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted" },
+    // Dirty flags — set when the user is actively editing a field.
+    // SSE state pushes respect these so we never overwrite a key the
+    // user is typing. Cleared after a save round-trip.
+    _dirtyIngest:    false,
+    _dirtyStreamKey: false,
+    _dirtyAudio:     false,
+    _dirtyVideo:     false,
+
+    schedForm: { id: "", name: "", days: [], time: "09:00", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted", enabled: true },
+    ovrForm:   { id: "", name: "", wallClock: "", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted" },
 
     // Internal
-    _previewPC: null,
-    _previewTimeout: null,
-    _previewStarting: false,
-    _audioMeterInterval: null,
-    _audioMeterLastEnergy: null,
-    _audioMeterLastDuration: null,
-    _audioMeterPeakHold: 0,
-    _audioMeterContext: null,
-    _audioMeterSource: null,
-    _audioMeterAnalyser: null,
-    _audioMeterGain: null,
-    _audioMeterData: null,
-    _configLoaded: false,
-    _wasLive: false,
-    _stopTimer: null,
-    _toastTimer: null,
-    _statusInterval: null,
-    _deviceInterval: null,
+    _eventSource:   null,
+    _savePending:   null,
+    _toastTimer:    null,
+    _stopTimer:     null,
+    _safetyPoll:    null,
+    _nowTimer:      null,
+    _wasLive:       false,
 
     dayList: [
-      { value: "sunday",    label: "Sun" },
-      { value: "monday",    label: "Mon" },
-      { value: "tuesday",   label: "Tue" },
-      { value: "wednesday", label: "Wed" },
-      { value: "thursday",  label: "Thu" },
-      { value: "friday",    label: "Fri" },
-      { value: "saturday",  label: "Sat" },
+      { value: "sunday",    label: "Sun", fullLabel: "Sunday" },
+      { value: "monday",    label: "Mon", fullLabel: "Monday" },
+      { value: "tuesday",   label: "Tue", fullLabel: "Tuesday" },
+      { value: "wednesday", label: "Wed", fullLabel: "Wednesday" },
+      { value: "thursday",  label: "Thu", fullLabel: "Thursday" },
+      { value: "friday",    label: "Fri", fullLabel: "Friday" },
+      { value: "saturday",  label: "Sat", fullLabel: "Saturday" },
     ],
     tzList: [
       { value: "America/Chicago",     label: "Central (CST/CDT)" },
@@ -106,19 +113,12 @@ document.addEventListener("alpine:init", () => {
       { value: "America/Anchorage",   label: "Alaska (AKST/AKDT)" },
       { value: "UTC",                 label: "UTC" },
     ],
-    tzListShort: [
-      { value: "America/Chicago",     label: "Central (CST/CDT)" },
-      { value: "America/New_York",    label: "Eastern (EST/EDT)" },
-      { value: "America/Denver",      label: "Mountain (MST/MDT)" },
-      { value: "America/Los_Angeles", label: "Pacific (PST/PDT)" },
-      { value: "UTC",                 label: "UTC" },
-    ],
 
     // ============================================================
-    // INIT / LIFECYCLE
+    // INIT
     // ============================================================
     async init() {
-      // Browser timezone as schedForm default (overridden later by user).
+      // Pre-fill schedule timezone from the browser if it's one we list.
       try {
         const browserTZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
         if (this.tzList.some((t) => t.value === browserTZ)) {
@@ -127,30 +127,39 @@ document.addEventListener("alpine:init", () => {
         }
       } catch (_) {}
 
-      // Initial loads — scan encoders first so the <select> has options
-      // before syncConfigToForm sets the selected value. Otherwise Alpine
-      // resets selectedEncoder to the first option ("libx264") because no
-      // matching <option> exists yet.
+      // One-shot fetches for things not pushed via SSE.
       await this.scanEncoders();
-      await this.refresh();
-      this._initDone = true;
-      this.loadSchedules();
-      this.loadOverrides();
-      this.scanDevices();
+      await this.scanDevices();
 
-      // Polling
-      this._statusInterval = setInterval(() => this.refresh(), 2000);
-      this._deviceInterval = setInterval(() => this.scanDevices(false), 5000);
+      // Connect to SSE — replaces 2-second polling entirely.
+      this.connectSSE();
 
-      // Track previous live state so we only act on actual transitions,
-      // not on every reactive re-evaluation (refresh() reassigns this.stream
-      // every 2s, which can re-trigger $watch even when isLive stays false).
+      // Safety-net active probe every 30 s. ensureSSEHealthy() checks
+      // readyState rather than the soft connectionOK flag — a half-open
+      // socket whose error never fired (mobile background eviction)
+      // would otherwise sit stale.
+      this._safetyPoll = setInterval(() => this.ensureSSEHealthy(), 30000);
+
+      // Mobile browsers throttle and often kill SSE on background. When
+      // the tab returns, reconnect immediately so we don't show stale
+      // data while waiting for the safety poll.
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) this.ensureSSEHealthy();
+      });
+
+      // Live-timer tick. Only running when a uptime/countdown is
+      // visible — gates on isLive or having a next event.
+      this.updateNowTimer();
+      this.$watch("isLive",         () => this.updateNowTimer());
+      this.$watch("nextEvent",      () => this.updateNowTimer());
+
+      // Watch isLive transitions to update title, favicon, preview, and
+      // any in-flight stop confirmation. Only act on real transitions
+      // (Alpine $watch fires on every reassignment of stream).
       this._wasLive = this.isLive;
-      this.$watch("isLive", (now) => {
-        const prev = this._wasLive;
+      this.$watch("isLive", (now, prev) => {
+        if (now === prev) return;
         this._wasLive = now;
-        if (now === prev) return; // no real transition
-
         document.title = now ? "● LIVE · EasyStream" : "EasyStream";
         const favicon = document.querySelector("#favicon");
         if (favicon) {
@@ -158,60 +167,181 @@ document.addEventListener("alpine:init", () => {
             ? "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230d1117'/%3E%3Ccircle cx='8' cy='8' r='5' fill='%23ff1a1a'/%3E%3C/svg%3E"
             : "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230d1117'/%3E%3Cpath d='M5 4 L12 8 L5 12 Z' fill='%232f81f7'/%3E%3C/svg%3E";
         }
-
-        if (now && this.previewVisible && !this.previewSuppressed) {
-          // Going live — keep an existing preview connected if possible. If
-          // the preview was not connected, start a passive live preview session
-          // after the main stream has begun feeding RTP.
-          setTimeout(() => {
-            if (!this.isLive || !this.previewVisible || this.previewSuppressed) return;
-            if (!this._previewPC) {
-              this.startPreview();
-              return;
-            }
-            const pc = this._previewPC;
-            const receivers = pc.getReceivers ? pc.getReceivers() : [];
-            for (const r of receivers) {
-              if (r.track && r.track.kind === "audio") {
-                this.attachAudioMeterTrack(r.track);
-                break;
-              }
-            }
-          }, 1500);
+        // If the stream stops while the operator was mid-confirm, drop
+        // the confirm state — the banner is about to unmount.
+        if (!now) {
+          this.stopConfirm = false;
+          clearTimeout(this._stopTimer);
         }
-
-        if (!now && this.previewVisible && !this.previewSuppressed) {
-          // Going idle — refresh the full PeerConnection after preview
-          // FFmpeg has had time to start via Unblock().
-          setTimeout(() => {
-            if (this.isLive) return;
-            if (!this.previewVisible || this.previewSuppressed) return;
-            this.refreshPreview();
-          }, 2000);
+        // After main-stream FFmpeg or preview FFmpeg has swapped over,
+        // re-establish the preview PeerConnection so packets flow. Only
+        // do this when the preview controller already has a connection
+        // — the init path handles cold start.
+        if (this.previewVisible && this.preview?.isRunning()) {
+          setTimeout(() => this.preview?.refresh(), 1500);
         }
       });
 
-      // Tear down WebRTC PC on tab close.
-      window.addEventListener("beforeunload", () => this.stopPreviewPC());
-      window.addEventListener("pointerdown", () => this.resumeAudioMeterContext(), { passive: true });
-      window.addEventListener("keydown", () => this.resumeAudioMeterContext());
-
-      // Start preview on initial load — idle starts preview FFmpeg, live starts
-      // a passive WebRTC session fed by the main stream.
-      this.$nextTick(() => {
-        this.maybeStartPreview();
+      // Preview controller — bridges WebRTC + audio meter into reactive state.
+      this.preview = window.EasyStreamPreview.create({
+        videoEl: this.$refs.previewVideo,
+        onAudioLevel: (level, peak, text, active) => {
+          this.audioMeterLevel = level;
+          this.audioMeterPeak = peak;
+          this.audioMeterText = text;
+          this.audioMeterActive = active;
+        },
+        onError: (msg) => { this.previewError = msg; },
       });
+      window.addEventListener("pointerdown", () => this.preview?.resumeAudio(), { passive: true });
+      window.addEventListener("keydown",      () => this.preview?.resumeAudio());
+      window.addEventListener("beforeunload", () => this.preview?.stop());
+
+      // Initial preview start. The $watch(isLive) above only acts on
+      // transitions; the very first paint needs an explicit start.
+      // preview.start() is idempotent (a `starting` flag inside the
+      // controller prevents the well-known double-fire).
+      if (this.previewVisible) this.$nextTick(() => this.preview?.start());
     },
 
     // ============================================================
-    // COMPUTED
+    // SSE — server-sent state
+    // ============================================================
+    connectSSE() {
+      // Null out the prior listener BEFORE close so a delayed onerror
+      // from the old connection can't flip connectionOK against the new one.
+      if (this._eventSource) {
+        const prev = this._eventSource;
+        prev.onerror = null;
+        try { prev.close(); } catch (_) {}
+        this._eventSource = null;
+      }
+      const es = new EventSource("/api/stream/state");
+      this._eventSource = es;
+      es.addEventListener("state",     (e) => { if (this._eventSource === es) { this.connectionOK = true; this.applyState(JSON.parse(e.data)); }});
+      es.addEventListener("schedules", (e) => { if (this._eventSource === es) { this.connectionOK = true; this.schedules = JSON.parse(e.data) || []; }});
+      es.addEventListener("overrides", (e) => { if (this._eventSource === es) { this.connectionOK = true; this.overrides = JSON.parse(e.data) || []; }});
+      es.addEventListener("open",      ()  => { if (this._eventSource === es) { this.connectionOK = true; }});
+      es.onerror = () => {
+        // EventSource auto-reconnects with the `retry:` hint. Mark
+        // disconnected so the topbar pill turns yellow.
+        if (this._eventSource === es) this.connectionOK = false;
+      };
+    },
+
+    // ensureSSEHealthy is called from the safety-poll interval and on
+    // visibilitychange. It actively probes EventSource.readyState rather
+    // than relying on a connectionOK flag that a half-open connection
+    // may never have cleared.
+    ensureSSEHealthy() {
+      const es = this._eventSource;
+      if (!es || es.readyState === EventSource.CLOSED) {
+        this.connectSSE();
+      }
+    },
+
+    applyState(data) {
+      // Replace, don't merge — server is authoritative.
+      this.stream            = data.stream     || this.stream;
+      this.app               = data.app        || this.app;
+      this.config            = data.config     || this.config;
+      this.youtube           = data.youtube    || this.youtube;
+      this.scheduler         = data.scheduler  || null;
+      this.nextEvents        = data.nextEvents || [];
+      this.presets           = data.presets    || [];
+      this.confidence        = data.confidence || [];
+      this.adaptive          = data.adaptive   || this.adaptive;
+      this.health            = data.health     || {};
+      this.capabilities      = data.capabilities || this.capabilities;
+      this.activeBroadcastId = data.activeBroadcastId || "";
+      this.syncFormFromConfig(data.config);
+    },
+
+    syncFormFromConfig(config) {
+      if (!config) return;
+      // Preset + encoder are non-dirtyable: there's no free-text input,
+      // so server is always authoritative.
+      this.selectedPreset  = config.preset?.id || this.selectedPreset;
+      this.selectedEncoder = config.encoder || "libx264";
+      this.hasStreamKey    = !!config.hasStreamKey;
+      // Migrate legacy outputMode=hls (older daemons or saved configs)
+      // to the new shape: primary=rtmp + enableHls=true.
+      let mode = config.outputMode || "rtmp";
+      if (mode === "hls") { mode = "rtmp"; this.enableHls = true; }
+      this.outputMode      = mode;
+      this.enableHls       = !!config.enableHls || this.enableHls;
+      if (config.hlsUrl) this.hlsUrl = config.hlsUrl;
+      // Free-text fields: respect dirty flag so an SSE push doesn't
+      // overwrite what the user is actively typing or selecting.
+      if (!this._dirtyIngest) this.ingestUrl = config.ingestUrl || "";
+      // streamKey is write-only: server never sends it back.
+
+      // Re-resolve the video source by name in case AVFoundation indexes
+      // shifted. Skip the re-encode when the current selection already
+      // decodes to the same kind/backend/device — avoids dropdown flicker
+      // when two devices share a name and .find() picks the first one.
+      if (!this._dirtyVideo) {
+        const encoded = S.encodeSourceValue(config.input, this.devices);
+        if (encoded && encoded !== this.videoSourceValue) {
+          // Only accept the new value if it actually decodes differently.
+          const cur = S.decodeSourceValue(this.videoSourceValue);
+          const next = S.decodeSourceValue(encoded);
+          const sameTriple = cur && next &&
+            cur.kind === next.kind && cur.backend === next.backend && cur.videoDevice === next.videoDevice;
+          if (!sameTriple) {
+            this.videoSourceValue = encoded;
+            this.$nextTick(() => this.syncSelectElements());
+          }
+        }
+      }
+      if (!this._dirtyAudio) {
+        this.audioSourceValue = config.input?.audioDevice || "";
+      }
+    },
+
+    // ============================================================
+    // API + one-shot fetches
+    // ============================================================
+    async api(path, options = {}) {
+      const headers = {};
+      if (options.body) headers["content-type"] = "application/json";
+      const resp = await fetch(path, { ...options, headers });
+      const body = await resp.json();
+      if (!resp.ok) throw new Error(body.error || "Request failed");
+      return body;
+    },
+
+    async scanDevices(force) {
+      try {
+        const url = `/api/devices${force ? "?refresh=1" : ""}`;
+        const data = await this.api(url);
+        this.devices = data;
+        const v = (data.video || []).length;
+        const a = (data.audio || []).length;
+        this.deviceStatusText = v === 0
+          ? "No video devices detected. Connect a camera or capture card and click Refresh."
+          : `${v} video, ${a} audio detected.`;
+        // Resolve source value by name now that device list is loaded.
+        if (this.config?.input) this.syncFormFromConfig(this.config);
+      } catch (e) {
+        this.deviceStatusText = "Device scan failed.";
+      }
+    },
+
+    async scanEncoders() {
+      try {
+        const data = await this.api("/api/encoders");
+        this.encoders = (data || []).filter((e) => e.available);
+      } catch (_) {}
+    },
+
+    // ============================================================
+    // COMPUTED — derived from state
     // ============================================================
     get isLive() {
       return ["starting", "running", "degraded", "restarting"].includes(this.stream.state);
     },
-    get videoOK() {
-      return !!this.videoSourceValue;
-    },
+    get videoOK() { return !!this.videoSourceValue; },
     get hasCustomDest() {
       if (!this.ingestUrl) return false;
       if (this.outputMode === "hls") return true;
@@ -235,59 +365,20 @@ document.addEventListener("alpine:init", () => {
       const e = this.scheduler?.activeEndsAt;
       return e && !e.startsWith("0001-01-01") ? new Date(e) : null;
     },
-    get activeEventName() {
-      return this.scheduler?.activeEventName || "";
+    get activeEventName() { return this.scheduler?.activeEventName || ""; },
+    get liveHeadline()    { return this.activeEventName || "Live stream"; },
+    get liveUptime() {
+      // Touch nowTick so this getter re-runs every second.
+      void this.nowTick;
+      return F.elapsedSince(this.startedAt);
     },
-    get liveHeadline() {
-      return this.activeEventName || "Live stream";
-    },
-    get liveMeta() {
-      const parts = [];
-      if (this.startedAt) parts.push(`Started ${this.fmtTime(this.startedAt)}`);
-      if (this.scheduleEndsAt) parts.push(`ends ${this.fmtTime(this.scheduleEndsAt)}`);
-      return parts.join(" · ") || "Streaming";
-    },
-    get liveBannerEvent() {
-      return this.activeEventName ? `· ${this.activeEventName}` : "";
-    },
-    get liveBannerTime() {
-      return this.startedAt ? `started ${this.fmtTime(this.startedAt)}` : "";
-    },
-    get liveHealthParts() {
-      const parts = [];
-      let dest;
-      if (this.activeBroadcastId) dest = "LIVE on YouTube";
-      else if (this.outputMode === "hls") dest = "Streaming to local HLS playlist";
-      else {
-        const platform = this.platformFromURL(this.ingestUrl);
-        dest = platform ? `Streaming to ${platform}` : "Streaming to custom server";
-      }
-      parts.push({ text: dest });
-
-      const conf = (this.confidence || []).reduce((a, c) => (a[c.label] = c, a), {});
-      const enc = conf.Encoder;
-      if (enc?.status === "green" || enc?.status === "yellow") parts.push({ text: "Receiving video" });
-      else if (enc?.status === "red") parts.push({ text: "Video problem" });
-      else parts.push({ text: "Sending video..." });
-
-      const aud = conf.Audio;
-      if (aud?.status === "green") parts.push({ text: "Audio detected" });
-      else if (aud?.status === "yellow") parts.push({ text: "Audio very quiet" });
-      else if (aud?.status === "red") parts.push({ text: "No audio" });
-      else parts.push({ text: "Waiting for audio..." });
-
-      return parts;
-    },
-    get liveHealthSeverity() {
-      let worst = "green";
-      for (const c of (this.confidence || [])) {
-        if (c.status === "red") return "failed";
-        if (c.status === "yellow") worst = "degraded";
-      }
-      return worst === "green" ? "" : worst;
-    },
-    get nextEvent() {
-      return this.nextEvents[0] || null;
+    get liveEndsAt()      { return this.scheduleEndsAt ? F.fmtTime(this.scheduleEndsAt) : null; },
+    get nextEvent()       { return this.nextEvents[0] || null; },
+    get nextEventCountdown() {
+      if (!this.nextEvent) return "";
+      // Read nowTick so this re-evaluates every second.
+      void this.nowTick;
+      return F.relativeUntil(new Date(this.nextEvent.startTime));
     },
     get canStartScheduledNow() {
       if (!this.nextEvent) return false;
@@ -299,15 +390,10 @@ document.addEventListener("alpine:init", () => {
       const extra = this.scheduler?.extraMinutes || 0;
       return extra > 0 ? `+15 min (extended ${extra}m)` : "+15 min";
     },
-    get showExtendButton() {
-      return !!this.activeEventName;
-    },
+    get showExtendButton() { return !!this.activeEventName; },
     get bitrateText() {
       const k = this.stream.lastProgress?.bitrateKbps;
       return k ? `${Math.round(k)} kbps` : "-";
-    },
-    get logLineText() {
-      return this.stream.lastError || this.stream.lastExit || this.stream.lastLogLine || "Stream is live.";
     },
     get problemTitle() {
       return {
@@ -319,623 +405,185 @@ document.addEventListener("alpine:init", () => {
     get problemDetail() {
       return this.stream.lastError || this.stream.lastExit || this.stream.lastLogLine || "Check your network and capture source.";
     },
+    get problemVisible() {
+      return ["degraded", "restarting", "failed"].includes(this.stream.state);
+    },
     get idleLabel() {
       return {
-        idle: "Idle",
-        stopping: "Stopping",
-        failed: "Stopped",
-      }[this.stream.state] || "Idle";
+        idle: "Ready", stopping: "Stopping", failed: "Stopped",
+      }[this.stream.state] || "Ready";
     },
     get idleDetail() {
       if (this.stream.state === "stopping") return "Stopping encoder...";
       if (this.stream.state === "failed") return this.stream.lastError || this.stream.lastExit || "Last attempt did not complete.";
       return "Ready to stream.";
     },
-    get currentPreset() {
-      return this.presets.find((p) => p.id === this.selectedPreset);
+    get currentPreset() { return this.presets.find((p) => p.id === this.selectedPreset); },
+    get isSDISource()   { return S.decodeSourceValue(this.videoSourceValue)?.kind === "sdi"; },
+    get destinationLabel() {
+      if (this.activeBroadcastId) return "YouTube";
+      if (this.outputMode === "hls") return "Local HLS";
+      return F.platformFromURL(this.ingestUrl) || "Custom RTMP";
     },
     get customDestLabel() {
-      if (this.outputMode === "hls") return `Local HLS playlist · ${this.hlsUrl}`;
-      const platform = this.platformFromURL(this.ingestUrl);
+      if (this.outputMode === "hls") return `Local HLS · ${this.hlsUrl}`;
+      const platform = F.platformFromURL(this.ingestUrl);
       return platform ? `${platform} · ${this.ingestUrl}` : (this.ingestUrl || "(not set)");
     },
-    get isSDISource() {
-      return this.decodeSourceValue(this.videoSourceValue)?.kind === "sdi";
-    },
 
-    // ============================================================
-    // POLLING / API CALLS
-    // ============================================================
-    async api(path, options = {}) {
-      const headers = {};
-      if (options.body) headers["content-type"] = "application/json";
-      const resp = await fetch(path, { ...options, headers });
-      const body = await resp.json();
-      if (!resp.ok) throw new Error(body.error || "Request failed");
-      return body;
-    },
-
-    async refresh() {
-      try {
-        const data = await this.api("/api/status");
-        this.stream = data.stream || this.stream;
-        this.app = data.app || this.app;
-        this.config = data.config;
-        this.youtube = data.youtube || this.youtube;
-        this.scheduler = data.scheduler || null;
-        this.nextEvents = data.nextEvents || [];
-        this.presets = data.presets || [];
-        this.confidence = data.confidence || [];
-        this.adaptive = data.adaptive || this.adaptive;
-        this.health = data.health || {};
-        this.activeBroadcastId = data.activeBroadcastId || "";
-
-        if (data.config && (!this._configLoaded || !this.videoSourceValue)) {
-          this.syncConfigToForm(data.config);
-        }
-        // Keep encoder in sync with backend on every poll — the encoder
-        // select is side-effect-free so this won't trigger saves.
-        if (data.config?.encoder) {
-          this.selectedEncoder = data.config.encoder;
-        }
-      } catch (e) {
-        this.showToast("Connection error: " + e.message);
-      }
-    },
-
-    async scanDevices(force) {
-      try {
-        const url = `/api/devices${force ? "?refresh=1" : ""}`;
-        const data = await this.api(url);
-        this.devices = data;
-        // Re-resolve the video source value by device name in case
-        // AVFoundation indexes shifted since last scan.
-        if (this.config?.input?.videoDeviceName && (data.video || []).length > 0) {
-          const resolved = this.encodeSourceValue(this.config.input);
-          if (resolved && resolved !== this.videoSourceValue) {
-            this.videoSourceValue = resolved;
-          }
-        }
-        this.$nextTick(() => this.syncSelectElements());
-        const v = (data.video || []).length;
-        const a = (data.audio || []).length;
-        this.deviceStatusText = v === 0
-          ? "No video devices detected. Connect a camera or capture card and click Refresh."
-          : `${v} video, ${a} audio detected.`;
-      } catch (_) {}
-    },
-
-    async scanEncoders() {
-      try {
-        const data = await this.api("/api/encoders");
-        this.encoders = (data || []).filter((e) => e.available);
-      } catch (_) {}
-    },
-    onEncoderChange() {
-      // Skip saves triggered by Alpine reactivity during init —
-      // only save when the user explicitly changes the select.
-      if (!this._initDone) return;
-      this.saveConfig().then(() => this.showToast("Encoder saved"));
-    },
-    encoderDescription() {
-      const enc = this.encoders.find((e) => e.id === this.selectedEncoder);
-      return enc ? enc.description : "";
-    },
-
-    async loadSchedules() {
-      try {
-        const data = await this.api("/api/schedules");
-        this.schedules = data || [];
-      } catch (_) {}
-    },
-
-    async loadOverrides() {
-      try {
-        const data = await this.api("/api/overrides");
-        this.overrides = data || [];
-      } catch (_) {}
-    },
-
-    // ============================================================
-    // PREVIEW (WebRTC, imperative)
-    //
-    // The server-side swaps the RTP source between the preview's own ffmpeg
-    // (idle) and the main stream's preview output (live). The UI reconnects
-    // on the transition to live so the browser picks up the pipe feed.
-    // ============================================================
-    togglePreview() {
-      this.previewVisible = !this.previewVisible;
-      this.previewSuppressed = !this.previewVisible;
-      if (this.previewVisible) {
-        this.maybeStartPreview();
+    // Pre-flight status rows. Color + icon + text so a single channel
+    // failure (e.g. color-blind operator on a sanctuary projector) never
+    // hides the signal.
+    get preflightRows() {
+      // Video source: verify the saved device name is actually present
+      // in the live device list. If not, surface RED so the operator
+      // sees the problem BEFORE the scheduled go-live silently fails
+      // its preflight server-side. This is layer 1 of the
+      // sticky-source defense.
+      let v;
+      if (!this.videoOK) {
+        v = { icon: "video", label: "Video", status: "red", detail: "No video source picked" };
+      } else if (this.videoSourceValue === "test-video::") {
+        v = { icon: "video", label: "Video", status: "green", detail: "Test pattern" };
       } else {
-        this.stopPreviewPC();
-        this.previewError = "";
-      }
-    },
-
-    maybeStartPreview() {
-      if (!this.previewVisible) return;
-      if (this._previewPC || this._previewStarting) return;
-      this.startPreview();
-    },
-
-    refreshPreview() {
-      this.previewError = "";
-      this.stopPreviewPC();
-      this.$nextTick(() => this.startPreview());
-    },
-
-    async startPreview() {
-      if (this._previewStarting) return;
-      this._previewStarting = true;
-      try {
-        this.stopPreviewPC();
-
-        const pc = new RTCPeerConnection();
-        this._previewPC = pc;
-        pc.addTransceiver("video", { direction: "recvonly" });
-        pc.addTransceiver("audio", { direction: "recvonly" });
-        this.startAudioMeter(pc);
-        pc.ontrack = (e) => this.handlePreviewTrack(e);
-
-        // Connect timeout only — once connected, we don't tear down on
-        // transient ICE disconnects. The transient state is recoverable
-        // and reconnecting would cause visible video stutter.
-        let connected = false;
-        clearTimeout(this._previewTimeout);
-        this._previewTimeout = setTimeout(() => {
-          if (!connected && this._previewPC === pc) {
-            this.previewError = "Could not connect to preview. Click Refresh to try again.";
-            this.stopPreviewPC();
-          }
-        }, 10000);
-
-        pc.oniceconnectionstatechange = () => {
-          if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
-            connected = true;
-            clearTimeout(this._previewTimeout);
-          } else if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "closed") {
-            if (this._previewPC === pc) {
-              this.previewError = "Preview disconnected. Click Refresh.";
-              this.stopPreviewPC();
-            }
-          }
-        };
-
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        const resp = await fetch("/api/preview/webrtc/offer", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(pc.localDescription),
-        });
-        if (!resp.ok) {
-          const t = await resp.text();
-          throw new Error(t || `HTTP ${resp.status}`);
-        }
-        const answer = await resp.json();
-        await pc.setRemoteDescription(answer);
-      } catch (e) {
-        this.previewError = `Preview connection failed: ${e.message}`;
-        this.stopPreviewPC();
-      } finally {
-        this._previewStarting = false;
-      }
-    },
-
-    stopPreviewPC() {
-      clearTimeout(this._previewTimeout);
-      this.stopAudioMeter();
-      if (this._previewPC) {
-        try { this._previewPC.close(); } catch (_) {}
-        this._previewPC = null;
-      }
-      const v = this.$refs.previewVideo;
-      if (v) v.srcObject = null;
-    },
-
-    handlePreviewTrack(e) {
-      const stream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
-      if (e.track.kind === "video") {
-        const v = this.$refs.previewVideo;
-        if (v) v.srcObject = stream;
-      }
-      if (e.track.kind === "audio") {
-        this.attachAudioMeterTrack(e.track);
-      }
-    },
-
-    startAudioMeter(pc) {
-      this.stopAudioMeter();
-      this.audioMeterLevel = 0;
-      this.audioMeterPeak = 0;
-      this.audioMeterText = "Waiting";
-      this.audioMeterActive = false;
-      this._audioMeterPeakHold = 0;
-      this._audioMeterFallbackLevel = null;
-
-      // Stats polling loop (runs every 500ms as a fallback if Web Audio is suspended)
-      this._audioMeterInterval = setInterval(async () => {
-        if (!pc || this._previewPC !== pc) return;
-        try {
-          const stats = await pc.getStats();
-          if (this._previewPC !== pc) return;
-          let statsLevel = null;
-          stats.forEach((report) => {
-            if (report.type !== "inbound-rtp") return;
-            if (report.kind !== "audio" && report.mediaType !== "audio") return;
-            if (typeof report.audioLevel === "number") {
-              statsLevel = report.audioLevel;
-              return;
-            }
-            if (typeof report.totalAudioEnergy !== "number" || typeof report.totalSamplesDuration !== "number") return;
-            if (this._audioMeterLastEnergy == null || this._audioMeterLastDuration == null) {
-              this._audioMeterLastEnergy = report.totalAudioEnergy;
-              this._audioMeterLastDuration = report.totalSamplesDuration;
-              return;
-            }
-            const energyDelta = report.totalAudioEnergy - this._audioMeterLastEnergy;
-            const durationDelta = report.totalSamplesDuration - this._audioMeterLastDuration;
-            this._audioMeterLastEnergy = report.totalAudioEnergy;
-            this._audioMeterLastDuration = report.totalSamplesDuration;
-            if (energyDelta >= 0 && durationDelta > 0) {
-              statsLevel = Math.sqrt(energyDelta / durationDelta);
-            }
-          });
-          if (statsLevel != null) this._audioMeterFallbackLevel = statsLevel;
-        } catch (_) {}
-      }, 500);
-
-      // Fast render loop for smooth UI
-      const render = () => {
-        if (!pc || this._previewPC !== pc) return;
-        this._audioMeterRaf = requestAnimationFrame(render);
-        this.updateAudioMeterRender();
-      };
-      this._audioMeterRaf = requestAnimationFrame(render);
-    },
-
-    stopAudioMeter() {
-      clearInterval(this._audioMeterInterval);
-      cancelAnimationFrame(this._audioMeterRaf);
-      this._audioMeterInterval = null;
-      this._audioMeterRaf = null;
-      this.stopAudioMeterGraph();
-      this._audioMeterLastEnergy = null;
-      this._audioMeterLastDuration = null;
-      this._audioMeterPeakHold = 0;
-      this._audioMeterFallbackLevel = null;
-      this.audioMeterLevel = 0;
-      this.audioMeterPeak = 0;
-      this.audioMeterText = "No audio";
-      this.audioMeterActive = false;
-    },
-
-    attachAudioMeterTrack(track) {
-      this.stopAudioMeterGraph();
-      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextCtor || !track) return;
-      try {
-        const ctx = new AudioContextCtor();
-        const source = ctx.createMediaStreamSource(new MediaStream([track]));
-        const analyser = ctx.createAnalyser();
-        const gain = ctx.createGain();
-        analyser.fftSize = 512;
-        analyser.smoothingTimeConstant = 0.25;
-        gain.gain.value = 0;
-        source.connect(analyser);
-        analyser.connect(gain);
-        gain.connect(ctx.destination); // keeps the graph active while remaining silent
-        this._audioMeterContext = ctx;
-        this._audioMeterSource = source;
-        this._audioMeterAnalyser = analyser;
-        this._audioMeterGain = gain;
-        this._audioMeterData = new Uint8Array(analyser.fftSize);
-        this.resumeAudioMeterContext();
-      } catch (_) {
-        this.stopAudioMeterGraph();
-      }
-    },
-
-    resumeAudioMeterContext() {
-      const ctx = this._audioMeterContext;
-      if (ctx && ctx.state === "suspended") {
-        ctx.resume().catch(() => {});
-      }
-    },
-
-    stopAudioMeterGraph() {
-      try { this._audioMeterSource?.disconnect(); } catch (_) {}
-      try { this._audioMeterAnalyser?.disconnect(); } catch (_) {}
-      try { this._audioMeterGain?.disconnect(); } catch (_) {}
-      const ctx = this._audioMeterContext;
-      if (ctx && ctx.state !== "closed") ctx.close().catch(() => {});
-      this._audioMeterContext = null;
-      this._audioMeterSource = null;
-      this._audioMeterAnalyser = null;
-      this._audioMeterGain = null;
-      this._audioMeterData = null;
-    },
-
-    readAudioMeterLevel() {
-      const analyser = this._audioMeterAnalyser;
-      const data = this._audioMeterData;
-      if (!analyser || !data) return null;
-      if (this._audioMeterContext?.state === "suspended") {
-        this.resumeAudioMeterContext();
-        return null;
-      }
-      analyser.getByteTimeDomainData(data);
-      let max = 0;
-      for (const sample of data) {
-        const val = Math.abs(sample - 128);
-        if (val > max) max = val;
-      }
-      return max / 128;
-    },
-
-    updateAudioMeterRender() {
-      try {
-        let rawLevel = this.readAudioMeterLevel();
-        if (rawLevel == null) rawLevel = this._audioMeterFallbackLevel;
-
-        if (rawLevel == null) {
-          this.audioMeterActive = false;
-          this.audioMeterLevel = Math.max(0, this.audioMeterLevel - 0.05);
-          this.audioMeterPeak = Math.max(0, this.audioMeterPeak - 0.01);
-          this.audioMeterText = "Waiting";
-          return;
-        }
-
-        const clamped = Math.min(1, Math.max(0, rawLevel));
-        const db = clamped > 0 ? 20 * Math.log10(clamped) : -60;
-        const display = Math.min(1, Math.max(0, (db + 60) / 60));
-        
-        // Instant attack, smooth release
-        if (display > this.audioMeterLevel) {
-          this.audioMeterLevel = display;
+        const presence = this.devicePresence("video");
+        if (presence.connected) {
+          v = { icon: "video", label: "Video", status: "green", detail: presence.label };
+        } else if (presence.label) {
+          v = { icon: "video", label: "Video", status: "red",
+                detail: `${presence.label} not detected — plug it in or pick a different source` };
         } else {
-          this.audioMeterLevel = Math.max(0, this.audioMeterLevel - 0.04);
+          v = { icon: "video", label: "Video", status: "yellow", detail: "Saved source not in current device list" };
         }
-        
-        if (display > this._audioMeterPeakHold) {
-          this._audioMeterPeakHold = display;
+      }
+      // Audio source
+      let aSource;
+      if (this.isSDISource) {
+        aSource = { icon: "mic", label: "Audio", status: "green", detail: "Embedded SDI audio" };
+      } else if (!this.audioSourceValue) {
+        aSource = { icon: "mic", label: "Audio", status: "yellow", detail: "No audio source — silence will be sent" };
+      } else {
+        const presence = this.devicePresence("audio");
+        if (presence.connected) {
+          aSource = { icon: "mic", label: "Audio", status: "green", detail: presence.label };
+        } else if (presence.label) {
+          aSource = { icon: "mic", label: "Audio", status: "red",
+                      detail: `${presence.label} not detected` };
         } else {
-          this._audioMeterPeakHold = Math.max(0, this._audioMeterPeakHold - 0.005);
-        }
-        
-        this.audioMeterPeak = this._audioMeterPeakHold;
-        this.audioMeterText = clamped > 0 ? `${Math.round(Math.max(-60, db))} dB` : "-∞ dB";
-        if (clamped > 0.001) this.audioMeterActive = true;
-      } catch (_) {
-        this.audioMeterActive = false;
-        this.audioMeterText = "No audio";
-      }
-    },
-
-    // ============================================================
-    // CAPTURE SOURCE
-    // ============================================================
-    encodeSourceValue(input) {
-      if (!input || input.kind === "test-video") return "test-video::";
-      const kind = input.kind || "webcam";
-      const backend = input.backend || "avfoundation";
-      let device = input.videoDevice || "";
-      // If a device name is persisted and devices are loaded, resolve the
-      // current index by name — AVFoundation indexes can shift between boots.
-      if (input.videoDeviceName && (this.devices.video || []).length > 0) {
-        const match = this.devices.video.find(
-          (d) => d.name === input.videoDeviceName && d.backend === backend
-        );
-        if (match) device = String(match.index);
-      }
-      return `${kind}:${backend}:${device}`;
-    },
-    decodeSourceValue(value) {
-      if (!value) return null;
-      if (value === "test-video::") return { kind: "test-video", backend: "lavfi", videoDevice: "" };
-      const [kind, backend, ...rest] = value.split(":");
-      return { kind, backend, videoDevice: rest.join(":") };
-    },
-    syncConfigToForm(config) {
-      if (!config) return;
-      this.selectedPreset = config.preset.id;
-      this.selectedEncoder = config.encoder || "libx264";
-      this.videoSourceValue = this.encodeSourceValue(config.input);
-      this.audioSourceValue = config.input.audioDevice || "";
-      this.outputMode = config.outputMode || "rtmp";
-      this.ingestUrl = config.ingestUrl || "";
-      this.hasStreamKey = !!config.hasStreamKey;
-      if (config.hlsUrl) this.hlsUrl = config.hlsUrl;
-      this._configLoaded = true;
-      this.$nextTick(() => this.syncSelectElements());
-    },
-    syncSelectElements() {
-      // Native select rendering can miss an x-model value when options arrive
-      // later from /api/devices. Keep the visible control aligned with state.
-      if (this.$refs.videoSourceSelect) this.$refs.videoSourceSelect.value = this.videoSourceValue;
-      if (this.$refs.audioSourceSelect) this.$refs.audioSourceSelect.value = this.audioSourceValue;
-    },
-    kindForDeviceType(type) {
-      switch (type) {
-        case "sdi": return "sdi";
-        case "capture-card": return "hdmi";
-        default: return "webcam";
-      }
-    },
-    deviceGroups() {
-      const labels = {
-        camera:         "Cameras",
-        "capture-card": "Capture cards (USB HDMI)",
-        screen:         "Screen capture",
-        sdi:            "SDI (Blackmagic DeckLink)",
-      };
-      const order = ["camera", "capture-card", "screen", "sdi"];
-      const out = [];
-      for (const t of order) {
-        const matches = (this.devices.video || []).filter((d) => d.type === t);
-        if (matches.length === 0) continue;
-        out.push({
-          label: labels[t],
-          devices: matches.map((d) => ({
-            kind: this.kindForDeviceType(d.type),
-            backend: d.backend,
-            index: d.index,
-            label: d.backend === "decklink" ? d.name : `${d.name} [${d.index}]`,
-          })),
-        });
-      }
-      return out;
-    },
-    videoSourceOptions() {
-      const labels = {
-        camera:         "Cameras",
-        "capture-card": "Capture cards",
-        screen:         "Screen capture",
-        sdi:            "SDI",
-      };
-      const order = ["camera", "capture-card", "screen", "sdi"];
-      const out = [
-        { key: "group:test", value: "__group:test", label: "Test source", disabled: true },
-        { key: "test-video", value: "test-video::", label: "  Test pattern (no hardware)", disabled: false },
-      ];
-      for (const t of order) {
-        const matches = (this.devices.video || []).filter((d) => d.type === t);
-        if (matches.length === 0) continue;
-        out.push({ key: `group:${t}`, value: `__group:${t}`, label: labels[t] || "Video", disabled: true });
-        for (const d of matches) {
-          const kind = this.kindForDeviceType(d.type);
-          const label = d.backend === "decklink" ? d.name : `${d.name} [${d.index}]`;
-          out.push({ key: `${kind}:${d.backend}:${d.index}`, value: `${kind}:${d.backend}:${d.index}`, label: `  ${label}`, disabled: false });
+          aSource = { icon: "mic", label: "Audio", status: "yellow", detail: "Saved audio source not in current device list" };
         }
       }
-      return out;
-    },
-    audioDeviceGroups() {
-      const labels = { microphone: "Microphones", "audio-input": "Audio inputs" };
-      const order = ["microphone", "audio-input"];
-      const out = [];
-      for (const t of order) {
-        const matches = (this.devices.audio || []).filter((d) => d.type === t);
-        if (matches.length === 0) continue;
-        out.push({ label: labels[t], devices: matches });
-      }
-      return out;
-    },
-    audioSourceOptions() {
-      const labels = { microphone: "Microphones", "audio-input": "Audio inputs" };
-      const order = ["microphone", "audio-input"];
-      const out = [{ key: "silent", value: "", label: this.isSDISource ? "Embedded SDI audio" : "None / silent", disabled: false }];
-      for (const t of order) {
-        const matches = (this.devices.audio || []).filter((d) => d.type === t);
-        if (matches.length === 0) continue;
-        out.push({ key: `group:${t}`, value: `__group:${t}`, label: labels[t] || "Audio", disabled: true });
-        for (const d of matches) {
-          out.push({ key: `${t}:${d.index}`, value: d.index, label: `  ${d.name} [${d.index}]`, disabled: false });
-        }
-      }
-      return out;
-    },
-    onVideoSourceChange() {
-      // If we switched to SDI, clear external audio (embedded SDI audio is used).
-      if (this.isSDISource) this.audioSourceValue = "";
-      this.saveConfig();
-      this.refreshPreview();
+      // YouTube
+      const yt = !this.youtube.configured
+        ? { icon: "yt", label: "YouTube", status: "off", detail: "Not configured" }
+        : this.youtube.authenticated
+          ? { icon: "yt", label: "YouTube", status: "green", detail: `Connected as ${this.youtube.channelName || "—"}` }
+          : { icon: "yt", label: "YouTube", status: "yellow", detail: "Not signed in" };
+      return [v, aSource, yt];
     },
 
-    // ============================================================
-    // CONFIG SAVE
-    // ============================================================
-    async saveConfig() {
-      if (!this.videoSourceValue && this.config?.input) {
-        this.videoSourceValue = this.encodeSourceValue(this.config.input);
-        this.audioSourceValue = this.config.input.audioDevice || this.audioSourceValue || "";
-        this.syncSelectElements();
+    // devicePresence checks whether the saved video/audio device is
+    // currently visible in /api/devices. Returns the persisted name as
+    // the label so the operator sees what they picked, and a boolean
+    // for green/red status. Names are matched against the server's
+    // device scan so unplugged hardware shows red.
+    devicePresence(kind) {
+      const cfg = this.config?.input;
+      if (!cfg) return { connected: false, label: "" };
+      const wantName = kind === "video" ? cfg.videoDeviceName : cfg.audioDeviceName;
+      const idx      = kind === "video" ? cfg.videoDevice     : cfg.audioDevice;
+      const backend  = cfg.backend;
+      const list = (this.devices[kind] || []);
+      // Name-based match (the source of truth).
+      if (wantName) {
+        const byName = list.find((d) => d.name === wantName && (!backend || d.backend === backend));
+        if (byName) return { connected: true, label: wantName };
       }
-      const decoded = this.decodeSourceValue(this.videoSourceValue);
-      if (!decoded) {
-        this.showToast("Pick a video source before saving.");
-        return false;
+      // Fall back to index match for legacy configs without a name.
+      if (idx && !wantName) {
+        const byIndex = list.find((d) => String(d.index) === String(idx) && (!backend || d.backend === backend));
+        if (byIndex) return { connected: true, label: byIndex.name };
       }
-      const payload = {
-        presetId: this.selectedPreset,
-        encoder: this.selectedEncoder,
-        ingestUrl: (this.ingestUrl || "").trim(),
-        outputMode: this.outputMode,
-        input: {
-          kind: decoded.kind,
-          backend: decoded.backend,
-          videoDevice: decoded.videoDevice,
-          audioDevice: this.audioSourceValue || "",
-        },
-      };
-      // Persist device names so the backend can resolve stable AVFoundation
-      // indexes by name even when indexes shift between reboots/replugs.
-      const vDev = (this.devices.video || []).find(
-        (d) => String(d.index) === String(decoded.videoDevice) && d.backend === decoded.backend
-      );
-      if (vDev) payload.input.videoDeviceName = vDev.name;
-      const aDev = (this.devices.audio || []).find(
-        (d) => String(d.index) === String(this.audioSourceValue)
-      );
-      if (aDev) payload.input.audioDeviceName = aDev.name;
-      const key = (this.streamKey || "").trim();
-      if (key) payload.streamName = key;
-      try {
-        const result = await this.api("/api/config", { method: "POST", body: JSON.stringify(payload) });
-        this.config = result;
-        this.selectedPreset = result.preset.id;
-        this.selectedEncoder = result.encoder || "libx264";
-        this.ingestUrl = result.ingestUrl || "";
-        this.streamKey = "";
-        this.hasStreamKey = !!result.hasStreamKey;
-        this.outputMode = result.outputMode || "rtmp";
-        if (result.hlsUrl) this.hlsUrl = result.hlsUrl;
-        return true;
-      } catch (e) {
-        this.showToast("Save failed: " + e.message);
-        return false;
-      }
+      return { connected: false, label: wantName || "" };
     },
 
-    // ============================================================
-    // PRESETS
-    // ============================================================
-    presetTitle(p) {
-      const fps = p.fps === 60 ? "60" : "";
-      return `${p.name} · ${p.height}p${fps} · ${p.videoKbps / 1000} Mbps`;
+    deviceLabel(value) {
+      if (!value || value === "test-video::") return "Test pattern";
+      const parts = value.split(":");
+      const idx = parts[parts.length - 1];
+      const found = (this.devices.video || []).find((d) => String(d.index) === String(idx) && d.backend === parts[1]);
+      return found ? found.name : value;
     },
-    presetName(id) {
-      return this.presets.find((p) => p.id === id)?.name || id;
+
+    // Live-state health pills.
+    livePill(label) {
+      const c = (this.confidence || []).find((x) => x.label === label);
+      return c || { status: "unknown", detail: "" };
     },
-    selectPreset(id) {
-      this.selectedPreset = id;
-      this.presetMenuOpen = false;
-      this.saveConfig().then(() => this.showToast("Quality saved"));
+
+    // statusWord maps a traffic-light status to a single word so screen
+    // readers announce severity verbally, not just via the colored dot.
+    statusWord(s) {
+      return { green: "OK", yellow: "warning", red: "problem", off: "off", unknown: "unknown" }[s] || "";
     },
 
     // ============================================================
     // STREAM CONTROLS
     // ============================================================
-    async startNow() {
+    async startScheduledNow() {
       try {
         if (!(await this.saveConfig())) return;
         await this.api("/api/start", { method: "POST" });
         this.showToast("Starting...");
-        await this.refresh();
-      } catch (e) {
-        this.showToast(e.message);
-      }
+      } catch (e) { this.showToast(e.message); }
     },
 
     openYTModal() {
       this.ytModal.warn = "";
+      this.ytModal.title = this.nextEvent?.title || this.nextEvent?.name || "Live Stream";
+      this._modalReturnFocus = document.activeElement;
       this.ytModal.open = true;
+      this.$nextTick(() => this.focusModal("ytModalCard"));
     },
     openCustomModal() {
       this.customModal.warn = "";
+      this._modalReturnFocus = document.activeElement;
       this.customModal.open = true;
+      this.$nextTick(() => this.focusModal("customModalCard"));
+    },
+
+    // focusModal moves focus to the first focusable control inside the
+    // modal card. Returning focus to the trigger on close happens via
+    // closeModal below.
+    focusModal(refName) {
+      const card = this.$refs[refName];
+      if (!card) return;
+      const first = card.querySelector("input, select, textarea, button, [tabindex]");
+      if (first) first.focus();
+    },
+
+    // closeModal centralizes "modal close" logic: hide, restore focus
+    // to the trigger, clear any error state.
+    closeYTModal()     { this.ytModal.open = false;     this.restoreModalFocus(); },
+    closeCustomModal() { this.customModal.open = false; this.restoreModalFocus(); },
+    restoreModalFocus() {
+      const el = this._modalReturnFocus;
+      this._modalReturnFocus = null;
+      if (el && typeof el.focus === "function") el.focus();
+    },
+
+    // Tab-key focus trap. Cycles focus among the modal's focusables.
+    // Invoked from @keydown.tab on the modal card.
+    trapModalTab(refName, ev) {
+      const card = this.$refs[refName];
+      if (!card) return;
+      const items = Array.from(card.querySelectorAll("input, select, textarea, button, [tabindex]"))
+        .filter((el) => !el.disabled && el.offsetParent !== null);
+      if (items.length === 0) return;
+      const first = items[0], last = items[items.length - 1];
+      const active = document.activeElement;
+      if (ev.shiftKey && active === first) { ev.preventDefault(); last.focus(); }
+      else if (!ev.shiftKey && active === last) { ev.preventDefault(); first.focus(); }
     },
 
     async goLiveYouTube() {
@@ -949,12 +597,8 @@ document.addEventListener("alpine:init", () => {
         });
         this.ytModal.open = false;
         this.showToast("Broadcast created — going live...");
-        await this.refresh();
-      } catch (e) {
-        this.ytModal.warn = e.message;
-      } finally {
-        this.ytModal.busy = false;
-      }
+      } catch (e) { this.ytModal.warn = e.message; }
+      finally { this.ytModal.busy = false; }
     },
 
     async startCustom() {
@@ -965,28 +609,22 @@ document.addEventListener("alpine:init", () => {
         await this.api("/api/start", { method: "POST" });
         this.customModal.open = false;
         this.showToast("Stream starting...");
-        await this.refresh();
-      } catch (e) {
-        this.customModal.warn = e.message;
-      } finally {
-        this.customModal.busy = false;
-      }
+      } catch (e) { this.customModal.warn = e.message; }
+      finally { this.customModal.busy = false; }
     },
 
     showStopConfirm() {
       this.stopConfirm = true;
       clearTimeout(this._stopTimer);
       this._stopTimer = setTimeout(() => { this.stopConfirm = false; }, 5000);
+      // Move focus so keyboard users land on the confirm button.
+      this.$nextTick(() => this.$refs.confirmStop?.focus());
     },
     async doStop() {
       clearTimeout(this._stopTimer);
       this.stopConfirm = false;
-      try {
-        await this.api("/api/stop", { method: "POST" });
-        await this.refresh();
-      } catch (e) {
-        this.showToast(e.message);
-      }
+      try { await this.api("/api/stop", { method: "POST" }); }
+      catch (e) { this.showToast(e.message); }
     },
 
     async extend() {
@@ -994,87 +632,183 @@ document.addEventListener("alpine:init", () => {
         const result = await this.api("/api/extend", { method: "POST", body: JSON.stringify({ minutes: 15 }) });
         const endsAt = new Date(result.endsAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
         this.showToast(`Extended — now ends at ${endsAt}`);
-        await this.refresh();
-      } catch (e) {
-        this.showToast(e.message);
-      }
+      } catch (e) { this.showToast(e.message); }
     },
 
     async setAdaptive(enabled) {
       try {
         await this.api("/api/adaptive", { method: "POST", body: JSON.stringify({ enabled }) });
-        this.adaptive.enabled = enabled;
         this.showToast(enabled ? "Auto-quality enabled" : "Auto-quality disabled");
-      } catch (e) {
-        this.showToast(e.message);
-      }
+      } catch (e) { this.showToast(e.message); }
+    },
+
+    setEnableHLS(enabled) {
+      this.enableHls = enabled;
+      this.saveConfig().then(() => this.showToast(enabled ? "HLS monitoring on" : "HLS monitoring off"));
     },
 
     // ============================================================
-    // YOUTUBE OAUTH
+    // CONFIG SAVE
+    // ============================================================
+    async saveConfig() {
+      // Single in-flight save promise to prevent overlapping requests.
+      if (this._savePending) { await this._savePending; }
+      this._savePending = this._doSaveConfig();
+      try { return await this._savePending; }
+      finally { this._savePending = null; }
+    },
+    async _doSaveConfig() {
+      const decoded = S.decodeSourceValue(this.videoSourceValue) || S.decodeSourceValue(S.encodeSourceValue(this.config?.input, this.devices));
+      if (!decoded) {
+        this.showToast("Pick a video source before saving.");
+        return false;
+      }
+      const payload = {
+        presetId: this.selectedPreset,
+        encoder: this.selectedEncoder,
+        ingestUrl: (this.ingestUrl || "").trim(),
+        outputMode: this.outputMode,
+        enableHls: this.enableHls,
+        input: {
+          kind: decoded.kind,
+          backend: decoded.backend,
+          videoDevice: decoded.videoDevice,
+          audioDevice: this.audioSourceValue || "",
+        },
+      };
+      // Persist device names so the backend can resolve stable
+      // AVFoundation indexes even when indexes shift between reboots.
+      const vDev = (this.devices.video || []).find(
+        (d) => String(d.index) === String(decoded.videoDevice) && d.backend === decoded.backend
+      );
+      if (vDev) payload.input.videoDeviceName = vDev.name;
+      const aDev = (this.devices.audio || []).find(
+        (d) => String(d.index) === String(this.audioSourceValue)
+      );
+      if (aDev) payload.input.audioDeviceName = aDev.name;
+      const key = (this.streamKey || "").trim();
+      if (key) payload.streamName = key;
+      try {
+        await this.api("/api/config", { method: "POST", body: JSON.stringify(payload) });
+        // SSE will push the new config back. Clear write-only fields
+        // and dirty flags so the next push can refresh the form.
+        this.streamKey = "";
+        this._dirtyIngest = false;
+        this._dirtyStreamKey = false;
+        this._dirtyAudio = false;
+        this._dirtyVideo = false;
+        return true;
+      } catch (e) {
+        this.showToast("Save failed: " + e.message);
+        return false;
+      }
+    },
+
+    onVideoSourceChange() {
+      this._dirtyVideo = true;
+      if (this.isSDISource) this.audioSourceValue = "";
+      this.saveConfig().then(() => this.preview?.refresh());
+    },
+    onAudioSourceChange()   { this._dirtyAudio = true; this.saveConfig(); },
+    onEncoderChange()       { this.saveConfig().then(() => this.showToast("Encoder saved")); },
+    onIngestChange()        { this._dirtyIngest = true; },
+    onStreamKeyChange()     { this._dirtyStreamKey = true; },
+    onIngestBlur()          { this.saveConfig(); },
+    onStreamKeyBlur()       { this.saveConfig(); },
+
+    encoderDescription() {
+      const enc = this.encoders.find((e) => e.id === this.selectedEncoder);
+      return enc ? enc.description : "";
+    },
+
+    selectPreset(id) {
+      this.selectedPreset = id;
+      this.presetMenuOpen = false;
+      this.saveConfig().then(() => this.showToast("Quality saved"));
+    },
+
+    syncSelectElements() {
+      // Native <select> sometimes ignores x-model when options arrive
+      // later from /api/devices (the value reference predates the matching
+      // <option>). Force-set after the next tick.
+      if (this.$refs.videoSourceSelect) this.$refs.videoSourceSelect.value = this.videoSourceValue;
+      if (this.$refs.audioSourceSelect) this.$refs.audioSourceSelect.value = this.audioSourceValue;
+    },
+
+    videoSourceOptions() { return S.videoSourceOptions(this.devices); },
+    audioSourceOptions() { return S.audioSourceOptions(this.devices, this.isSDISource); },
+
+    // ============================================================
+    // PREVIEW (delegated to controller)
+    // ============================================================
+    togglePreview() {
+      this.previewVisible = !this.previewVisible;
+      if (this.previewVisible) { this.preview?.start(); }
+      else { this.preview?.stop(); this.previewError = ""; }
+    },
+    refreshPreview() { this.previewError = ""; this.preview?.refresh(); },
+
+    // ============================================================
+    // YOUTUBE AUTH
     // ============================================================
     async loginYouTube() {
       try {
         const data = await this.api("/api/youtube/auth/url");
         if (data.url) window.open(data.url, "_blank", "width=600,height=700");
-      } catch (e) {
-        this.showToast("YouTube login failed: " + e.message);
-      }
+      } catch (e) { this.showToast("YouTube login failed: " + e.message); }
     },
-    async logoutYouTube() {
-      await this.api("/api/youtube/auth/logout", { method: "POST" });
-      await this.refresh();
-    },
+    async logoutYouTube() { await this.api("/api/youtube/auth/logout", { method: "POST" }); },
 
     // ============================================================
-    // SCHEDULES
+    // SCHEDULES + OVERRIDES
     // ============================================================
     _blankSchedForm() {
-      return {
-        id: "",
-        name: "", days: [], time: "08:45", timezone: "America/Chicago",
-        durationMin: 120, title: "", description: "", privacy: "unlisted", enabled: true,
-      };
+      return { id: "", name: "", days: [], time: "09:00", timezone: this.schedForm.timezone || "America/Chicago",
+               durationMin: 120, title: "", description: "", privacy: "unlisted", enabled: true };
     },
     _blankOvrForm() {
-      return {
-        id: "",
-        name: "", wallClock: "", timezone: "America/Chicago", durationMin: 120,
-        title: "", description: "", privacy: "unlisted",
-      };
+      return { id: "", name: "", wallClock: "", timezone: this.ovrForm.timezone || "America/Chicago",
+               durationMin: 120, title: "", description: "", privacy: "unlisted" };
     },
-    openSchedForm() {
-      this.schedForm = this._blankSchedForm();
-      this.ovrFormOpen = false;
-      this.schedFormOpen = true;
-    },
+    openSchedForm() { this.schedForm = this._blankSchedForm(); this.ovrFormOpen = false; this.schedFormOpen = true; },
+    openOvrForm()   { this.ovrForm = this._blankOvrForm();     this.schedFormOpen = false; this.ovrFormOpen = true; },
     editSchedule(s) {
       this.schedForm = {
-        id: s.id,
-        name: s.name || "",
-        days: [...(s.days || [])],
-        time: s.time || "08:45",
-        timezone: s.timezone || "America/Chicago",
-        durationMin: s.durationMin || 120,
-        title: s.title || "",
-        description: s.description || "",
-        privacy: s.privacy || "unlisted",
+        id: s.id, name: s.name || "", days: [...(s.days || [])],
+        time: s.time || "09:00", timezone: s.timezone || "America/Chicago",
+        durationMin: s.durationMin || 120, title: s.title || "",
+        description: s.description || "", privacy: s.privacy || "unlisted",
         enabled: s.enabled !== false,
       };
       if (s.presetId) this.selectedPreset = s.presetId;
       this.ovrFormOpen = false;
       this.schedFormOpen = true;
     },
+    editOverride(o) {
+      this.ovrForm = {
+        id: o.id, name: o.name || "", wallClock: this.toDateTimeLocal(o.startTime),
+        timezone: o.timezone || this.ovrForm.timezone || "America/Chicago",
+        durationMin: o.durationMin || 120, title: o.title || "",
+        description: o.description || "", privacy: o.privacy || "unlisted",
+      };
+      if (o.presetId) this.selectedPreset = o.presetId;
+      this.schedFormOpen = false;
+      this.ovrFormOpen = true;
+    },
     toggleDay(day) {
       const idx = this.schedForm.days.indexOf(day);
       if (idx < 0) this.schedForm.days.push(day);
       else this.schedForm.days.splice(idx, 1);
     },
+    toDateTimeLocal(value) {
+      if (!value) return "";
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return "";
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    },
     async saveSchedule() {
-      if (this.schedForm.days.length === 0) {
-        alert("Select at least one day.");
-        return;
-      }
+      if (this.schedForm.days.length === 0) { this.showToast("Select at least one day."); return; }
       const sched = {
         ...this.schedForm,
         presetId: this.selectedPreset,
@@ -1085,70 +819,26 @@ document.addEventListener("alpine:init", () => {
       };
       try {
         const editing = !!sched.id;
-        const path = editing ? `/api/schedules/${sched.id}` : "/api/schedules";
-        const method = editing ? "PUT" : "POST";
-        await this.api(path, { method, body: JSON.stringify(sched) });
+        await this.api(editing ? `/api/schedules/${sched.id}` : "/api/schedules",
+          { method: editing ? "PUT" : "POST", body: JSON.stringify(sched) });
         this.schedFormOpen = false;
         this.showToast(editing ? "Schedule updated." : "Schedule created.");
-        await this.loadSchedules();
-        await this.refresh();
-      } catch (e) {
-        alert(e.message);
-      }
+      } catch (e) { this.showToast(e.message); }
     },
     async toggleScheduleEnabled(s) {
-      const enabled = !s.enabled;
       try {
-        await this.api(`/api/schedules/${s.id}`, {
-          method: "PUT",
-          body: JSON.stringify({ ...s, enabled }),
-        });
-        this.showToast(enabled ? "Schedule resumed." : "Schedule paused.");
-        await this.loadSchedules();
-        await this.refresh();
-      } catch (e) {
-        alert(e.message);
-      }
+        await this.api(`/api/schedules/${s.id}`,
+          { method: "PUT", body: JSON.stringify({ ...s, enabled: !s.enabled }) });
+        this.showToast(!s.enabled ? "Schedule resumed." : "Schedule paused.");
+      } catch (e) { this.showToast(e.message); }
     },
     async deleteSchedule(id) {
       if (!confirm("Delete this schedule?")) return;
-      await this.api(`/api/schedules/${id}`, { method: "DELETE" });
-      await this.loadSchedules();
-      await this.refresh();
-    },
-
-    openOvrForm() {
-      this.ovrForm = this._blankOvrForm();
-      this.schedFormOpen = false;
-      this.ovrFormOpen = true;
-    },
-    editOverride(o) {
-      this.ovrForm = {
-        id: o.id,
-        name: o.name || "",
-        wallClock: this.toDateTimeLocal(o.startTime),
-        timezone: o.timezone || this.ovrForm.timezone || "America/Chicago",
-        durationMin: o.durationMin || 120,
-        title: o.title || "",
-        description: o.description || "",
-        privacy: o.privacy || "unlisted",
-      };
-      if (o.presetId) this.selectedPreset = o.presetId;
-      this.schedFormOpen = false;
-      this.ovrFormOpen = true;
-    },
-    toDateTimeLocal(value) {
-      if (!value) return "";
-      const d = new Date(value);
-      if (Number.isNaN(d.getTime())) return "";
-      const pad = (n) => String(n).padStart(2, "0");
-      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      try { await this.api(`/api/schedules/${id}`, { method: "DELETE" }); }
+      catch (e) { this.showToast(e.message); }
     },
     async saveOverride() {
-      if (!this.ovrForm.wallClock) {
-        alert("Pick a date and time.");
-        return;
-      }
+      if (!this.ovrForm.wallClock) { this.showToast("Pick a date and time."); return; }
       const override = {
         ...this.ovrForm,
         presetId: this.selectedPreset,
@@ -1158,84 +848,98 @@ document.addEventListener("alpine:init", () => {
       };
       try {
         const editing = !!override.id;
-        const path = editing ? `/api/overrides/${override.id}` : "/api/overrides";
-        const method = editing ? "PUT" : "POST";
-        await this.api(path, { method, body: JSON.stringify(override) });
+        await this.api(editing ? `/api/overrides/${override.id}` : "/api/overrides",
+          { method: editing ? "PUT" : "POST", body: JSON.stringify(override) });
         this.ovrFormOpen = false;
         this.showToast(editing ? "Special event updated." : "Special event created.");
-        await this.loadOverrides();
-        await this.refresh();
-      } catch (e) {
-        alert(e.message);
-      }
+      } catch (e) { this.showToast(e.message); }
     },
     async deleteOverride(id) {
       if (!confirm("Delete this event?")) return;
-      await this.api(`/api/overrides/${id}`, { method: "DELETE" });
-      await this.loadOverrides();
-      await this.refresh();
+      try { await this.api(`/api/overrides/${id}`, { method: "DELETE" }); }
+      catch (e) { this.showToast(e.message); }
     },
 
     // ============================================================
-    // QUICK FILL + HLS COPY
+    // QUICK FILL + UTIL
     // ============================================================
     quickFill(platform) {
-      const URLS = {
-        youtube: "rtmps://a.rtmps.youtube.com/live2",
+      const RTMP = {
+        youtube:    "rtmps://a.rtmps.youtube.com/live2",
         cloudflare: "rtmps://live.cloudflare.com:443/live/",
-        twitch: "rtmp://live.twitch.tv/app",
+        twitch:     "rtmp://live.twitch.tv/app",
       };
-      const url = URLS[platform];
-      if (!url) return;
-      this.ingestUrl = url;
+      if (RTMP[platform]) {
+        this.outputMode = "rtmp";
+        this.ingestUrl = RTMP[platform];
+      } else {
+        return;
+      }
+      this._dirtyIngest = true;
       this.saveConfig();
-      this.showToast(`${platform} URL filled — paste your stream key.`);
+      this.showToast(`URL filled — paste your stream key/ID.`);
     },
     copyHLSUrl() {
-      navigator.clipboard.writeText(this.hlsUrl).then(() => this.showToast("HLS URL copied!"));
+      window.EasyStreamClipboard(this.hlsUrl).then((ok) => {
+        this.showToast(ok ? "HLS URL copied!" : "Copy failed — select the URL manually.");
+      });
+    },
+    copyWatchURL(broadcastId) {
+      window.EasyStreamClipboard(`https://youtube.com/watch?v=${broadcastId}`).then((ok) => {
+        this.showToast(ok ? "Watch link copied!" : "Copy failed — open the link manually.");
+      });
     },
 
-    // ============================================================
-    // HELPERS / FORMATTING
-    // ============================================================
-    fmtTime(d) {
-      return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-    },
-    formatEventWhen(d) {
-      const now = new Date();
-      const sameDay = d.toDateString() === now.toDateString();
-      const tomorrow = new Date(now.getTime() + 86400000);
-      const isTomorrow = d.toDateString() === tomorrow.toDateString();
-      const timeStr = this.fmtTime(d);
-      if (sameDay) return `Today at ${timeStr}`;
-      if (isTomorrow) return `Tomorrow at ${timeStr}`;
-      const dateStr = d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
-      return `${dateStr} at ${timeStr}`;
-    },
-    formatDateTime(d) {
-      const dateStr = d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
-      const timeStr = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-      return `${dateStr} at ${timeStr}`;
-    },
-    formatDays(days) {
-      return (days || []).map((d) => d.charAt(0).toUpperCase() + d.slice(0, 3)).join(", ");
-    },
-    shortTZ(tz) {
-      return (tz || "").split("/").pop().replace("_", " ");
-    },
-    platformFromURL(url) {
-      if (!url) return null;
-      const u = url.toLowerCase();
-      if (u.includes("youtube.com")) return "YouTube";
-      if (u.includes("cloudflare.com")) return "Cloudflare";
-      if (u.includes("twitch.tv")) return "Twitch";
-      if (u.includes("facebook.com") || u.includes("fb.com")) return "Facebook";
-      return null;
-    },
+    presetTitle(p) { return F.presetTitle(p); },
+    presetName(id) { return this.presets.find((p) => p.id === id)?.name || id; },
+    fmtTime(d)            { return F.fmtTime(d); },
+    formatEventWhen(d)    { return F.formatEventWhen(d); },
+    formatDateTime(d)     { return F.formatDateTime(d); },
+    formatDays(days)      { return F.formatDays(days); },
+    shortTZ(tz)           { return F.shortTZ(tz); },
+    platformFromURL(url)  { return F.platformFromURL(url); },
+
     showToast(msg) {
       this.toast = msg;
       clearTimeout(this._toastTimer);
       this._toastTimer = setTimeout(() => { this.toast = ""; }, 3000);
     },
+
+    // updateNowTimer starts the 1s tick only when something visible
+    // depends on it (uptime when live, countdown when next event exists).
+    // Stopped otherwise to avoid needless reactive churn on idle dashboards
+    // and on the Settings view.
+    updateNowTimer() {
+      const need = this.isLive || !!this.nextEvent;
+      if (need && !this._nowTimer) {
+        this._nowTimer = setInterval(() => { this.nowTick = Date.now(); }, 1000);
+      } else if (!need && this._nowTimer) {
+        clearInterval(this._nowTimer);
+        this._nowTimer = null;
+      }
+    },
   }));
+
+  // copyToClipboard: graceful fallback for browsers without the async
+  // Clipboard API (older Safari, insecure origin, etc). Returns a
+  // Promise<boolean> indicating success so callers can toast appropriately.
+  window.EasyStreamClipboard = function copyToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text).then(() => true, () => false);
+    }
+    // Legacy execCommand fallback.
+    return new Promise((resolve) => {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (_) {}
+      document.body.removeChild(ta);
+      resolve(ok);
+    });
+  };
 });

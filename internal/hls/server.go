@@ -29,11 +29,6 @@ func (s *Server) Dir() string {
 	return s.dir
 }
 
-// PlaylistPath returns the full path to the main playlist file.
-func (s *Server) PlaylistPath() string {
-	return filepath.Join(s.Dir(), "stream.m3u8")
-}
-
 // Clean removes all HLS files from the output directory.
 func (s *Server) Clean() error {
 	dir := s.Dir()

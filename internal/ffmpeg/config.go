@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -46,12 +47,20 @@ type Input struct {
 	Format          string    `json:"format"`
 }
 
-// OutputMode selects where FFmpeg sends the encoded stream.
+// OutputMode selects the *primary* destination FFmpeg sends to.
+// HLS is no longer one of the mutually-exclusive primaries — it is an
+// independent toggle (Config.EnableHLS) that runs alongside any primary
+// for local monitoring. The legacy "hls" value is accepted on input
+// solely for backwards-compat migration; new code emits only "rtmp"
+// (or future "srt").
 type OutputMode string
 
 const (
-	OutputRTMP OutputMode = "rtmp" // RTMP/RTMPS push to YouTube/etc
-	OutputHLS  OutputMode = "hls"  // Write HLS segments to local dir
+	OutputRTMP OutputMode = "rtmp" // RTMP/RTMPS push (YouTube, Twitch, etc.)
+	OutputSRT  OutputMode = "srt"  // SRT push
+	// Legacy "hls" value is recognised on the load path (server.go,
+	// handleConfigUpdate, configResponse) for migrating older configs.
+	// New code should not emit it as a primary mode.
 )
 
 // Encoder selects which H.264 video encoder FFmpeg uses.
@@ -75,11 +84,54 @@ type EncoderInfo struct {
 
 // knownEncoders lists all encoders we know how to configure, in display order.
 var knownEncoders = []EncoderInfo{
-	{EncoderX264, "Software (x264)", "CPU-based, always available, widest compatibility", true},
-	{EncoderVideoToolbox, "Apple VideoToolbox", "macOS hardware encoder (Apple Silicon / Intel)", false},
+	{EncoderX264, "Software (x264)", "CPU-based, true CBR, widest compatibility. Required for SRT destinations.", true},
+	{EncoderVideoToolbox, "Apple VideoToolbox", "macOS hardware encoder. Soft CBR — not used for SRT, which requires true CBR.", false},
 	{EncoderNVENC, "NVIDIA NVENC", "NVIDIA GPU hardware encoder", false},
 	{EncoderVAAPI, "VA-API", "Linux Intel/AMD GPU hardware encoder", false},
 	{EncoderQSV, "Intel QuickSync", "Intel GPU hardware encoder", false},
+}
+
+// Capabilities reports which optional FFmpeg features this build
+// supports. Probed once at startup; the UI uses it to gate features
+// (e.g. don't let the operator pick SRT if FFmpeg can't speak it).
+type Capabilities struct {
+	SRT bool `json:"srt"`
+}
+
+// DetectCapabilities runs `ffmpeg -protocols` and reports which
+// optional protocols the binary was built with. Homebrew's default
+// FFmpeg formula on macOS doesn't link against libsrt — without this
+// check the operator only finds out when the stream fails with
+// "Protocol not found" at the wrong moment.
+func DetectCapabilities(binary string) Capabilities {
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, binary, "-hide_banner", "-protocols").CombinedOutput()
+	if err != nil {
+		return Capabilities{}
+	}
+	// `ffmpeg -protocols` prints sections "Input:" and "Output:" with
+	// one protocol per line. We need SRT in the Output section.
+	caps := Capabilities{}
+	inOutput := false
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "Output:" {
+			inOutput = true
+			continue
+		}
+		if trimmed == "Input:" {
+			inOutput = false
+			continue
+		}
+		if inOutput && trimmed == "srt" {
+			caps.SRT = true
+		}
+	}
+	return caps
 }
 
 // DetectEncoders probes ffmpeg for available hardware encoders.
@@ -113,17 +165,20 @@ func DetectEncoders(binary string) []EncoderInfo {
 }
 
 type Config struct {
-	Binary       string         `json:"binary"`
-	Input        Input          `json:"input"`
-	Preset       quality.Preset `json:"preset"`
-	Encoder      Encoder        `json:"encoder,omitempty"`
-	OutputMode   OutputMode     `json:"outputMode"`
-	IngestURL    string         `json:"ingestUrl"`
-	StreamName   string         `json:"streamName"`
-	HLSDir       string         `json:"hlsDir,omitempty"`
-	Network      Network        `json:"network"`
-	LogLevel     string         `json:"logLevel"`
-	ProcessTitle string         `json:"processTitle"`
+	Binary     string         `json:"binary"`
+	Input      Input          `json:"input"`
+	Preset     quality.Preset `json:"preset"`
+	Encoder    Encoder        `json:"encoder,omitempty"`
+	OutputMode OutputMode     `json:"outputMode"`
+	IngestURL  string         `json:"ingestUrl"`
+	StreamName string         `json:"streamName"`
+	// EnableHLS writes a local HLS playlist alongside the primary
+	// destination. Independent of OutputMode — operators can have both
+	// a YouTube broadcast and a local HLS playlist for monitoring.
+	EnableHLS bool    `json:"enableHls"`
+	HLSDir    string  `json:"hlsDir,omitempty"`
+	Network   Network `json:"network"`
+	LogLevel  string  `json:"logLevel"`
 }
 
 type Network struct {
@@ -160,21 +215,52 @@ func (c Config) Validate() error {
 	if c.Input.Kind != InputTestVideo && strings.TrimSpace(c.Input.VideoDevice) == "" {
 		return errors.New("video device is required")
 	}
-	switch c.OutputMode {
-	case OutputHLS:
-		if strings.TrimSpace(c.HLSDir) == "" {
-			return errors.New("HLS output directory is required")
-		}
-	default: // rtmp
-		if strings.TrimSpace(c.IngestURL) == "" {
-			return errors.New("ingest URL is required")
+	if c.EnableHLS && strings.TrimSpace(c.HLSDir) == "" {
+		return errors.New("HLS output directory is required when EnableHLS is true")
+	}
+	// At least one runnable output must exist.
+	primary := c.primaryRunnable()
+	if !primary && !c.EnableHLS {
+		return errors.New("no output configured — set a destination URL+key or enable HLS")
+	}
+	if primary {
+		switch c.OutputMode {
+		case OutputRTMP, OutputSRT, "":
+		default:
+			return fmt.Errorf("unsupported primary output mode %q", c.OutputMode)
 		}
 	}
 	return nil
 }
 
-// EffectiveEncoder returns the encoder to use, defaulting to libx264.
+// primaryRunnable reports whether the primary destination has enough
+// config to actually run. Used by Args() to decide whether to append
+// the primary output muxer, and by Validate() to permit HLS-only runs.
+//
+// RTMP requires both URL and stream key (key is a path segment).
+// SRT requires only the URL — the user pastes the complete URL
+// (including any streamid=... query param required by the receiver).
+func (c Config) primaryRunnable() bool {
+	url := strings.TrimSpace(c.IngestURL)
+	if url == "" {
+		return false
+	}
+	if c.OutputMode == OutputSRT {
+		return true
+	}
+	return strings.TrimSpace(c.StreamName) != ""
+}
+
+// EffectiveEncoder returns the encoder to use.
+//
+// SRT destinations always use libx264. Apple's h264_videotoolbox is a
+// quality-target encoder (soft CBR — it produces what the content needs
+// even with -constant_bit_rate=1) and SRT receivers expect a true CBR
+// stream that matches the declared bitrate.
 func (c Config) EffectiveEncoder() Encoder {
+	if c.OutputMode == OutputSRT {
+		return EncoderX264
+	}
 	if c.Encoder == "" {
 		return EncoderX264
 	}
@@ -182,12 +268,91 @@ func (c Config) EffectiveEncoder() Encoder {
 }
 
 func (c Config) OutputURL() string {
+	if c.OutputMode == OutputSRT {
+		// SRT URL formats vary by receiver (streamid syntax,
+		// passphrase, latency, etc.). The user pastes the complete
+		// URL; we pass it through verbatim. Mutating it would
+		// URL-encode characters like ':' that some receivers
+		// require literal.
+		return c.IngestURL
+	}
+	// RTMP: append stream key as a path segment.
 	base := strings.TrimRight(c.IngestURL, "/")
 	name := strings.TrimLeft(c.StreamName, "/")
 	if name == "" {
 		return base
 	}
 	return base + "/" + name
+}
+
+// primaryOutputArgs returns the direct-output args (no tee) for the
+// primary destination — used when HLS sidecar is disabled.
+func (c Config) primaryOutputArgs() []string {
+	switch c.OutputMode {
+	case OutputSRT:
+		// -flush_packets 1 + -muxdelay 0 -muxpreload 0 keep the muxer
+		// low-latency: each packet is flushed immediately and the
+		// muxer doesn't hold audio waiting for video PTS (default
+		// muxdelay is 0.7 s).
+		return []string{
+			"-f", "mpegts",
+			"-flush_packets", "1",
+			"-muxdelay", "0",
+			"-muxpreload", "0",
+			c.OutputURL(),
+		}
+	default: // OutputRTMP and "" both go here
+		out := []string{"-f", "flv"}
+		if c.Network.TCPKeepalive {
+			out = append(out, "-tcp_keepalive", "1")
+		}
+		if c.Network.RWTimeout > 0 {
+			out = append(out, "-rw_timeout", fmt.Sprintf("%d", c.Network.RWTimeout.Microseconds()))
+		}
+		return append(out, c.OutputURL())
+	}
+}
+
+// hlsOutputArgs returns the direct-output args for the HLS sidecar
+// when there's no primary destination configured.
+func (c Config) hlsOutputArgs() []string {
+	return []string{
+		"-f", "hls",
+		"-hls_time", "6",
+		"-hls_list_size", "10",
+		"-hls_flags", "delete_segments+append_list+independent_segments",
+		"-hls_segment_filename", fmt.Sprintf("%s/seg%%d.ts", c.HLSDir),
+		fmt.Sprintf("%s/stream.m3u8", c.HLSDir),
+	}
+}
+
+// primaryTeeSlave returns the tee-muxer slave spec for the primary
+// destination. Slave options inside [...] are colon-separated; the
+// URL follows after ']' and may contain any character except '|'.
+func (c Config) primaryTeeSlave() (string, error) {
+	switch c.OutputMode {
+	case OutputSRT:
+		return "[f=mpegts:flush_packets=1:muxdelay=0:muxpreload=0]" + c.OutputURL(), nil
+	case OutputRTMP, "":
+		opts := []string{"f=flv"}
+		if c.Network.TCPKeepalive {
+			opts = append(opts, "tcp_keepalive=1")
+		}
+		if c.Network.RWTimeout > 0 {
+			opts = append(opts, fmt.Sprintf("rw_timeout=%d", c.Network.RWTimeout.Microseconds()))
+		}
+		return "[" + strings.Join(opts, ":") + "]" + c.OutputURL(), nil
+	default:
+		return "", fmt.Errorf("unsupported output mode for tee: %q", c.OutputMode)
+	}
+}
+
+// hlsTeeSlave returns the tee-muxer slave spec for the HLS sidecar.
+func (c Config) hlsTeeSlave() string {
+	return fmt.Sprintf(
+		"[f=hls:hls_time=6:hls_list_size=10:hls_flags=delete_segments+append_list+independent_segments:hls_segment_filename=%s/seg%%d.ts]%s/stream.m3u8",
+		c.HLSDir, c.HLSDir,
+	)
 }
 
 func (c Config) Args() ([]string, error) {
@@ -205,47 +370,72 @@ func (c Config) Args() ([]string, error) {
 		"-stats_period", "1",
 	}
 
-	inputs := c.buildInputs()
+	inputs, err := c.buildInputs()
+	if err != nil {
+		return nil, err
+	}
 	args = append(args, inputs.args...)
-	args = append(args, "-map", inputs.videoMap, "-map", inputs.audioMap)
 
 	encoder := c.EffectiveEncoder()
 	gop := fmt.Sprintf("%d", c.Preset.GOP())
-
-	// Build video filter chain. SDI/DeckLink sources may be interlaced
-	// so we auto-deinterlace with yadif, then scale + pad to the target
-	// resolution preserving aspect ratio.
-	//
-	// scale/pad accept W:H (colon-separated) — NOT W x H. The pad filter
-	// in particular doesn't recognise "1920x1080" as a dimension pair.
-	var vf string
 	w, h := c.Preset.Width, c.Preset.Height
+
+	// Single -filter_complex graph for video and audio. We branch
+	// audio with asplit so the encoder consumes a clean stream and
+	// the astats/ametadata stderr-print path runs on its own copy.
+	// Mixing astats into the encode path would synchronously block
+	// the filter graph on stderr writes — producing exactly the
+	// "MediaSource readyState: closed" failure browsers/players
+	// throw when AAC frames arrive with non-uniform PTS deltas.
+	//
+	// SDI/DeckLink can be interlaced, so the software path deint with
+	// yadif (no-op on progressive). VideoToolbox handles progressive
+	// natively; scale_vt would need hwaccel frames AVFoundation can't
+	// produce, so the CPU scaler runs cheaply alongside the GPU
+	// encoder.
+	var videoChain string
 	if encoder == EncoderVideoToolbox {
-		// VideoToolbox encoder handles progressive webcam/OBS input natively
-		// so we skip yadif deinterlacing. scale_vt requires hwaccel frames
-		// which AVFoundation doesn't produce, so we keep the CPU scaler
-		// (cheap relative to encoding).
-		vf = fmt.Sprintf(
-			"scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black",
-			w, h, w, h,
+		videoChain = fmt.Sprintf(
+			"[%s]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black[v]",
+			inputs.videoMap, w, h, w, h,
 		)
 	} else {
-		// Software path: yadif deint=interlaced is a no-op on progressive
-		// sources but catches real interlaced SDI/DeckLink input.
-		vf = fmt.Sprintf(
-			"yadif=deint=interlaced,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black",
-			w, h, w, h,
+		videoChain = fmt.Sprintf(
+			"[%s]yadif=deint=interlaced,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black[v]",
+			inputs.videoMap, w, h, w, h,
 		)
 	}
+
+	// Audio resampler:
+	//   async=1            broadcast-standard soft sync — pad/trim
+	//                      only on stream start, never warps PTS
+	//                      deltas mid-stream (a continuous warping
+	//                      resampler produces AAC frames whose
+	//                      PTS deltas drift off 1024/48000 s and
+	//                      strict demuxers/players reject them).
+	//   min_hard_comp=0.1  fall back to hard pad/trim only after
+	//                      100 ms of accumulated drift.
+	//   osr=48000          pin output rate so the encoder always
+	//                      sees 48 kHz regardless of source rate.
+	// astats + ametadata feeds the audio confidence pill via stderr,
+	// but it runs on a side branch and never touches the encoder.
+	audioChain := fmt.Sprintf(
+		"[%s]aresample=async=1:min_hard_comp=0.100000:osr=48000,asplit=2[a_enc][a_stats];"+
+			"[a_stats]astats=metadata=1:reset=1:length=1,"+
+			"ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr,anullsink",
+		inputs.audioMap,
+	)
+
+	args = append(args, "-filter_complex", videoChain+";"+audioChain)
+	args = append(args, "-map", "[v]", "-map", "[a_enc]")
 
 	// Encoder settings aligned with YouTube's H.264 recommendations:
 	//   - High profile where supported (CABAC, 8-bit 4:2:0)
 	//   - 2 B-frames, 1 reference frame, progressive scan (software)
-	//   - CBR via -b:v == -maxrate, 2x bufsize for ~2s buffer
+	//   - CBR via -b:v == -maxrate, bufsize == maxrate for 1s VBV
 	//   - 2-second keyframe interval (GOP = FPS * 2)
 	//   - Rec.709 color primaries / transfer / matrix for SDR
-	//   - 128 kbps AAC stereo at 48 kHz
-	args = append(args, "-vf", vf)
+	//   - AAC stereo at 48 kHz, encoder selected per platform
 	args = append(args, c.encoderArgs(encoder, gop)...)
 	args = append(args,
 		"-b:v", c.Preset.VideoBitrate(),
@@ -257,37 +447,34 @@ func (c Config) Args() ([]string, error) {
 		"-color_primaries", "bt709",
 		"-color_trc", "bt709",
 		"-colorspace", "bt709",
-		// Audio filter: compute per-second RMS level and print to stderr so
-		// the supervisor can detect silent audio (stuck mic, wrong source).
-		// astats with metadata=1:reset=1:length=1 emits a stat every 1s.
-		// ametadata file output bypasses -loglevel warning suppression while
-		// keeping stdout reserved for FFmpeg's machine-readable progress stream.
-		"-af", "astats=metadata=1:reset=1:length=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr",
-		"-c:a", "aac",
+	)
+	args = append(args, c.audioEncoderArgs()...)
+	args = append(args,
 		"-b:a", c.Preset.AudioBitrate(),
 		"-ar", "48000",
 		"-ac", "2",
 	)
 
-	switch c.OutputMode {
-	case OutputHLS:
-		args = append(args,
-			"-f", "hls",
-			"-hls_time", "6",
-			"-hls_list_size", "10",
-			"-hls_flags", "delete_segments+append_list+independent_segments",
-			"-hls_segment_filename", fmt.Sprintf("%s/seg%%d.ts", c.HLSDir),
-			fmt.Sprintf("%s/stream.m3u8", c.HLSDir),
-		)
-	default: // rtmp
-		args = append(args, "-f", "flv")
-		if c.Network.TCPKeepalive {
-			args = append(args, "-tcp_keepalive", "1")
+	// Primary destination + optional HLS sidecar.
+	//
+	// When both are enabled we use ffmpeg's tee muxer so a single
+	// encoder feeds both outputs — re-encoding twice would double
+	// CPU, and -c copy on the raw input streams produces invalid
+	// HLS (the inputs are uyvy422 / PCM, not H.264 / AAC).
+	hlsEnabled := c.EnableHLS && strings.TrimSpace(c.HLSDir) != ""
+	switch {
+	case c.primaryRunnable() && hlsEnabled:
+		primary, err := c.primaryTeeSlave()
+		if err != nil {
+			return nil, err
 		}
-		if c.Network.RWTimeout > 0 {
-			args = append(args, "-rw_timeout", fmt.Sprintf("%d", c.Network.RWTimeout.Microseconds()))
-		}
-		args = append(args, c.OutputURL())
+		args = append(args, "-f", "tee", primary+"|"+c.hlsTeeSlave())
+	case c.primaryRunnable():
+		args = append(args, c.primaryOutputArgs()...)
+	case hlsEnabled:
+		// HLS-only run. Same encoded output as the primary path
+		// would have used, just muxed to HLS instead.
+		args = append(args, c.hlsOutputArgs()...)
 	}
 
 	// Secondary output: low-res H.264 RTP for live browser preview.
@@ -331,23 +518,40 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 		// Apple VideoToolbox (macOS). Uses hardware H.264 on Apple Silicon
 		// or Intel. Supports -profile and -level but not x264 presets.
 		// -allow_sw 1 falls back to software if hardware is busy.
+		//
+		// -constant_bit_rate 1 forces true CBR. Without it, VideoToolbox
+		// defaults to VBR — which drops the bitrate well below the
+		// configured target for low-motion content (a static scene can
+		// come in at 1-2 Mbps even when -b:v says 10 Mbps). Live ingest
+		// receivers expect a constant rate at or near the target.
+		// Requires macOS 13+ / current VideoToolbox.
 		return []string{
 			"-c:v", "h264_videotoolbox",
 			"-profile:v", "high",
 			"-level:v", "4.1",
 			"-allow_sw", "1",
 			"-realtime", "1",
+			"-constant_bit_rate", "1",
 		}
 
 	case EncoderNVENC:
-		// NVIDIA NVENC. Uses -preset p4 (balanced speed/quality) and
-		// CBR rate control. -rc cbr requires -b:v to be set (done by caller).
+		// NVIDIA NVENC. Industry-standard live CBR settings:
+		//   -rc cbr           true constant bitrate (with -b:v from caller)
+		//   -no-scenecut 1    no auto-inserted IDR on scene change — keep
+		//                     keyframes on the configured GOP boundaries
+		//                     so receivers can segment cleanly
+		//   -forced-idr 1     every keyframe is an IDR (closed GOP)
+		//   -strict_gop 1     no GOP-boundary slippage; receivers can
+		//                     count frames to predict the next keyframe
 		return []string{
 			"-c:v", "h264_nvenc",
 			"-preset", "p4",
 			"-profile:v", "high",
 			"-level:v", "4.1",
 			"-rc", "cbr",
+			"-no-scenecut", "1",
+			"-forced-idr", "1",
+			"-strict_gop", "1",
 			"-bf", "2",
 			"-g", gop,
 			"-keyint_min", gop,
@@ -355,9 +559,10 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 
 	case EncoderVAAPI:
 		// VA-API (Linux Intel/AMD). Requires a DRM render device.
-		// The video filter chain needs hwupload and format conversion.
+		// Multi-GPU systems (iGPU + dGPU) expose renderD128 AND
+		// renderD129 — pinning to 128 silently picks the wrong card.
 		return []string{
-			"-vaapi_device", "/dev/dri/renderD128",
+			"-vaapi_device", pickVAAPIRenderNode(),
 			"-c:v", "h264_vaapi",
 			"-profile:v", "high",
 			"-level", "41",
@@ -379,9 +584,16 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 		}
 
 	default: // libx264 (software)
+		// Industry-standard live H.264 CBR settings:
+		//   filler=1     VBV filler NALs to maintain hard-CBR without
+		//                emitting HRD parameters in the SPS VUI.
+		//   open-gop=0   closed GOP — every keyframe is IDR, no frames
+		//                reference across keyframe boundaries.
+		//   scenecut=0   no scene-change keyframes; keyframes only at
+		//                the configured GOP boundary so receivers
+		//                segment predictably.
 		// No -tune zerolatency: it disables B-frames, which YouTube
-		// explicitly recommends keeping (2 B-frames). Latency doesn't
-		// matter for broadcast streaming.
+		// explicitly recommends keeping (2 B-frames).
 		return []string{
 			"-c:v", "libx264",
 			"-preset", "veryfast",
@@ -391,12 +603,24 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 			"-sc_threshold", "0",
 			"-bf", "2",
 			"-refs", "1",
-			// Closed GOP: every keyframe is IDR and no frame references
-			// across keyframe boundaries. Required by Cloudflare Stream;
-			// preferred by YouTube/Twitch/etc.
-			"-x264-params", "open-gop=0",
+			"-x264-params", "filler=1:open-gop=0:scenecut=0:keyint=" + gop + ":min-keyint=" + gop,
 		}
 	}
+}
+
+// audioEncoderArgs picks the best available AAC-LC encoder for the
+// current platform. On macOS we prefer aac_at (Apple AudioToolbox),
+// which produces noticeably better quality per bit than FFmpeg's
+// native encoder at 128–192 kbps — particularly on music and choir
+// content — and is what OBS Studio ships on macOS. Elsewhere we
+// fall back to the native aac encoder with -aac_coder twoloop
+// (the higher-quality two-loop search coder, not the default fast
+// coder which can produce frames strict demuxers reject).
+func (c Config) audioEncoderArgs() []string {
+	if runtime.GOOS == "darwin" {
+		return []string{"-c:a", "aac_at"}
+	}
+	return []string{"-c:a", "aac", "-aac_coder", "twoloop"}
 }
 
 // previewEncoderArgs returns lightweight encoder flags for the secondary
@@ -466,7 +690,14 @@ const silentAudio = "anullsrc=channel_layout=stereo:sample_rate=48000"
 // audio (or audio isn't applicable), it adds a silent audio track as a
 // second input. RTMP streams require an audio track; YouTube rejects video-
 // only streams.
-func (c Config) buildInputs() inputBuild {
+//
+// Fail-closed: for AVFoundation, if the persisted VideoDeviceName cannot
+// be located in the current device listing (camera unplugged, renamed,
+// AVFoundation indexes shifted), returns ErrDeviceNotFound rather than
+// silently spawning FFmpeg against whichever device is at the stale
+// persisted index. Picking the wrong source on Sunday morning is a
+// worse failure than refusing to start with a clear error.
+func (c Config) buildInputs() (inputBuild, error) {
 	if c.Input.Kind == InputTestVideo {
 		return inputBuild{
 			args: []string{
@@ -478,7 +709,7 @@ func (c Config) buildInputs() inputBuild {
 			},
 			videoMap: "0:v",
 			audioMap: "1:a",
-		}
+		}, nil
 	}
 
 	backend := defaultString(c.Input.Backend, PlatformBackend())
@@ -488,24 +719,41 @@ func (c Config) buildInputs() inputBuild {
 
 	switch backend {
 	case "avfoundation":
-		device := ResolveAVFoundationDeviceIndex(c.Binary, c.Input.VideoDevice, c.Input.VideoDeviceName, "video")
-		audio := ResolveAVFoundationDeviceIndex(c.Binary, c.Input.AudioDevice, c.Input.AudioDeviceName, "audio")
+		// Video device: require strict name resolution. If the user
+		// picked a device whose name is persisted, that name MUST
+		// match something in the current listing.
+		device := c.Input.VideoDevice
+		if c.Input.VideoDeviceName != "" {
+			resolved, err := ResolveAVFoundationDeviceIndexStrict(c.Binary, c.Input.VideoDeviceName, "video", c.Input.VideoDevice)
+			if err != nil {
+				return inputBuild{}, fmt.Errorf("video source: %w", err)
+			}
+			device = resolved
+		}
+		// Audio device: same strictness when a name is persisted. An
+		// empty audio device is legitimate (silent audio fallback).
+		audio := c.Input.AudioDevice
+		if c.Input.AudioDeviceName != "" {
+			resolved, err := ResolveAVFoundationDeviceIndexStrict(c.Binary, c.Input.AudioDeviceName, "audio", c.Input.AudioDevice)
+			if err != nil {
+				return inputBuild{}, fmt.Errorf("audio source: %w", err)
+			}
+			audio = resolved
+		}
 		fps := ProbeAVFoundationFramerate(c.Binary, device, c.Preset.FPS)
 		if audio != "" {
-			// Both video and audio in one avfoundation input.
 			return inputBuild{
 				args:     []string{"-f", "avfoundation", "-framerate", fps, "-i", device + ":" + audio},
 				videoMap: "0:v", audioMap: "0:a",
-			}
+			}, nil
 		}
-		// Video only; mix in a silent audio track.
 		return inputBuild{
 			args: []string{
 				"-f", "avfoundation", "-framerate", fps, "-i", device + ":none",
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
-		}
+		}, nil
 
 	case "dshow":
 		device := "video=" + c.Input.VideoDevice
@@ -513,7 +761,7 @@ func (c Config) buildInputs() inputBuild {
 			return inputBuild{
 				args:     []string{"-f", "dshow", "-i", device + ":audio=" + c.Input.AudioDevice},
 				videoMap: "0:v", audioMap: "0:a",
-			}
+			}, nil
 		}
 		return inputBuild{
 			args: []string{
@@ -521,33 +769,53 @@ func (c Config) buildInputs() inputBuild {
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
-		}
+		}, nil
 
 	case "v4l2":
-		// v4l2 is video-only. Audio comes from ALSA (separate input) or silent.
+		// Resolve the v4l2 device strictly by its kernel-reported name
+		// (/sys/class/video4linux/videoN/name). Symmetrical to the
+		// AVFoundation strict path: a missing/renamed device aborts
+		// the start rather than silently going live on whatever sits
+		// at the stale /dev/videoN path.
+		device := c.Input.VideoDevice
+		if c.Input.VideoDeviceName != "" {
+			resolved, err := ResolveV4L2DevicePathStrict(c.Input.VideoDeviceName, c.Input.VideoDevice)
+			if err != nil {
+				return inputBuild{}, fmt.Errorf("video source: %w", err)
+			}
+			device = resolved
+		}
 		if c.Input.AudioDevice != "" {
 			return inputBuild{
 				args: []string{
-					"-f", "v4l2", "-i", c.Input.VideoDevice,
+					"-f", "v4l2", "-i", device,
 					"-f", "alsa", "-i", c.Input.AudioDevice,
 				},
 				videoMap: "0:v", audioMap: "1:a",
-			}
+			}, nil
 		}
 		return inputBuild{
 			args: []string{
-				"-f", "v4l2", "-i", c.Input.VideoDevice,
+				"-f", "v4l2", "-i", device,
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
-		}
+		}, nil
 
 	case "decklink":
-		// SDI carries embedded audio in the same signal.
-		return inputBuild{
-			args:     []string{"-f", "decklink", "-audio_input", "embedded", "-i", c.Input.VideoDevice},
-			videoMap: "0:v", audioMap: "0:a",
+		// DeckLink addresses by name (BlackMagic appends "(2)", "(3)"
+		// to disambiguate identical hardware). When a card is removed,
+		// the remaining ones get re-numbered — verify the saved name
+		// is still in `ffmpeg -list_devices` output before spawning,
+		// otherwise the operator sees a cryptic FFmpeg error.
+		device := c.Input.VideoDevice
+		if err := verifyDeckLinkDevicePresent(c.Binary, device); err != nil {
+			return inputBuild{}, fmt.Errorf("video source: %w", err)
 		}
+		return inputBuild{
+			args:     []string{"-f", "decklink", "-audio_input", "embedded", "-i", device},
+			videoMap: "0:v", audioMap: "0:a",
+		}, nil
 
 	default:
 		return inputBuild{
@@ -556,7 +824,7 @@ func (c Config) buildInputs() inputBuild {
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
-		}
+		}, nil
 	}
 }
 
@@ -613,41 +881,188 @@ func chooseAVFoundationFramerate(output string, targetFPS int) (string, bool) {
 	return "", false
 }
 
+// ErrDeviceNotFound is returned when an AVFoundation device cannot be
+// resolved by name. The configured source's index has likely shifted
+// (USB replug, reboot) AND the persisted name no longer matches anything
+// FFmpeg is reporting. Critically, this is returned INSTEAD of silently
+// using the stale index — picking the wrong device on Sunday morning
+// is a worse failure than refusing to start.
+var ErrDeviceNotFound = errors.New("configured AVFoundation device not found")
+
 // ResolveAVFoundationDeviceIndex resolves a device name to its current
-// AVFoundation index. If deviceName is empty or the probe fails, it falls
-// back to fallbackIndex. This handles the AVFoundation problem where
-// device indices shift between system boots or when USB devices are
-// plugged/unplugged — persisting the name gives stable device selection.
+// AVFoundation index. Best-effort variant used for UI/listing where
+// "almost right" is acceptable. For start-time resolution, callers
+// must use ResolveAVFoundationDeviceIndexStrict.
+//
+// If deviceName is empty or the probe fails, it falls back to
+// fallbackIndex. This handles AVFoundation index drift between boots.
 func ResolveAVFoundationDeviceIndex(binary, fallbackIndex, deviceName, kind string) string {
 	if deviceName == "" {
 		return fallbackIndex
 	}
+	idx, err := resolveAVFoundationDeviceIndex(binary, deviceName, kind, fallbackIndex)
+	if err != nil {
+		return fallbackIndex
+	}
+	return idx
+}
+
+// ResolveAVFoundationDeviceIndexStrict is fail-closed: it returns
+// ErrDeviceNotFound when the named device isn't present in FFmpeg's
+// device listing. Callers about to spawn FFmpeg must use this variant
+// so a missing/renamed device aborts the start instead of silently
+// picking whatever sits at the stale persisted index.
+//
+// fallbackIndex is used only as a tie-breaker when multiple devices
+// share the same name (rare but possible: two HDMI capture cards both
+// named "USB Capture HDMI"). The candidate matching fallbackIndex wins;
+// otherwise ambiguity is an error so we don't pick the wrong twin.
+func ResolveAVFoundationDeviceIndexStrict(binary, deviceName, kind, fallbackIndex string) (string, error) {
+	if deviceName == "" {
+		return "", fmt.Errorf("%w: empty device name", ErrDeviceNotFound)
+	}
+	return resolveAVFoundationDeviceIndex(binary, deviceName, kind, fallbackIndex)
+}
+
+func resolveAVFoundationDeviceIndex(binary, deviceName, kind, fallbackIndex string) (string, error) {
 	if binary == "" {
 		binary = "ffmpeg"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	out, _ := exec.CommandContext(ctx, binary, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "").CombinedOutput()
-	if idx, ok := chooseAVFoundationDeviceIndex(string(out), deviceName, kind); ok {
-		return idx
+	matches := matchAVFoundationDevices(string(out), deviceName, kind)
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("%w: %q not in current AVFoundation %s list", ErrDeviceNotFound, deviceName, kind)
+	case 1:
+		return matches[0], nil
+	default:
+		// Multiple devices share this name. Prefer the one whose index
+		// matches the saved fallbackIndex — that's the operator's most
+		// recent successful pick. If no match, fail rather than guess.
+		for _, m := range matches {
+			if m == fallbackIndex {
+				return m, nil
+			}
+		}
+		return "", fmt.Errorf("%w: %q is ambiguous (%d devices share this name, none at saved index %q)",
+			ErrDeviceNotFound, deviceName, len(matches), fallbackIndex)
 	}
-	return fallbackIndex
 }
 
-// chooseAVFoundationDeviceIndex scans FFmpeg's AVFoundation device list output
-// for a device matching the given name in the correct section (video or audio).
-// Returns the device index and true if found.
-func chooseAVFoundationDeviceIndex(output, deviceName, kind string) (string, bool) {
+// verifyDeckLinkDevicePresent runs FFmpeg's decklink listing and
+// returns nil if the named device is present. Used as a preflight in
+// buildInputs so a missing DeckLink (one of three was unplugged and
+// the rest got renumbered) surfaces a clean ErrDeviceNotFound instead
+// of a cryptic FFmpeg failure once we spawn the encoder.
+func verifyDeckLinkDevicePresent(binary, deviceName string) error {
 	if deviceName == "" {
-		return "", false
+		return fmt.Errorf("%w: empty DeckLink device name", ErrDeviceNotFound)
+	}
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, binary, "-hide_banner", "-f", "decklink", "-list_devices", "1", "-i", "dummy").CombinedOutput()
+	// FFmpeg's decklink listing format: [decklink @ 0x...] 'DeckLink Mini Recorder HD'
+	target := strings.TrimSpace(strings.ToLower(deviceName))
+	for _, line := range strings.Split(string(out), "\n") {
+		// Single-quoted name extraction; case-insensitive equality.
+		if i := strings.Index(line, "'"); i >= 0 {
+			if j := strings.Index(line[i+1:], "'"); j >= 0 {
+				name := strings.TrimSpace(strings.ToLower(line[i+1 : i+1+j]))
+				if name == target {
+					return nil
+				}
+			}
+		}
+	}
+	return fmt.Errorf("%w: DeckLink %q not in current device list", ErrDeviceNotFound, deviceName)
+}
+
+// pickVAAPIRenderNode returns the first readable /dev/dri/renderD12X
+// node. Multi-GPU machines have several; rootless containers may have
+// none. Falls back to renderD128 (the kernel's first allocation) so
+// existing configs aren't disturbed.
+func pickVAAPIRenderNode() string {
+	for i := 128; i < 144; i++ {
+		path := fmt.Sprintf("/dev/dri/renderD%d", i)
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return "/dev/dri/renderD128"
+}
+
+// ResolveV4L2DevicePathStrict resolves a saved v4l2 device-name to its
+// CURRENT /dev/videoN path by reading /sys/class/video4linux/. This
+// closes the same wrong-source bug class on Linux as the AVFoundation
+// strict resolver does on macOS: when USB renumeration shifts what
+// /dev/video0 points at, we refuse to start FFmpeg on the new device.
+//
+// fallbackPath is used as a tie-breaker when multiple v4l2 nodes share
+// the same name (rare — capture cards expose sub-device nodes; the
+// device scanner filters those out, but a duplicate-name dual-camera
+// case can still happen). If a candidate's path matches the saved
+// fallbackPath we prefer it; otherwise ambiguity is an error.
+func ResolveV4L2DevicePathStrict(deviceName, fallbackPath string) (string, error) {
+	if deviceName == "" {
+		return "", fmt.Errorf("%w: empty device name", ErrDeviceNotFound)
+	}
+	entries, err := os.ReadDir("/sys/class/video4linux")
+	if err != nil {
+		// /sys not present (non-Linux, stripped container) — let the
+		// caller use the persisted path as-is.
+		return fallbackPath, nil
+	}
+	type cand struct{ path string }
+	var matches []cand
+	for _, e := range entries {
+		nm := e.Name()
+		if !strings.HasPrefix(nm, "video") {
+			continue
+		}
+		raw, err := os.ReadFile("/sys/class/video4linux/" + nm + "/name")
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(string(raw)), deviceName) {
+			matches = append(matches, cand{path: "/dev/" + nm})
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("%w: %q not under /sys/class/video4linux", ErrDeviceNotFound, deviceName)
+	case 1:
+		return matches[0].path, nil
+	default:
+		for _, m := range matches {
+			if m.path == fallbackPath {
+				return m.path, nil
+			}
+		}
+		return "", fmt.Errorf("%w: %q ambiguous (%d matches, none at saved path %q)",
+			ErrDeviceNotFound, deviceName, len(matches), fallbackPath)
+	}
+}
+
+// matchAVFoundationDevices returns every index whose device name matches
+// (case-insensitive, trimmed) in the requested kind's section. Returning
+// a slice — not the first hit — lets the strict resolver detect
+// duplicates and avoid the "wrong twin" bug.
+func matchAVFoundationDevices(output, deviceName, kind string) []string {
+	if deviceName == "" {
+		return nil
 	}
 	targetName := strings.TrimSpace(strings.ToLower(deviceName))
 	inCorrectSection := false
 	wantAudio := kind == "audio"
+	var out []string
 
 	for _, line := range strings.Split(output, "\n") {
 		lower := strings.ToLower(line)
-		// Detect section headers in FFmpeg's device listing.
 		if strings.Contains(lower, "avfoundation video devices") {
 			inCorrectSection = !wantAudio
 			continue
@@ -662,9 +1077,19 @@ func chooseAVFoundationDeviceIndex(output, deviceName, kind string) (string, boo
 		if m := avfoundationDeviceRE.FindStringSubmatch(line); len(m) == 3 {
 			name := strings.TrimSpace(strings.ToLower(m[2]))
 			if name == targetName {
-				return m[1], true
+				out = append(out, m[1])
 			}
 		}
 	}
-	return "", false
+	return out
+}
+
+// chooseAVFoundationDeviceIndex is the legacy best-effort wrapper kept
+// for callers that don't need strict semantics (currently only tests).
+func chooseAVFoundationDeviceIndex(output, deviceName, kind string) (string, bool) {
+	matches := matchAVFoundationDevices(output, deviceName, kind)
+	if len(matches) == 0 {
+		return "", false
+	}
+	return matches[0], true
 }

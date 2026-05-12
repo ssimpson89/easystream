@@ -29,6 +29,11 @@ type ServerConfig struct {
 	ScheduleStore   *schedule.Store
 	HLSServer       *hls.Server
 	DataDir         string
+	// FFmpegBinary is the absolute path to ffmpeg picked at startup
+	// (cmd/easystream/main.go findFFmpeg). Defaults to plain "ffmpeg"
+	// if the caller didn't resolve a path, in which case the daemon
+	// relies on $PATH lookup.
+	FFmpegBinary string
 }
 
 // Server wires the EasyStream HTTP API + background controllers together.
@@ -51,11 +56,28 @@ type Server struct {
 
 	mu                sync.Mutex
 	config            ffmpeg.Config
-	destinationMode   string // UI hint: which destination tab is active
 	activeBroadcastID string // YouTube broadcast bound to the current stream
 	activeStreamID    string // YouTube stream resource bound to the current broadcast
 	streamHealth      streamHealthSnapshot
 	destinationBad    int
+
+	// transitionCancel cancels the in-flight YouTube broadcast transition
+	// goroutine when the user stops or starts a different broadcast.
+	transitionMu     sync.Mutex
+	transitionCancel context.CancelFunc
+
+	// healthPollerStop signals the background health poller to exit on
+	// Shutdown. Without this, polling continues past server close.
+	healthPollerStop chan struct{}
+
+	// hub is the SSE pub/sub: every mutator calls s.publishState() so all
+	// open browser tabs see changes in real time without polling.
+	hub *hub
+
+	// ffmpegCaps is probed once at startup; the UI uses it to disable
+	// destination options that this FFmpeg build doesn't support
+	// (notably SRT, which Homebrew's default formula omits).
+	ffmpegCaps ffmpeg.Capabilities
 }
 
 // markLive persists the operator's intent to be live. Called from every
@@ -111,15 +133,16 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 
 	defaultCfg := ffmpeg.DefaultConfig()
+	if cfg.FFmpegBinary != "" {
+		defaultCfg.Binary = cfg.FFmpegBinary
+	}
 	if cfg.HLSServer != nil {
 		defaultCfg.HLSDir = cfg.HLSServer.Dir()
 	}
 
-	// Load persisted stream config (stream key, preset, input, destination
-	// tab) from disk so it survives restarts. Falls back to defaults if
-	// missing/corrupt.
+	// Load persisted stream config (stream key, preset, input) from disk so
+	// it survives restarts. Falls back to defaults if missing/corrupt.
 	configPath := ""
-	destinationMode := "scheduled" // default tab
 	if cfg.DataDir != "" {
 		configPath = filepath.Join(cfg.DataDir, "stream-config.json")
 		if persisted, err := loadPersistedConfig(configPath); err == nil {
@@ -128,8 +151,19 @@ func NewServer(cfg ServerConfig) *Server {
 					defaultCfg.Preset = preset
 				}
 			}
-			if persisted.OutputMode != "" {
+			// Migrate legacy OutputMode="hls" (when HLS was the sole
+			// primary destination) to the new shape: primary RTMP +
+			// independent HLS toggle. After this load+save round-trip
+			// the file on disk has the new shape.
+			if persisted.OutputMode == "hls" {
+				defaultCfg.OutputMode = ffmpeg.OutputRTMP
+				defaultCfg.EnableHLS = true
+				cfg.Logger.Printf("config: migrated legacy outputMode=hls to enableHls=true + outputMode=rtmp")
+			} else if persisted.OutputMode != "" {
 				defaultCfg.OutputMode = persisted.OutputMode
+				defaultCfg.EnableHLS = persisted.EnableHLS
+			} else {
+				defaultCfg.EnableHLS = persisted.EnableHLS
 			}
 			if persisted.IngestURL != "" {
 				defaultCfg.IngestURL = persisted.IngestURL
@@ -143,12 +177,10 @@ func NewServer(cfg ServerConfig) *Server {
 			if persisted.Encoder != "" {
 				defaultCfg.Encoder = persisted.Encoder
 			}
-			if persisted.DestinationMode != "" {
-				destinationMode = persisted.DestinationMode
-			}
-			// Resolve AVFoundation device names to current indexes. Device
-			// indexes shift between reboots or when USB devices are
-			// plugged/unplugged; the persisted name is the stable identifier.
+			// Resolve device names to their CURRENT identifiers. Device
+			// addressing shifts between reboots / USB replugs; the
+			// persisted name is the stable identifier. Symmetric on
+			// macOS (AVFoundation indexes) and Linux (/dev/videoN paths).
 			backend := defaultCfg.Input.Backend
 			if backend == "" {
 				backend = ffmpeg.PlatformBackend()
@@ -175,6 +207,37 @@ func NewServer(cfg ServerConfig) *Server {
 					defaultCfg.Input.AudioDevice = resolved
 				}
 			}
+			if backend == "v4l2" && defaultCfg.Input.VideoDeviceName != "" {
+				resolved, err := ffmpeg.ResolveV4L2DevicePathStrict(
+					defaultCfg.Input.VideoDeviceName, defaultCfg.Input.VideoDevice)
+				if err == nil && resolved != defaultCfg.Input.VideoDevice {
+					cfg.Logger.Printf("resolved v4l2 video device %q from %s → %s",
+						defaultCfg.Input.VideoDeviceName, defaultCfg.Input.VideoDevice, resolved)
+					defaultCfg.Input.VideoDevice = resolved
+				}
+			}
+			// Legacy back-fill: a config saved before the strict-resolver
+			// branch has a path/index but no device name. We must
+			// back-fill from the current scan so the strict resolver
+			// (used at FFmpeg start) doesn't silently skip resolution
+			// — that fall-through is the exact wrong-source bug we
+			// closed for new configs.
+			if defaultCfg.Input.Kind != ffmpeg.InputTestVideo &&
+				defaultCfg.Input.VideoDevice != "" &&
+				defaultCfg.Input.VideoDeviceName == "" {
+				devScan := devices.NewScanner(defaultCfg.Binary).Scan()
+				for _, d := range devScan.Video {
+					if d.Backend == backend && d.Index == defaultCfg.Input.VideoDevice {
+						defaultCfg.Input.VideoDeviceName = d.Name
+						cfg.Logger.Printf("back-filled legacy video device name: %s = %q", d.Index, d.Name)
+						break
+					}
+				}
+				if defaultCfg.Input.VideoDeviceName == "" {
+					cfg.Logger.Printf("WARNING: legacy config references video device %q but no current device matches — re-pick in Settings",
+						defaultCfg.Input.VideoDevice)
+				}
+			}
 			cfg.Logger.Printf("loaded persisted stream config from %s", configPath)
 		}
 	}
@@ -182,23 +245,47 @@ func NewServer(cfg ServerConfig) *Server {
 	devScanner := devices.NewScanner(defaultCfg.Binary)
 	adaptive := ffmpeg.NewAdaptiveController(supervisor, ffmpeg.DefaultAdaptiveConfig(), cfg.Logger)
 
-	server := &Server{
-		addr:            cfg.Addr,
-		supervisor:      supervisor,
-		adaptive:        adaptive,
-		preview:         prev,
-		hlsServer:       cfg.HLSServer,
-		devScanner:      devScanner,
-		ytAuth:          cfg.YTAuth,
-		ytClient:        ytClient,
-		schedStore:      cfg.ScheduleStore,
-		logger:          cfg.Logger,
-		configPath:      configPath,
-		intentPath:      intentPath,
-		config:          defaultCfg,
-		destinationMode: destinationMode,
+	// Probe optional FFmpeg features once at startup. The UI uses this
+	// to grey out destinations the binary can't actually push to
+	// (Homebrew's default FFmpeg ships without libsrt, so SRT pushes
+	// fail at runtime with a confusing "Protocol not found" — better
+	// to disable the option upfront with a clear hint).
+	ffmpegCaps := ffmpeg.DetectCapabilities(defaultCfg.Binary)
+	if !ffmpegCaps.SRT {
+		cfg.Logger.Printf("ffmpeg: SRT not supported by this build — see README for how to install ffmpeg with libsrt")
 	}
-	supervisor.SetOnRestart(adaptive.OnRestart)
+
+	server := &Server{
+		addr:             cfg.Addr,
+		supervisor:       supervisor,
+		adaptive:         adaptive,
+		preview:          prev,
+		hlsServer:        cfg.HLSServer,
+		devScanner:       devScanner,
+		ytAuth:           cfg.YTAuth,
+		ytClient:         ytClient,
+		schedStore:       cfg.ScheduleStore,
+		logger:           cfg.Logger,
+		configPath:       configPath,
+		intentPath:       intentPath,
+		config:           defaultCfg,
+		healthPollerStop: make(chan struct{}),
+		hub:              newHub(),
+		ffmpegCaps:       ffmpegCaps,
+	}
+	// Supervisor restart events drive both the adaptive controller and an
+	// SSE push so the UI flips to "Reconnecting" instantly.
+	supervisor.SetOnRestart(func() {
+		adaptive.OnRestart()
+		server.publishState()
+	})
+	// Every supervisor state transition (Starting → Running → Degraded
+	// → Restarting → Idle/Failed) fans out to SSE subscribers. Without
+	// this the dashboard sticks on the initial Starting/"Waiting for
+	// level..." snapshot from handleStart until something unrelated
+	// (health poll change, schedule tick, user save) triggers a publish.
+	// The hub coalesces rapid transitions into a single wire frame.
+	supervisor.SetOnStateChange(server.publishState)
 	adaptive.Start()
 
 	// Initialize preview with the default config so it knows the input source.
@@ -206,14 +293,14 @@ func NewServer(cfg ServerConfig) *Server {
 
 	// Create scheduler if we have both YouTube and schedule store.
 	if cfg.ScheduleStore != nil {
-		var ytCtrl schedule.YouTubeController
+		var bcastCtrl schedule.BroadcastController
 		if ytClient != nil && cfg.YTAuth != nil {
-			ytCtrl = &ytControllerAdapter{client: ytClient, auth: cfg.YTAuth}
+			bcastCtrl = &broadcastControllerAdapter{server: server}
 		}
 		server.scheduler = schedule.NewScheduler(
 			cfg.ScheduleStore,
 			&streamControllerAdapter{server: server},
-			ytCtrl,
+			bcastCtrl,
 			cfg.Logger,
 		)
 		server.scheduler.Start()
@@ -222,7 +309,7 @@ func NewServer(cfg ServerConfig) *Server {
 	// Start the health poller. When a YouTube broadcast is bound to the
 	// active stream, we poll YouTube every 15s for streamStatus/healthStatus
 	// so the UI can show "Receiving" / "noData" / "bad" indicators.
-	go server.runHealthPoller()
+	go server.runHealthPoller(server.healthPollerStop)
 
 	// If the previous session was live (crashed mid-stream and got restarted
 	// by launchd/systemd), resume the broadcast automatically. The PID
@@ -248,6 +335,10 @@ func (s *Server) routes(webFS fs.FS) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		fileServer.ServeHTTP(w, r)
 	}))
+
+	// Real-time state push (SSE). All open UIs receive every state change
+	// immediately; the REST endpoints below remain as control/fallback.
+	mux.HandleFunc("GET /api/stream/state", s.handleEventStream)
 
 	// Stream control.
 	mux.HandleFunc("GET /api/status", s.handleStatus)
@@ -309,18 +400,44 @@ func (s *Server) ListenAndServe() error {
 }
 
 func (s *Server) Close() {
+	// Cancel the testing→live transition first so it can't fire after
+	// supervisor.Stop disowns the broadcast.
+	s.cancelTransitionGoroutine()
+
+	// Stop the health poller before the supervisor so it doesn't observe
+	// an idle FFmpeg state mid-tear-down and incorrectly mark "destination
+	// unhealthy."
+	s.stopHealthPollerOnce()
+
 	if s.scheduler != nil {
 		s.scheduler.Stop()
 	}
 	if s.adaptive != nil {
 		s.adaptive.Stop()
 	}
-
 	if s.supervisor != nil {
 		s.supervisor.Stop()
 	}
 	if s.preview != nil {
 		s.preview.Block() // tears down preview's child ffmpeg
+	}
+	// Close the hub last so any final publishState from supervisor/adaptive
+	// shutdown paths can still reach subscribers, then the hub wakes
+	// remaining SSE handlers so they exit their loops cleanly.
+	if s.hub != nil {
+		s.hub.Close()
+	}
+}
+
+// stopHealthPollerOnce is safe to call multiple times; closing an already-
+// closed channel would panic.
+func (s *Server) stopHealthPollerOnce() {
+	s.mu.Lock()
+	ch := s.healthPollerStop
+	s.healthPollerStop = nil
+	s.mu.Unlock()
+	if ch != nil {
+		close(ch)
 	}
 }
 
@@ -328,6 +445,14 @@ func (s *Server) Close() {
 // supervised FFmpeg children. EasyStream keeps one clear owner for FFmpeg;
 // crash recovery starts a fresh process from persisted intent rather than
 // adopting a blind process with no telemetry.
+//
+// Intent is preserved across Shutdown so a systemd restart can resume the
+// broadcast. If the operator is shutting down permanently (e.g. host
+// reboot), the active broadcast remains "live" on YouTube until the
+// next startup completes resume — which is exactly when systemd
+// restarts EasyStream anyway. For a true clean shutdown the operator
+// uses the Stop button in the UI, which calls handleStop and properly
+// transitions the broadcast to complete.
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.httpServer.Shutdown(ctx)
 	s.Close()
@@ -380,7 +505,7 @@ func (s *Server) resumeIfNeeded() {
 
 	// Start fresh. The platform may see a brief reconnect, but EasyStream keeps
 	// full observability and recovery control over the new FFmpeg process.
-	if config.OutputMode == ffmpeg.OutputHLS && s.hlsServer != nil {
+	if config.EnableHLS && s.hlsServer != nil {
 		_ = s.hlsServer.Clean()
 	}
 	if s.preview != nil && config.Input.Kind != ffmpeg.InputTestVideo {
@@ -404,13 +529,16 @@ func (s *Server) resumeIfNeeded() {
 	s.logger.Printf("resume: restarted stream from previous session (mode=%s broadcast=%q, started %s ago)",
 		mode, intent.BroadcastID, time.Since(intent.StartedAt).Round(time.Second))
 
-	// If this was a Go Live Now broadcast, re-trigger the testing → live
-	// transition. The original transition goroutine died with the old
-	// server process; without re-triggering, the broadcast stays stuck in
-	// "testing" or "ready" and YouTube's player spins indefinitely.
-	if intent.Mode == "go-live-now" && intent.BroadcastID != "" && s.ytClient != nil && s.ytAuth != nil && s.ytAuth.IsAuthenticated() {
+	// Re-trigger the testing → live transition. The original transition
+	// goroutine died with the old server process; without re-triggering,
+	// the broadcast stays stuck in "testing" or "ready" and YouTube's
+	// player spins indefinitely. Applies to both go-live-now and scheduled
+	// modes — same recovery is needed either way.
+	if (intent.Mode == "go-live-now" || intent.Mode == "scheduled") &&
+		intent.BroadcastID != "" && s.ytClient != nil &&
+		s.ytAuth != nil && s.ytAuth.IsAuthenticated() {
 		s.logger.Printf("resume: re-triggering YouTube broadcast transition for %s", intent.BroadcastID)
-		s.startTransitionGoroutine(intent.BroadcastID)
+		s.startTransitionGoroutine(intent.BroadcastID, intent.StreamID)
 	}
 }
 

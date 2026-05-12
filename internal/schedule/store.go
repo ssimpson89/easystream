@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,6 +13,8 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
+
+	"github.com/ssimpson89/easystream/internal/atomicfile"
 )
 
 // Schedule defines a recurring live stream event.
@@ -82,15 +83,27 @@ type Store struct {
 	data storeData
 }
 
-// NewStore loads or creates a schedule store at the given path.
-func NewStore(file string) (*Store, error) {
+// NewStore loads or creates a schedule store at the given path. A corrupt
+// file is moved aside to <file>.corrupt-<unix> before continuing with an
+// empty in-memory store so a truncated write doesn't silently erase every
+// recurring schedule on the next save. recoveryWarning is non-nil and
+// non-fatal when corruption was detected and successfully sidelined; the
+// caller should log it but continue startup.
+func NewStore(file string) (store *Store, recoveryWarning error, err error) {
 	s := &Store{file: file}
-	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
-		return nil, err
-	}
-	raw, err := os.ReadFile(file)
-	if err == nil {
-		_ = json.Unmarshal(raw, &s.data)
+	raw, rerr := os.ReadFile(file)
+	if rerr == nil {
+		if jerr := json.Unmarshal(raw, &s.data); jerr != nil {
+			backup := fmt.Sprintf("%s.corrupt-%d", file, time.Now().Unix())
+			if mvErr := os.Rename(file, backup); mvErr != nil {
+				// Couldn't move it — return the parse error so the operator
+				// notices instead of silently dropping their schedules.
+				return nil, nil, fmt.Errorf("parse %s: %w (and could not move aside: %v)", file, jerr, mvErr)
+			}
+			// Recovered. Reset to a fresh empty store and tell the caller.
+			s.data = storeData{}
+			recoveryWarning = fmt.Errorf("schedules file %s was corrupt (%v) — moved to %s; starting with empty store", file, jerr, backup)
+		}
 	}
 	if s.data.Broadcasts == nil {
 		s.data.Broadcasts = make(map[string]string)
@@ -101,7 +114,7 @@ func NewStore(file string) (*Store, error) {
 	if s.data.Skipped == nil {
 		s.data.Skipped = make(map[string]time.Time)
 	}
-	return s, nil
+	return s, recoveryWarning, nil
 }
 
 // Schedules returns all recurring schedules.
@@ -137,6 +150,16 @@ func normalizeSchedule(sched Schedule) (Schedule, error) {
 	if sched.Time == "" {
 		return Schedule{}, fmt.Errorf("time is required")
 	}
+	// Validate Time format here so a malformed "abc" doesn't silently
+	// parse as 0:0 (firing at midnight every day).
+	if _, _, err := parseHHMM(sched.Time); err != nil {
+		return Schedule{}, fmt.Errorf("invalid time %q: %w", sched.Time, err)
+	}
+	for _, d := range sched.Days {
+		if _, ok := parseWeekday(d); !ok {
+			return Schedule{}, fmt.Errorf("invalid day: %q", d)
+		}
+	}
 	if sched.Timezone == "" {
 		sched.Timezone = "America/Chicago"
 	}
@@ -150,6 +173,23 @@ func normalizeSchedule(sched Schedule) (Schedule, error) {
 		sched.Privacy = "unlisted"
 	}
 	return sched, nil
+}
+
+// parseHHMM parses an "HH:MM" 24-hour string.
+func parseHHMM(s string) (int, int, error) {
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("expected HH:MM")
+	}
+	h, err := strconv.Atoi(parts[0])
+	if err != nil || h < 0 || h > 23 {
+		return 0, 0, fmt.Errorf("hour out of range")
+	}
+	m, err := strconv.Atoi(parts[1])
+	if err != nil || m < 0 || m > 59 {
+		return 0, 0, fmt.Errorf("minute out of range")
+	}
+	return h, m, nil
 }
 
 // UpdateSchedule replaces a schedule by ID.
@@ -449,12 +489,10 @@ func nextOccurrences(sched Schedule, after, horizon time.Time) []time.Time {
 	if err != nil {
 		return nil
 	}
-	parts := strings.SplitN(sched.Time, ":", 2)
-	if len(parts) != 2 {
+	hour, minute, err := parseHHMM(sched.Time)
+	if err != nil {
 		return nil
 	}
-	hour, _ := strconv.Atoi(parts[0])
-	minute, _ := strconv.Atoi(parts[1])
 
 	// Build the day-of-week field. robfig/cron accepts 0-6 (Sun-Sat),
 	// matching our parsed time.Weekday values.
@@ -515,7 +553,7 @@ func (s *Store) save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.file, data, 0600)
+	return atomicfile.Write(s.file, data, 0600)
 }
 
 func newID() string {

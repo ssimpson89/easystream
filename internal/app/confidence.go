@@ -18,7 +18,7 @@ type confidenceIndicator struct {
 // computeConfidence turns raw supervisor + destination signals into
 // operator-facing traffic-light indicators. Answers "is the church
 // actually live?" — separate from the engineering metrics in the UI.
-func computeConfidence(stream ffmpeg.Status, health streamHealthSnapshot, broadcastID, destMode string) []confidenceIndicator {
+func computeConfidence(stream ffmpeg.Status, health streamHealthSnapshot, broadcastID string) []confidenceIndicator {
 	out := []confidenceIndicator{}
 
 	// 1. Encoder is sending.
@@ -30,7 +30,13 @@ func computeConfidence(stream ffmpeg.Status, health streamHealthSnapshot, broadc
 	case ffmpeg.StateDegraded:
 		enc.Status = "yellow"
 		enc.Detail = "Stalled or backed up"
-	case ffmpeg.StateRestarting, ffmpeg.StateStarting:
+	case ffmpeg.StateStarting:
+		// Initial connection — distinct from a restart loop.
+		enc.Status = "yellow"
+		enc.Detail = "Connecting..."
+	case ffmpeg.StateRestarting:
+		// Recovery: FFmpeg died and we're respawning. "Reconnecting"
+		// is the right word here.
 		enc.Status = "yellow"
 		enc.Detail = "Reconnecting"
 	case ffmpeg.StateFailed:

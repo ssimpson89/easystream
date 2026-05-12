@@ -8,51 +8,124 @@ import (
 	"time"
 )
 
+// Default lead times. Tuned for church-service streaming where the
+// watch URL must be available before the service starts, and we need
+// a brief warmup so YouTube sees ingest before transitioning to live.
+const (
+	// DefaultPrepLead: how far before StartTime to create the YouTube
+	// broadcast + stream resources. 15 min gives the host time to share
+	// the watch URL with the congregation before service starts.
+	DefaultPrepLead = 15 * time.Minute
+
+	// DefaultPreroll: how far before StartTime to start FFmpeg pushing.
+	// 10 s is enough for YouTube's ingest to register and report
+	// streamStatus="active" before the scheduled start time, so the
+	// transition to "live" can happen at (or very close to) StartTime.
+	// Note: viewers don't see anything until we transition to "live".
+	DefaultPreroll = 10 * time.Second
+
+	// Scheduler tick interval. Small enough to start within tickInterval
+	// of preroll/prep boundaries; large enough not to hammer the store.
+	tickInterval = 1 * time.Second
+)
+
 // StreamController is the interface the scheduler uses to start/stop FFmpeg.
 type StreamController interface {
-	// StartWithIngest starts FFmpeg with the given ingest details. broadcastID
-	// and streamID are the YouTube resources this stream is bound to (empty
-	// for non-YouTube destinations) so the controller can complete the
-	// broadcast cleanly on stop.
+	// StartWithIngest starts FFmpeg pushing to the given destination.
+	// broadcastID and streamID are recorded so completion logic can run
+	// when the stream stops (broadcast → complete, stream → deleted).
 	StartWithIngest(presetID, ingestURL, streamKey, broadcastID, streamID string) error
 	StopStream()
 	IsStreaming() bool
+	// Preflight verifies the configured capture source is present and
+	// the config is valid for FFmpeg, without spawning anything. The
+	// scheduler runs this just before goLive so a missing source aborts
+	// the scheduled event with a clear error instead of going live on
+	// whatever device happens to be at the stale persisted index.
+	Preflight() error
 }
 
-// YouTubeController is the interface for YouTube API operations.
-type YouTubeController interface {
+// BroadcastController is the YouTube-side lifecycle the scheduler drives.
+// Implementations live in the app package (ytControllerAdapter) so the
+// schedule package stays free of HTTP/OAuth dependencies.
+type BroadcastController interface {
 	IsAuthenticated() bool
-	CreateBroadcast(title, description string, scheduledStart time.Time, privacy string) (broadcastID string, err error)
-	EnsureStream(presetID string) (streamID, ingestURL, streamKey string, err error)
-	BindBroadcast(broadcastID, streamID string) error
-	TransitionBroadcast(broadcastID, status string) error
+	// CreateBroadcast creates the YouTube broadcast resource. Called at
+	// the prep boundary (StartTime - prepLead).
+	CreateBroadcast(ctx context.Context, title, description string, scheduledStart time.Time, privacy string) (broadcastID string, err error)
+	// CreateBoundStream creates a non-reusable stream for this broadcast
+	// and binds it. Returns the ingest details.
+	CreateBoundStream(ctx context.Context, broadcastID, presetID string) (streamID, ingestURL, streamKey string, err error)
+	// StartTransitionToLive kicks off the testing→live transition in the
+	// background. Cancellable via CancelTransition.
+	StartTransitionToLive(broadcastID, streamID string)
+	// CancelTransition aborts any in-flight transition goroutine.
+	CancelTransition()
+	// CompleteBroadcast transitions the broadcast to "complete" and
+	// deletes the bound stream resource. Best-effort; logs but does not
+	// surface partial failures.
+	CompleteBroadcast(broadcastID, streamID string)
 }
 
-// Scheduler starts streams at the event time. It does not create YouTube
-// broadcasts ahead of time; the scheduled start time is the operator's intent.
+// Scheduler drives the event lifecycle: prepare → preroll → live → stop.
 type Scheduler struct {
-	store  *Store
-	stream StreamController
-	yt     YouTubeController
-	logger *log.Logger
+	store     *Store
+	stream    StreamController
+	broadcast BroadcastController
+	logger    *log.Logger
+
+	// Lead times — overridable for tests.
+	prepLead time.Duration
+	preroll  time.Duration
 
 	mu              sync.Mutex
 	activeEvent     *Event // currently live event
 	activeBroadcast string // YouTube broadcast ID of active event
+	activeStream    string // YouTube stream ID of active event
 	extraMinutes    int    // extra minutes added to active event by Extend button
 	lastError       string
+
+	// prepFailures tracks consecutive prepare failures per event key so
+	// transient YouTube outages back off instead of creating an orphan
+	// broadcast every tick.
+	prepFailures map[string]*backoffState
+
+	// ingestCache maps eventKey → ingest URL+key. The stream key is
+	// intentionally NOT persisted to the on-disk store. We re-create the
+	// stream on app restart if the cache is cold.
+	ingestCache map[string]ingestDetails
 
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
-// NewScheduler creates a scheduler that checks events every minute.
-func NewScheduler(store *Store, stream StreamController, yt YouTubeController, logger *log.Logger) *Scheduler {
+type ingestDetails struct{ url, key string }
+
+type backoffState struct {
+	count   int
+	nextTry time.Time
+}
+
+// NewScheduler creates a scheduler with the default prep lead
+// (DefaultPrepLead) and preroll (DefaultPreroll). The scheduler checks
+// events every tickInterval (1s) so it can hit the preroll boundary
+// within one tick.
+func NewScheduler(store *Store, stream StreamController, broadcast BroadcastController, logger *log.Logger) *Scheduler {
+	return NewSchedulerWithLeads(store, stream, broadcast, logger, DefaultPrepLead, DefaultPreroll)
+}
+
+// NewSchedulerWithLeads is like NewScheduler but takes custom lead times.
+// Use this from tests so you don't have to wait minutes for real prep lead.
+func NewSchedulerWithLeads(store *Store, stream StreamController, broadcast BroadcastController, logger *log.Logger, prepLead, preroll time.Duration) *Scheduler {
 	return &Scheduler{
-		store:  store,
-		stream: stream,
-		yt:     yt,
-		logger: logger,
+		store:        store,
+		stream:       stream,
+		broadcast:    broadcast,
+		logger:       logger,
+		prepLead:     prepLead,
+		preroll:      preroll,
+		prepFailures: make(map[string]*backoffState),
+		ingestCache:  make(map[string]ingestDetails),
 	}
 }
 
@@ -143,122 +216,249 @@ func (s *Scheduler) run(ctx context.Context) {
 		}
 	}()
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 
-	// Run immediately on start, then every 30s.
-	s.tick()
+	// Run immediately on start so the first tick isn't delayed by tickInterval.
+	s.tick(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.tick()
+			s.tick(ctx)
 		}
 	}
 }
 
-func (s *Scheduler) tick() {
+// tick runs the lifecycle state machine once. It is structured as:
+//  1. End the active event if it has run past its window.
+//  2. Look at the next few upcoming events; for each, advance whichever
+//     phase is due (prepare → preroll → transition).
+//
+// The function holds s.mu only for very short read/write segments —
+// long-running operations (API calls, FFmpeg start) happen lock-free.
+func (s *Scheduler) tick(ctx context.Context) {
 	now := time.Now().UTC()
-	events := s.store.NextEvents(10, now)
 
-	// Check if we need to stop an active event.
+	// Stop active event if past end.
 	s.mu.Lock()
 	active := s.activeEvent
 	activeBroadcast := s.activeBroadcast
+	activeStream := s.activeStream
 	extra := s.extraMinutes
 	s.mu.Unlock()
 
 	if active != nil {
 		endTime := active.StartTime.Add(time.Duration(active.DurationMin+extra) * time.Minute)
 		if now.After(endTime) {
-			s.stopActiveEvent(activeBroadcast, false)
+			s.stopActiveEvent(activeBroadcast, activeStream, false)
 		}
 	}
 
-	if s.yt == nil || !s.yt.IsAuthenticated() {
+	if s.broadcast == nil || !s.broadcast.IsAuthenticated() {
 		return
 	}
 
-	for _, event := range events {
-		// Go live at start time. If the broadcast was not prepared by an
-		// earlier app version, create/bind it just-in-time here.
-		if !now.Before(event.StartTime) {
-			endTime := event.StartTime.Add(time.Duration(event.DurationMin) * time.Minute)
-			if now.Before(endTime) {
-				s.mu.Lock()
-				isActive := s.activeEvent != nil
-				s.mu.Unlock()
-				if !isActive && !s.stream.IsStreaming() {
-					s.goLive(event)
-				}
-			}
+	// Drive lifecycle for upcoming events.
+	for _, event := range s.store.NextEvents(10, now) {
+		if ctx.Err() != nil {
+			return
 		}
+		s.advanceEvent(ctx, event, now)
 	}
 }
 
-func (s *Scheduler) prepareBroadcast(event Event) (Event, string, string, bool) {
-	s.logger.Printf("scheduler: creating YouTube broadcast for %q at %s", event.Name, event.StartTime.Format(time.RFC822))
+// advanceEvent moves a single event through its lifecycle phases.
+func (s *Scheduler) advanceEvent(ctx context.Context, event Event, now time.Time) {
+	prepAt := event.StartTime.Add(-s.prepLead)
+	prerollAt := event.StartTime.Add(-s.preroll)
+	endAt := event.StartTime.Add(time.Duration(event.DurationMin) * time.Minute)
 
-	broadcastID, err := s.yt.CreateBroadcast(event.Title, event.Description, event.StartTime, event.Privacy)
+	// Past end: nothing to do.
+	if !now.Before(endAt) {
+		return
+	}
+
+	// Phase 1: prepare. Create the broadcast + stream once the prep
+	// window opens and persist the IDs so a restart finds them.
+	// Pre-flight the capture source first so we don't create an orphan
+	// YouTube broadcast for an event whose camera isn't connected.
+	if !now.Before(prepAt) && event.BroadcastID == "" {
+		if !s.canTryPrep(event) {
+			return
+		}
+		if err := s.stream.Preflight(); err != nil {
+			s.setError(fmt.Sprintf("preflight failed for %q: %v", event.Name, err))
+			s.recordPrepFailure(eventKey(event))
+			return
+		}
+		if prepared, ok := s.prepareBroadcast(ctx, event); ok {
+			event = prepared
+		} else {
+			return
+		}
+	}
+
+	// Phase 2: preroll. Start FFmpeg pushing to the bound stream so
+	// YouTube sees ingest and reports streamStatus=active by StartTime.
+	if !now.Before(prerollAt) && event.BroadcastID != "" {
+		s.mu.Lock()
+		alreadyActive := s.activeEvent != nil
+		s.mu.Unlock()
+		if alreadyActive || s.stream.IsStreaming() {
+			return
+		}
+		s.goLive(ctx, event)
+	}
+}
+
+// canTryPrep returns true when we haven't recently failed to prepare
+// this event. Provides exponential backoff so transient YouTube API
+// outages don't create one orphan broadcast every tick.
+func (s *Scheduler) canTryPrep(event Event) bool {
+	key := eventKey(event)
+	s.mu.Lock()
+	st, ok := s.prepFailures[key]
+	s.mu.Unlock()
+	if !ok || st == nil {
+		return true
+	}
+	return time.Now().UTC().After(st.nextTry)
+}
+
+func (s *Scheduler) recordPrepFailure(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.prepFailures[key]
+	if !ok || st == nil {
+		st = &backoffState{}
+		s.prepFailures[key] = st
+	}
+	st.count++
+	// Exponential backoff: 5s, 10s, 20s, 40s, 80s … capped at 5 min.
+	shift := min(st.count-1, 6)
+	delay := time.Duration(1<<shift) * 5 * time.Second
+	if delay > 5*time.Minute {
+		delay = 5 * time.Minute
+	}
+	st.nextTry = time.Now().UTC().Add(delay)
+}
+
+func (s *Scheduler) clearPrepFailure(key string) {
+	s.mu.Lock()
+	delete(s.prepFailures, key)
+	s.mu.Unlock()
+}
+
+// prepareBroadcast creates the YouTube broadcast + stream and persists
+// the IDs to the store. Returns the updated event and ok=true on success.
+// On failure the event is recorded against the backoff state and ok=false.
+func (s *Scheduler) prepareBroadcast(ctx context.Context, event Event) (Event, bool) {
+	s.logger.Printf("scheduler: preparing broadcast for %q (starts %s)",
+		event.Name, event.StartTime.Format(time.RFC822))
+
+	prepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	broadcastID, err := s.broadcast.CreateBroadcast(prepCtx,
+		event.Title, event.Description, event.StartTime, event.Privacy)
 	if err != nil {
 		s.setError(fmt.Sprintf("create broadcast for %q: %v", event.Name, err))
-		return event, "", "", false
+		s.recordPrepFailure(eventKey(event))
+		return event, false
 	}
 
-	streamID, ingestURL, streamKey, err := s.yt.EnsureStream(event.PresetID)
+	streamID, ingestURL, streamKey, err := s.broadcast.CreateBoundStream(prepCtx, broadcastID, event.PresetID)
 	if err != nil {
-		s.setError(fmt.Sprintf("ensure stream for %q: %v", event.Name, err))
-		return event, "", "", false
-	}
-
-	if err := s.yt.BindBroadcast(broadcastID, streamID); err != nil {
-		s.setError(fmt.Sprintf("bind broadcast for %q: %v", event.Name, err))
-		return event, "", "", false
+		s.setError(fmt.Sprintf("create+bind stream for %q: %v", event.Name, err))
+		s.recordPrepFailure(eventKey(event))
+		return event, false
 	}
 
 	key := eventKey(event)
 	if err := s.store.SetBroadcastID(key, broadcastID, streamID); err != nil {
-		s.setError(fmt.Sprintf("save broadcast mapping: %v", err))
-		return event, "", "", false
+		s.setError(fmt.Sprintf("persist broadcast mapping: %v", err))
+		return event, false
 	}
 	event.BroadcastID = broadcastID
 	event.StreamID = streamID
 
-	s.logger.Printf("scheduler: broadcast %s created and bound to stream %s for %q", broadcastID, streamID, event.Name)
+	// Stash the ingest details on the event so goLive doesn't have to
+	// recreate the stream. Round-trip through the store would persist
+	// the key on disk; keep these in-memory only.
+	s.cacheIngest(key, ingestURL, streamKey)
+	s.clearPrepFailure(key)
 	s.setError("")
-	return event, ingestURL, streamKey, true
+
+	s.logger.Printf("scheduler: prepared broadcast %s for %q (watch URL ready)", broadcastID, event.Name)
+	return event, true
 }
 
-func (s *Scheduler) goLive(event Event) {
-	s.logger.Printf("scheduler: going live with %q (broadcast %s)", event.Name, event.BroadcastID)
-	var ingestURL, streamKey string
-	if event.BroadcastID == "" {
-		var ok bool
-		event, ingestURL, streamKey, ok = s.prepareBroadcast(event)
-		if !ok {
-			return
-		}
-	} else {
-		// Older scheduled events may have a pre-created broadcast. Bind a
-		// fresh stream at the actual start time so FFmpeg and YouTube agree
-		// on the same ingest endpoint.
-		streamID, url, key, err := s.yt.EnsureStream(event.PresetID)
+func (s *Scheduler) cacheIngest(eventKey, url, key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ingestCache[eventKey] = ingestDetails{url: url, key: key}
+}
+
+func (s *Scheduler) lookupIngest(eventKey string) (string, string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.ingestCache[eventKey]
+	if !ok {
+		return "", "", false
+	}
+	return v.url, v.key, true
+}
+
+func (s *Scheduler) clearIngest(eventKey string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.ingestCache, eventKey)
+}
+
+func (s *Scheduler) goLive(parent context.Context, event Event) {
+	// Preflight the capture source BEFORE creating any YouTube resources
+	// or starting FFmpeg. If the configured camera is unplugged or its
+	// AVFoundation name no longer matches, refuse to go live rather
+	// than streaming from whatever device sits at the stale index.
+	if err := s.stream.Preflight(); err != nil {
+		s.setError(fmt.Sprintf("preflight failed for %q: %v", event.Name, err))
+		s.logger.Printf("scheduler: REFUSING to go live for %q — %v", event.Name, err)
+		// Back off this event for 30 s so we don't loop on every tick
+		// while the operator fixes the source.
+		s.recordPrepFailure(eventKey(event))
+		return
+	}
+
+	key := eventKey(event)
+	ingestURL, streamKey, ok := s.lookupIngest(key)
+	if !ok {
+		// App restarted between prepare and preroll. Re-create the
+		// stream now and re-bind it; the broadcast survived in the store.
+		// Derive from the scheduler context so Stop() cancels in-flight
+		// API calls instead of blocking for the 30s timeout.
+		s.logger.Printf("scheduler: ingest cache miss for %q — recreating stream", event.Name)
+		ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+		streamID, url, k, err := s.broadcast.CreateBoundStream(ctx, event.BroadcastID, event.PresetID)
+		cancel()
 		if err != nil {
-			s.setError(fmt.Sprintf("get stream for %q: %v", event.Name, err))
+			s.setError(fmt.Sprintf("recreate stream for %q: %v", event.Name, err))
 			return
 		}
-		if err := s.yt.BindBroadcast(event.BroadcastID, streamID); err != nil {
-			s.setError(fmt.Sprintf("bind broadcast for %q: %v", event.Name, err))
+		if err := s.store.SetBroadcastID(key, event.BroadcastID, streamID); err != nil {
+			s.setError(fmt.Sprintf("persist re-bound stream: %v", err))
 			return
 		}
 		event.StreamID = streamID
 		ingestURL = url
-		streamKey = key
+		streamKey = k
+		s.cacheIngest(key, ingestURL, streamKey)
 	}
 
-	// Start FFmpeg, passing through the YouTube IDs so the stream controller
-	// can complete the broadcast cleanly on stop.
+	s.logger.Printf("scheduler: starting FFmpeg for %q (broadcast %s, scheduled %s)",
+		event.Name, event.BroadcastID, event.StartTime.Format(time.RFC822))
+
 	if err := s.stream.StartWithIngest(event.PresetID, ingestURL, streamKey, event.BroadcastID, event.StreamID); err != nil {
 		s.setError(fmt.Sprintf("start stream for %q: %v", event.Name, err))
 		return
@@ -267,54 +467,26 @@ func (s *Scheduler) goLive(event Event) {
 	s.mu.Lock()
 	s.activeEvent = &event
 	s.activeBroadcast = event.BroadcastID
+	s.activeStream = event.StreamID
 	s.lastError = ""
 	s.mu.Unlock()
 
-	// Transition to testing then live in background.
-	go s.transitionToLive(event.BroadcastID)
+	// The host (Server) drives the testing→live transition. It owns the
+	// cancellable goroutine and the YouTube health-polling needed to gate
+	// the transition on streamStatus=="active".
+	s.broadcast.StartTransitionToLive(event.BroadcastID, event.StreamID)
 }
 
-func (s *Scheduler) transitionToLive(broadcastID string) {
-	// Wait for FFmpeg to start sending frames, then transition.
-	// YouTube needs the stream to be active before we can transition.
-	for i := 0; i < 30; i++ {
-		time.Sleep(5 * time.Second)
-		if !s.stream.IsStreaming() {
-			return
-		}
-		if err := s.yt.TransitionBroadcast(broadcastID, "testing"); err != nil {
-			s.logger.Printf("scheduler: transition to testing attempt %d: %v", i+1, err)
-			continue
-		}
-		s.logger.Printf("scheduler: broadcast %s transitioned to testing", broadcastID)
-		break
-	}
-
-	// Wait a moment then go live.
-	time.Sleep(10 * time.Second)
-	for i := 0; i < 10; i++ {
-		if !s.stream.IsStreaming() {
-			return
-		}
-		if err := s.yt.TransitionBroadcast(broadcastID, "live"); err != nil {
-			s.logger.Printf("scheduler: transition to live attempt %d: %v", i+1, err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		s.logger.Printf("scheduler: broadcast %s is LIVE", broadcastID)
-		return
-	}
-	s.setError("could not transition broadcast to live")
-}
-
-func (s *Scheduler) stopActiveEvent(broadcastID string, suppress bool) {
+func (s *Scheduler) stopActiveEvent(broadcastID, streamID string, suppress bool) {
 	s.logger.Printf("scheduler: stopping active event (broadcast %s)", broadcastID)
+
+	// Cancel the in-flight transition first so it can't fire after we
+	// transition the broadcast to complete.
+	s.broadcast.CancelTransition()
 	s.stream.StopStream()
 
 	if broadcastID != "" {
-		if err := s.yt.TransitionBroadcast(broadcastID, "complete"); err != nil {
-			s.logger.Printf("scheduler: transition to complete: %v", err)
-		}
+		s.broadcast.CompleteBroadcast(broadcastID, streamID)
 	}
 
 	s.mu.Lock()
@@ -322,11 +494,13 @@ func (s *Scheduler) stopActiveEvent(broadcastID string, suppress bool) {
 	extra := s.extraMinutes
 	s.activeEvent = nil
 	s.activeBroadcast = ""
+	s.activeStream = ""
 	s.extraMinutes = 0
 	s.mu.Unlock()
 
 	if event != nil {
 		key := eventKey(*event)
+		s.clearIngest(key)
 		if suppress {
 			until := event.StartTime.Add(time.Duration(event.DurationMin+extra) * time.Minute)
 			if err := s.store.SkipEvent(key, until); err != nil {
@@ -342,8 +516,9 @@ func (s *Scheduler) stopActiveEvent(broadcastID string, suppress bool) {
 func (s *Scheduler) StopActive() {
 	s.mu.Lock()
 	broadcast := s.activeBroadcast
+	stream := s.activeStream
 	s.mu.Unlock()
-	s.stopActiveEvent(broadcast, true)
+	s.stopActiveEvent(broadcast, stream, true)
 }
 
 func (s *Scheduler) setError(msg string) {

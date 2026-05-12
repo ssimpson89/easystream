@@ -1,12 +1,48 @@
 package schedule
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
+func TestNewStoreCorruptFileMovedAside(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "schedules.json")
+	// Half-written JSON simulating a power loss before atomic write replaced it.
+	if err := os.WriteFile(path, []byte(`{"schedules":[{"id":"x"`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store, recovery, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("expected recovery, got fatal: %v", err)
+	}
+	if recovery == nil {
+		t.Fatal("expected recovery warning")
+	}
+	if store == nil {
+		t.Fatal("expected a fresh store after recovery")
+	}
+	if got := store.Schedules(); len(got) != 0 {
+		t.Fatalf("expected empty fresh store, got %d schedules", len(got))
+	}
+	// Backup file should exist.
+	entries, _ := os.ReadDir(dir)
+	found := false
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".corrupt-") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected .corrupt- sidecar file to exist")
+	}
+}
+
 func TestDeleteScheduleClearsBroadcastMappings(t *testing.T) {
-	store, err := NewStore(t.TempDir() + "/schedules.json")
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +72,7 @@ func TestDeleteScheduleClearsBroadcastMappings(t *testing.T) {
 }
 
 func TestDeleteOverrideClearsBroadcastMappings(t *testing.T) {
-	store, err := NewStore(t.TempDir() + "/schedules.json")
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
 	if err != nil {
 		t.Fatal(err)
 	}

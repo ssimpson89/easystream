@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -14,12 +15,18 @@ const (
 
 // runHealthPoller polls YouTube for the bound stream's health every 15s
 // while we have an active broadcast. Updates s.streamHealth so the UI
-// confidence indicators reflect what YouTube actually sees.
-func (s *Server) runHealthPoller() {
+// confidence indicators reflect what YouTube actually sees. Exits when
+// stop is closed (Server.Close path).
+func (s *Server) runHealthPoller(stop <-chan struct{}) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.safePollStreamHealth()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			s.safePollStreamHealth()
+		}
 	}
 }
 
@@ -47,7 +54,11 @@ func (s *Server) pollStreamHealth() {
 		return
 	}
 
-	health, err := s.ytClient.GetStreamHealth(streamID)
+	// Bounded per-call deadline so a hung YouTube API doesn't pin the
+	// health poller goroutine past Server.Close.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	health, err := s.ytClient.GetStreamHealth(ctx, streamID)
 	if err != nil {
 		s.logger.Printf("health poll: %v", err)
 		return
@@ -64,7 +75,7 @@ func (s *Server) pollStreamHealth() {
 
 	// Fetch concurrent viewers if we have an active broadcast.
 	if broadcastID != "" {
-		if viewers, err := s.ytClient.GetConcurrentViewers(broadcastID); err != nil {
+		if viewers, err := s.ytClient.GetConcurrentViewers(ctx, broadcastID); err != nil {
 			s.logger.Printf("health poll: viewer count: %v", err)
 		} else if viewers >= 0 {
 			snap.ConcurrentViewers = &viewers
@@ -72,10 +83,43 @@ func (s *Server) pollStreamHealth() {
 	}
 
 	s.mu.Lock()
+	prev := s.streamHealth
 	s.streamHealth = snap
 	s.mu.Unlock()
 
+	// Only push if something visible changed (StreamStatus, HealthStatus,
+	// or viewer count). Avoids pushing every 15s for a stable stream.
+	if healthChanged(prev, snap) {
+		s.publishState()
+	}
+
 	s.applyDestinationHealth(snap)
+}
+
+// healthChanged returns true if any UI-visible field of the health
+// snapshot has changed. Fields intentionally ignored: LastUpdate (always
+// changes on every poll, would defeat coalescing), Source (set once),
+// HasBroadcast (handled by separate state transitions). If you start
+// rendering one of those, add it here.
+func healthChanged(a, b streamHealthSnapshot) bool {
+	if a.StreamStatus != b.StreamStatus || a.HealthStatus != b.HealthStatus {
+		return true
+	}
+	if (a.ConcurrentViewers == nil) != (b.ConcurrentViewers == nil) {
+		return true
+	}
+	if a.ConcurrentViewers != nil && b.ConcurrentViewers != nil && *a.ConcurrentViewers != *b.ConcurrentViewers {
+		return true
+	}
+	if len(a.Issues) != len(b.Issues) {
+		return true
+	}
+	for i := range a.Issues {
+		if a.Issues[i] != b.Issues[i] {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) applyDestinationHealth(snap streamHealthSnapshot) {

@@ -3,9 +3,12 @@ package devices
 import (
 	"bufio"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +24,6 @@ const (
 	TypeSDI         DeviceType = "sdi"          // Blackmagic DeckLink
 	TypeMicrophone  DeviceType = "microphone"   // Built-in or USB microphones
 	TypeAudioInput  DeviceType = "audio-input"  // Generic audio (line-in, NDI, virtual)
-	TypeOther       DeviceType = "other"
 )
 
 // Device represents a detected capture device.
@@ -45,9 +47,9 @@ type DeviceList struct {
 type Scanner struct {
 	binary string
 
-	mu        sync.Mutex
-	cache     *DeviceList
-	cachedAt  time.Time
+	mu       sync.Mutex
+	cache    *DeviceList
+	cachedAt time.Time
 }
 
 // NewScanner creates a device scanner.
@@ -138,27 +140,43 @@ func (s *Scanner) scanAll() DeviceList {
 }
 
 // classifyVideoDevice categorizes a video device based on backend and name.
+//
+// Anything that registers as a v4l2 or AVFoundation device works for
+// capture regardless of how we group it in the UI — this classification
+// only affects which dropdown group the device shows up in. The keyword
+// list below covers the SDI/HDMI capture cards we expect to encounter
+// (UVC-class devices that show up as a normal capture endpoint, not
+// the BlackMagic DeckLink dedicated backend).
 func classifyVideoDevice(d Device) DeviceType {
 	if d.Backend == "decklink" {
 		return TypeSDI
 	}
 	name := strings.ToLower(d.Name)
 
-	// Screen capture detection (must come before camera since "screen" is unambiguous).
-	if strings.Contains(name, "screen") || strings.Contains(name, "display") {
+	// Screen capture detection. "Capture screen 0" is the canonical
+	// AVFoundation screen-capture name. Don't match "display" — Apple's
+	// Studio Display Camera contains that substring but is a camera.
+	if strings.Contains(name, "screen") {
 		return TypeScreen
 	}
 
-	// USB HDMI capture cards — known vendor/product names.
+	// SDI / HDMI capture cards that present as UVC (v4l2 / AVFoundation /
+	// dshow). Grouped together under "Capture cards" in the UI.
 	captureKeywords := []string{
 		"cam link", "camlink",
 		"elgato",
 		"hd60", "hd 60",
 		"avermedia", "live gamer",
 		"magewell",
+		"inogeni", // SDI / HDMI USB converters
+		"aja",     // U-TAP HDMI/SDI USB
+		"yuan",    // SDI capture cards
+		"datavideo",
+		"deltacast",
 		"epiphan",
 		"capture", // generic "capture" devices (not "screen capture")
 		"hdmi",
+		"sdi", // explicit SDI keyword catches anything self-identifying
 		"usb video",
 	}
 	for _, kw := range captureKeywords {
@@ -304,24 +322,103 @@ func parseDeckLink(output string) DeviceList {
 }
 
 // --- v4l2 ---
+
+// probeV4L2Devices enumerates capture devices via the Linux kernel's
+// sysfs view at /sys/class/video4linux/. This is the canonical source:
+//   - works without v4l2-ctl installed (Fedora minimal, NixOS without
+//     v4l-utils, stripped containers)
+//   - covers all videoN nodes regardless of number (not capped at video9)
+//   - the name file is the kernel-reported model string, which is the
+//     same one v4l2-ctl prints. Stable across reboots for a given
+//     piece of hardware.
+//
+// Falls back to v4l2-ctl --list-devices then to /dev probing if sysfs
+// isn't available (running inside a container without /sys, etc.).
 func probeV4L2Devices() []Device {
-	cmd := exec.Command("v4l2-ctl", "--list-devices")
-	out, err := cmd.Output()
-	if err == nil {
-		return parseV4L2Ctl(string(out))
+	if devs := probeV4L2FromSysfs(); len(devs) > 0 {
+		return devs
 	}
-	var devices []Device
-	for i := 0; i < 10; i++ {
-		path := fmt.Sprintf("/dev/video%d", i)
-		cmd := exec.Command("test", "-e", path)
-		if cmd.Run() == nil {
-			devices = append(devices, Device{
-				Index:   path,
-				Name:    fmt.Sprintf("Video Device %d", i),
-				Kind:    "video",
-				Backend: "v4l2",
-			})
+	cmd := exec.Command("v4l2-ctl", "--list-devices")
+	if out, err := cmd.Output(); err == nil {
+		if devs := parseV4L2Ctl(string(out)); len(devs) > 0 {
+			return devs
 		}
+	}
+	// Last-resort scan of /dev/video* using os.Stat. No subprocess.
+	var devices []Device
+	for i := 0; i < 64; i++ {
+		path := fmt.Sprintf("/dev/video%d", i)
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		devices = append(devices, Device{
+			Index:   path,
+			Name:    fmt.Sprintf("Video Device %d", i),
+			Kind:    "video",
+			Backend: "v4l2",
+		})
+	}
+	return devices
+}
+
+// probeV4L2FromSysfs reads /sys/class/video4linux/*/name. Each entry
+// is a kernel-reported model string. We group entries by name and
+// keep only the lowest-numbered videoN per name — capture cards like
+// Magewell expose 2-4 nodes per board, only the first of which is the
+// actual capture surface. This filter prevents the picker from
+// showing 4 identical entries (3 of which would fail at start).
+func probeV4L2FromSysfs() []Device {
+	entries, err := os.ReadDir("/sys/class/video4linux")
+	if err != nil {
+		return nil
+	}
+	type entry struct {
+		path string
+		name string
+		num  int
+	}
+	var found []entry
+	for _, e := range entries {
+		nm := e.Name()
+		if !strings.HasPrefix(nm, "video") {
+			continue
+		}
+		num, err := strconv.Atoi(strings.TrimPrefix(nm, "video"))
+		if err != nil {
+			continue
+		}
+		nameBytes, err := os.ReadFile("/sys/class/video4linux/" + nm + "/name")
+		if err != nil {
+			continue
+		}
+		name := strings.TrimSpace(string(nameBytes))
+		if name == "" {
+			name = fmt.Sprintf("Video Device %d", num)
+		}
+		found = append(found, entry{
+			path: "/dev/" + nm,
+			name: name,
+			num:  num,
+		})
+	}
+	// Sort by num so the lowest-numbered node per name wins.
+	sort.Slice(found, func(i, j int) bool { return found[i].num < found[j].num })
+	seen := map[string]bool{}
+	var devices []Device
+	for _, f := range found {
+		// First node for this name wins; later sub-device nodes
+		// (capture-card metadata streams) get filtered out.
+		key := f.name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		devices = append(devices, Device{
+			Index:   f.path,
+			Name:    f.name,
+			Kind:    "video",
+			Backend: "v4l2",
+		})
 	}
 	return devices
 }

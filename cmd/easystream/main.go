@@ -6,10 +6,18 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+
+	// Embed Go's tzdata. macOS and most Linux distros ship system
+	// zoneinfo, but minimal containers, NixOS images without
+	// `localization.timeZone`, and older systems can have stale or
+	// missing zones — which silently breaks DST-aware schedule firing.
+	_ "time/tzdata"
 
 	"github.com/joho/godotenv"
 	"github.com/ssimpson89/easystream/internal/app"
@@ -20,6 +28,52 @@ import (
 	"github.com/ssimpson89/easystream/internal/version"
 	"github.com/ssimpson89/easystream/internal/youtube"
 )
+
+// findFFmpeg locates the ffmpeg binary EasyStream should run.
+//
+// Resolution order (first hit wins):
+//  1. EASYSTREAM_FFMPEG env var — explicit operator override. The
+//     escape hatch for non-standard installs: snap, flatpak,
+//     /nix/store, manually compiled binaries in /opt or ~/bin, etc.
+//  2. Homebrew's keg-only `ffmpeg-full` formula (macOS). Bundles
+//     every codec and protocol including libsrt; recommended for
+//     macOS where the default formula omits libsrt.
+//  3. exec.LookPath("ffmpeg") — finds whatever's on PATH. Covers
+//     `dnf install ffmpeg`, `apt install ffmpeg`, distro-shipped
+//     binaries in /usr/bin, /usr/local/bin, etc.
+//  4. A short list of well-known macOS install paths, because apps
+//     launched from Finder/launchd inherit a minimal PATH
+//     (/usr/bin:/bin:/usr/sbin:/sbin) that excludes Homebrew /
+//     MacPorts directories. Linux installs reach via PATH so they
+//     don't need entries here.
+//  5. Bare "ffmpeg" — the supervisor will then surface a clear
+//     "not found" error on first invocation.
+func findFFmpeg() string {
+	if env := strings.TrimSpace(os.Getenv("EASYSTREAM_FFMPEG")); env != "" {
+		return env
+	}
+	for _, candidate := range []string{
+		"/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg", // Apple Silicon
+		"/usr/local/opt/ffmpeg-full/bin/ffmpeg",    // Intel Mac
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	if p, err := exec.LookPath("ffmpeg"); err == nil {
+		return p
+	}
+	for _, candidate := range []string{
+		"/opt/homebrew/bin/ffmpeg", // Apple Silicon Homebrew
+		"/usr/local/bin/ffmpeg",    // Intel Homebrew or manual /usr/local
+		"/opt/local/bin/ffmpeg",    // MacPorts
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return "ffmpeg"
+}
 
 func main() {
 	logger := log.New(os.Stdout, "easystream ", log.LstdFlags|log.LUTC)
@@ -52,6 +106,11 @@ func main() {
 		redirectURI,
 		filepath.Join(dataDir, "tokens.json"),
 	)
+	if ytAuth != nil {
+		// Surface token-refresh persistence failures in the daemon log
+		// instead of dropping them silently to disk-full/permission errors.
+		ytAuth.SetLogger(logger)
+	}
 	// Surface real auth state at startup, not just "credentials present."
 	// A typo'd client ID, expired token, or revoked OAuth grant should
 	// show up here — not when the volunteer clicks Go Live Sunday morning.
@@ -68,10 +127,16 @@ func main() {
 		}
 	}
 
-	// Schedule store.
-	schedStore, err := schedule.NewStore(filepath.Join(dataDir, "schedules.json"))
+	// Schedule store. A corrupt file is moved aside to schedules.json.corrupt-<unix>
+	// and we start with an empty store — better than refusing to launch
+	// and missing the next service entirely. The recovery warning is
+	// surfaced as a log line so the operator can investigate.
+	schedStore, recovery, err := schedule.NewStore(filepath.Join(dataDir, "schedules.json"))
 	if err != nil {
 		logger.Fatalf("failed to initialize schedule store: %v", err)
+	}
+	if recovery != nil {
+		logger.Printf("schedule store: %v", recovery)
 	}
 
 	// HLS output server.
@@ -82,6 +147,9 @@ func main() {
 	}
 	logger.Printf("HLS output directory: %s", hlsDir)
 
+	ffmpegBin := findFFmpeg()
+	logger.Printf("ffmpeg binary: %s", ffmpegBin)
+
 	server := app.NewServer(app.ServerConfig{
 		Addr:            addr,
 		WebFS:           ui.FS(),
@@ -91,6 +159,7 @@ func main() {
 		ScheduleStore:   schedStore,
 		HLSServer:       hlsServer,
 		DataDir:         dataDir,
+		FFmpegBinary:    ffmpegBin,
 	})
 	defer server.Close()
 

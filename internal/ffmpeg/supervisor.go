@@ -9,6 +9,7 @@ import (
 	"log"
 	"math/rand"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,7 +39,6 @@ type Status struct {
 	LastLogLine     string    `json:"lastLogLine,omitempty"`
 	LastProgress    Progress  `json:"lastProgress"`
 	ActivePresetID  string    `json:"activePresetId"`
-	Command         []string  `json:"command,omitempty"`
 	AudioRMSdB      float64   `json:"audioRmsDb"`      // finite dB value; lower = quieter, -120 = silence floor
 	AudioRMSAt      time.Time `json:"audioRmsAt"`      // when AudioRMSdB was last updated
 	AudioDetectedAt time.Time `json:"audioDetectedAt"` // when audio above silence floor was last seen
@@ -71,15 +71,54 @@ type Supervisor struct {
 	// to be restarted by the supervisor. Used by the adaptive controller
 	// to detect restart storms.
 	onRestart func()
+
+	// onStateChange is called after every transition of status.State
+	// (Starting → Running → Degraded → Restarting → Idle/Failed).
+	// Used by app.Server to publish an SSE state event so open browser
+	// tabs reflect the transition immediately. Without this hook, the
+	// UI would stick on the initial Starting/Waiting snapshot until
+	// some unrelated event triggers a publish.
+	onStateChange func()
 }
 
 var errRestartRequested = errors.New("supervisor restart requested")
 
 // SetOnRestart installs a callback invoked when FFmpeg restarts.
+//
+// Contract: the callback is invoked without the supervisor lock held, so
+// the callback is free to call back into supervisor.Status() or anything
+// that itself takes the supervisor lock. Do not change this invocation
+// pattern without auditing every callback (adaptive controller +
+// app.Server.publishState rely on it).
 func (s *Supervisor) SetOnRestart(fn func()) {
 	s.mu.Lock()
 	s.onRestart = fn
 	s.mu.Unlock()
+}
+
+// SetOnStateChange installs a callback invoked whenever status.State
+// transitions. Same lock contract as SetOnRestart: invoked without
+// the supervisor lock held, may re-enter Status().
+//
+// The supervisor calls this on every state-mutating method. Callers
+// don't need to deduplicate — the SSE hub coalesces rapid publishes
+// into one wire frame.
+func (s *Supervisor) SetOnStateChange(fn func()) {
+	s.mu.Lock()
+	s.onStateChange = fn
+	s.mu.Unlock()
+}
+
+// emitStateChange is called after every state mutation. Reads the
+// callback under the lock, then invokes it outside the lock to honor
+// the contract documented on SetOnStateChange.
+func (s *Supervisor) emitStateChange() {
+	s.mu.Lock()
+	fn := s.onStateChange
+	s.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // CurrentConfig returns a copy of the currently configured FFmpeg config.
@@ -128,15 +167,16 @@ func (s *Supervisor) Start(config Config) error {
 	if err := config.Validate(); err != nil {
 		return err
 	}
-
-	args, err := config.Args()
-	if err != nil {
+	// Build args once up front to surface configuration errors synchronously
+	// to the caller, instead of finding them after the supervisor goroutine
+	// has already moved into StateStarting.
+	if _, err := config.Args(); err != nil {
 		return err
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.cancel != nil {
+		s.mu.Unlock()
 		return errors.New("stream is already running")
 	}
 
@@ -150,9 +190,13 @@ func (s *Supervisor) Start(config Config) error {
 		StartedAt:      time.Now().UTC(),
 		UpdatedAt:      time.Now().UTC(),
 		ActivePresetID: config.Preset.ID,
-		Command:        append([]string{config.Binary}, args...),
 	}
+	s.mu.Unlock()
 
+	// Publish the Starting state so the UI flips to "Connecting..."
+	// immediately instead of staying on whatever state was visible
+	// before (Idle/Failed).
+	s.emitStateChange()
 	go s.run(ctx)
 	return nil
 }
@@ -161,8 +205,8 @@ func (s *Supervisor) Start(config Config) error {
 // the stream intent active. It returns false when there is no active stream.
 func (s *Supervisor) Restart(reason string) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.cancel == nil || s.restart == nil {
+		s.mu.Unlock()
 		return false
 	}
 	if reason == "" {
@@ -175,6 +219,8 @@ func (s *Supervisor) Restart(reason string) bool {
 	case s.restart <- reason:
 	default:
 	}
+	s.mu.Unlock()
+	s.emitStateChange()
 	return true
 }
 
@@ -182,12 +228,17 @@ func (s *Supervisor) Stop() {
 	s.mu.Lock()
 	cancel := s.cancel
 	done := s.done
+	changed := false
 	if cancel != nil {
 		s.status.State = StateStopping
 		s.status.UpdatedAt = time.Now().UTC()
+		changed = true
 	}
 	s.mu.Unlock()
 
+	if changed {
+		s.emitStateChange()
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -234,10 +285,11 @@ func (s *Supervisor) progressStalledSince(started time.Time) (bool, string) {
 
 func (s *Supervisor) markDegraded(reason string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.status.State = StateDegraded
 	s.status.LastError = reason
 	s.status.UpdatedAt = time.Now().UTC()
+	s.mu.Unlock()
+	s.emitStateChange()
 }
 
 func (s *Supervisor) run(ctx context.Context) {
@@ -248,11 +300,16 @@ func (s *Supervisor) run(ctx context.Context) {
 		s.cancel = nil
 		s.done = nil
 		s.restart = nil
+		changed := false
 		if s.status.State == StateStopping {
 			s.status.State = StateIdle
 			s.status.UpdatedAt = time.Now().UTC()
+			changed = true
 		}
 		s.mu.Unlock()
+		if changed {
+			s.emitStateChange()
+		}
 		if done != nil {
 			close(done)
 		}
@@ -366,7 +423,17 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	s.status.AudioRMSAt = time.Time{}
 	s.status.AudioDetectedAt = time.Time{}
 	s.status.UpdatedAt = time.Now().UTC()
+	preset := s.status.ActivePresetID
+	outputMode := s.ffmpeg.OutputMode
+	if outputMode == "" {
+		outputMode = OutputRTMP
+	}
 	s.mu.Unlock()
+	// Tell the UI we've actually reached Running. Without this, the
+	// dashboard stays stuck on the initial Starting/Waiting snapshot
+	// from handleStart until something else triggers a publish.
+	s.emitStateChange()
+	s.logger.Printf("stream-start: preset=%s output=%s pid=%d", preset, outputMode, cmd.Process.Pid)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -395,6 +462,8 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 			if s.pidFile != nil {
 				s.pidFile.Clear()
 			}
+			s.logger.Printf("stream-end: ffmpeg exited after %s (%s)",
+				time.Since(processStarted).Round(time.Second), exitMessage(err))
 			return err
 
 		case reason := <-restartCh:
@@ -441,17 +510,24 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 
 func (s *Supervisor) recordProgress(progress Progress) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.status.LastProgress = progress
 	s.status.UpdatedAt = time.Now().UTC()
-	if s.status.State == StateDegraded {
+	recovered := s.status.State == StateDegraded
+	if recovered {
 		s.status.State = StateRunning
 		s.status.LastError = ""
+	}
+	s.mu.Unlock()
+	if recovered {
+		s.emitStateChange()
 	}
 }
 
 func (s *Supervisor) recordLogs(r io.Reader) {
 	scanner := bufio.NewScanner(r)
+	s.mu.Lock()
+	streamKey := s.ffmpeg.StreamName
+	s.mu.Unlock()
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -473,6 +549,10 @@ func (s *Supervisor) recordLogs(r io.Reader) {
 				s.status.AudioDetectedAt = now
 			}
 			s.mu.Unlock()
+			// Push the new audio level to SSE subscribers so the
+			// dashboard meter updates live. FFmpeg emits this stat
+			// every 1 second; the hub coalesces if needed.
+			s.emitStateChange()
 			continue
 		}
 		// Skip ametadata frame-header lines (file=/dev/stderr output).
@@ -480,18 +560,49 @@ func (s *Supervisor) recordLogs(r io.Reader) {
 			continue
 		}
 
-		hint := classifyFFmpegError(line)
+		// FFmpeg echoes the full RTMP URL (including the stream key) when
+		// the destination rejects the connection. Redact before storing or
+		// logging so the key never leaks into log files or /status.
+		redacted := redactStreamKey(line, streamKey)
+		hint := classifyFFmpegError(redacted)
 		s.mu.Lock()
-		s.status.LastLogLine = line
+		s.status.LastLogLine = redacted
 		if hint != "" {
 			s.status.LastError = hint
 		}
 		s.status.UpdatedAt = time.Now().UTC()
 		s.mu.Unlock()
 		if s.logger != nil {
-			s.logger.Printf("ffmpeg: %s", line)
+			s.logger.Printf("ffmpeg: %s", redacted)
 		}
 	}
+}
+
+// permissionDeniedMessage returns OS-appropriate guidance for the
+// "permission denied" FFmpeg error. macOS users need to grant TCC
+// privacy permissions; Linux users typically need to be added to the
+// `video` (and possibly `audio`) groups for /dev/video* access.
+func permissionDeniedMessage() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "Permission denied. On macOS, grant camera/microphone access in System Settings > Privacy & Security."
+	case "linux":
+		return "Permission denied. On Linux, ensure the easystream user is in the 'video' (and 'audio') groups: sudo usermod -aG video,audio $USER (then log out + back in)."
+	default:
+		return "Permission denied. The OS denied access to the capture device — check your platform's permission model."
+	}
+}
+
+// redactStreamKey replaces occurrences of the stream key in a log line
+// with "<redacted>" so the key never appears in logs or the /status API.
+func redactStreamKey(line, key string) string {
+	if key == "" || len(key) < 8 {
+		return line
+	}
+	if !strings.Contains(line, key) {
+		return line
+	}
+	return strings.ReplaceAll(line, key, "<redacted>")
 }
 
 // parseAudioRMS extracts the RMS_level value from an FFmpeg ametadata log line.
@@ -531,7 +642,7 @@ func classifyFFmpegError(line string) string {
 		return "Capture device not found. Plug it in or pick a different source."
 	case strings.Contains(l, "permission denied"),
 		strings.Contains(l, "operation not permitted"):
-		return "Permission denied. On macOS, grant camera/microphone access in System Settings > Privacy."
+		return permissionDeniedMessage()
 	case strings.Contains(l, "device or resource busy"),
 		strings.Contains(l, "device i/o error"),
 		strings.Contains(l, "no av capture device"):
@@ -547,20 +658,29 @@ func classifyFFmpegError(line string) string {
 
 func (s *Supervisor) setRestarting(lastExit string, delay time.Duration) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.status.State = StateRestarting
 	s.status.LastExit = lastExit
-	s.status.LastError = fmt.Sprintf("restarting FFmpeg in %s", delay.Round(time.Second))
+	// Preserve the classified reason from recordLogs (e.g. "Destination
+	// rejected the connection. Verify your stream key and ingest URL.")
+	// so the operator sees WHY we're restarting, not the useless
+	// "restarting in 1s" countdown. The state itself (Restarting) is
+	// enough signal that a retry is in progress.
+	if s.status.LastError == "" {
+		s.status.LastError = fmt.Sprintf("restarting FFmpeg in %s", delay.Round(time.Second))
+	}
 	s.status.UpdatedAt = time.Now().UTC()
+	s.mu.Unlock()
+	s.emitStateChange()
 }
 
 func (s *Supervisor) setExit(state State, lastExit, lastError string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.status.State = state
 	s.status.LastExit = lastExit
 	s.status.LastError = lastError
 	s.status.UpdatedAt = time.Now().UTC()
+	s.mu.Unlock()
+	s.emitStateChange()
 }
 
 func exitMessage(err error) string {

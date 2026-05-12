@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -14,15 +15,21 @@ import (
 // --- Status ---
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.statusSnapshot())
+}
+
+// statusSnapshot builds the full state object returned by /api/status and
+// pushed over SSE. Single source of truth so the polled and pushed views
+// stay identical.
+func (s *Server) statusSnapshot() map[string]any {
 	s.mu.Lock()
 	config := s.config
 	health := s.streamHealth
 	broadcastID := s.activeBroadcastID
-	destMode := s.destinationMode
 	s.mu.Unlock()
 
 	streamStatus := s.supervisor.Status()
-	confidence := computeConfidence(streamStatus, health, broadcastID, destMode)
+	confidence := computeConfidence(streamStatus, health, broadcastID)
 
 	result := map[string]any{
 		"stream":            streamStatus,
@@ -30,6 +37,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"config":            s.configResponse(config),
 		"presets":           quality.Selectable(),
 		"platform":          ffmpeg.PlatformBackend(),
+		"capabilities":      s.ffmpegCaps,
 		"health":            health,
 		"confidence":        confidence,
 		"activeBroadcastId": broadcastID,
@@ -46,7 +54,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if s.schedStore != nil {
 		result["nextEvents"] = s.schedStore.NextEvents(5, time.Now().UTC())
 	}
-	writeJSON(w, http.StatusOK, result)
+	return result
 }
 
 // --- Config ---
@@ -70,6 +78,7 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		OutputMode   *ffmpeg.OutputMode `json:"outputMode"`
 		IngestURL    *string            `json:"ingestUrl"`
 		StreamName   *string            `json:"streamName"`
+		EnableHLS    *bool              `json:"enableHls"`
 		Input        *ffmpeg.Input      `json:"input"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
@@ -91,7 +100,23 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		s.config.Preset = preset
 	}
 	if patch.OutputMode != nil {
-		s.config.OutputMode = *patch.OutputMode
+		// Migrate legacy "hls" payloads from older UIs to the new shape.
+		if *patch.OutputMode == "hls" {
+			s.config.OutputMode = ffmpeg.OutputRTMP
+			s.config.EnableHLS = true
+		} else if *patch.OutputMode == ffmpeg.OutputSRT && !s.ffmpegCaps.SRT {
+			// Don't let the operator silently set SRT when FFmpeg
+			// can't actually push it — they'd find out at go-live.
+			s.mu.Unlock()
+			writeError(w, http.StatusBadRequest,
+				"this FFmpeg build does not support SRT — see README for install instructions.")
+			return
+		} else {
+			s.config.OutputMode = *patch.OutputMode
+		}
+	}
+	if patch.EnableHLS != nil {
+		s.config.EnableHLS = *patch.EnableHLS
 	}
 	if patch.IngestURL != nil {
 		s.config.IngestURL = strings.TrimSpace(*patch.IngestURL)
@@ -100,7 +125,24 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		s.config.StreamName = strings.TrimSpace(*patch.StreamName)
 	}
 	if patch.Input != nil {
-		s.config.Input = *patch.Input
+		// Reject saves that drop the device name for backends where
+		// indexes shift between boots. The persisted name is what makes
+		// "go live on the right source" robust; saving without it is
+		// the silent failure mode that caused Sunday's wrong-source bug.
+		in := *patch.Input
+		needsName := in.Kind != ffmpeg.InputTestVideo && in.Kind != ""
+		platformBackend := in.Backend
+		if platformBackend == "" {
+			platformBackend = ffmpeg.PlatformBackend()
+		}
+		stableNeeded := platformBackend == "avfoundation" || platformBackend == "dshow" || platformBackend == "v4l2"
+		if needsName && stableNeeded && in.VideoDevice != "" && in.VideoDeviceName == "" {
+			s.mu.Unlock()
+			writeError(w, http.StatusBadRequest,
+				"video device name is required (capture device unplugged when this save was made? refresh devices and try again)")
+			return
+		}
+		s.config.Input = in
 	}
 	if patch.Encoder != nil {
 		s.config.Encoder = *patch.Encoder
@@ -114,6 +156,10 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			s.logger.Printf("failed to persist stream config: %v", err)
 		}
 	}
+	// Push to every open UI so a source/preset change in tab A propagates
+	// to tab B immediately. The preview reconnects client-side once the
+	// status event lands.
+	s.publishState()
 	writeJSON(w, http.StatusOK, s.configResponse(config))
 }
 
@@ -125,7 +171,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	// Clean old HLS segments before starting a new stream.
-	if config.OutputMode == ffmpeg.OutputHLS && s.hlsServer != nil {
+	if config.EnableHLS && s.hlsServer != nil {
 		_ = s.hlsServer.Clean()
 	}
 
@@ -148,6 +194,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	s.resetDestinationBadCount()
 	s.markLive("manual", "", "")
+	s.publishState()
 	writeJSON(w, http.StatusAccepted, s.supervisor.Status())
 }
 
@@ -180,13 +227,16 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	// "stream ended" instead of spinning indefinitely.
 	if broadcastID != "" && s.ytClient != nil && s.ytAuth.IsAuthenticated() {
 		go func(id string) {
-			if err := s.ytClient.TransitionBroadcast(id, "complete"); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := s.ytClient.TransitionBroadcast(ctx, id, "complete"); err != nil {
 				s.logger.Printf("stop: complete broadcast %s: %v", id, err)
 			} else {
 				s.logger.Printf("stop: broadcast %s transitioned to complete", id)
 			}
 		}(broadcastID)
 	}
+	s.publishState()
 	writeJSON(w, http.StatusOK, s.supervisor.Status())
 }
 
@@ -208,6 +258,7 @@ func (s *Server) handleExtend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.publishState()
 	writeJSON(w, http.StatusOK, map[string]any{"endsAt": endsAt})
 }
 
@@ -224,6 +275,7 @@ func (s *Server) handleAdaptiveToggle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.adaptive.SetEnabled(body.Enabled)
+	s.publishState()
 	writeJSON(w, http.StatusOK, s.adaptive.State())
 }
 
@@ -247,7 +299,10 @@ func (s *Server) handleEncoders(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) configResponse(config ffmpeg.Config) map[string]any {
 	outputMode := string(config.OutputMode)
-	if outputMode == "" {
+	if outputMode == "" || outputMode == "hls" {
+		// Normalise away the legacy "hls" value so clients only ever
+		// see the new shape (outputMode is the primary; enableHls is a
+		// separate boolean).
 		outputMode = "rtmp"
 	}
 	result := map[string]any{
@@ -258,6 +313,7 @@ func (s *Server) configResponse(config ffmpeg.Config) map[string]any {
 		"outputMode":   outputMode,
 		"ingestUrl":    config.IngestURL,
 		"hasStreamKey": config.StreamName != "",
+		"enableHls":    config.EnableHLS,
 		"network":      config.Network,
 	}
 	if s.hlsServer != nil {

@@ -23,16 +23,19 @@ func TestArgsIncludeBandwidthAndRecoveryOptions(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, expected := range []string{
 		"-b:v 10000k",       // YT-recommended 1080p30
-		"-maxrate 10000k",   // CBR
-		"-bufsize 20000k",   // 2x bitrate
+		"-maxrate 10000k",   // CBR target
+		"-bufsize 10000k",   // 1s VBV (bufsize == maxrate) — true CBR
 		"-g 60",             // 2-second keyframe interval
 		"-bf 2",             // YT: 2 B-frames
 		"-refs 1",           // YT: 1 reference frame
 		"-profile:v high",   // YT requires High profile for CABAC
 		"-colorspace bt709", // YT: Rec.709 SDR
-		"open-gop=0",        // Cloudflare requires closed GOP
+		"filler=1",          // VBV filler NALs maintain hard-CBR
+		"open-gop=0",        // Closed GOP
+		"scenecut=0",        // No scene-change keyframes; predictable segmenting
 		"-tcp_keepalive 1",
 		"-rw_timeout 12000000",
+		"aresample=async=1:min_hard_comp=0.100000:osr=48000", // soft drift correction; no PTS-warping
 		"ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr",
 		"rtmps://a.rtmps.youtube.com/live2/abc-def-ghi",
 	} {
@@ -145,6 +148,183 @@ func TestChooseAVFoundationDeviceIndex(t *testing.T) {
 	_, ok = chooseAVFoundationDeviceIndex(output, "MacBook Air Microphone", "video")
 	if ok {
 		t.Fatal("expected not found for audio device searched in video section")
+	}
+}
+
+func TestArgsSRTOutput(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.OutputMode = OutputSRT
+	cfg.IngestURL = "srt://example.com:9999"
+	cfg.StreamName = ""
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, expected := range []string{
+		"-f mpegts",
+		"-flush_packets 1",
+		"srt://example.com:9999",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Errorf("expected %q in args: %s", expected, joined)
+		}
+	}
+	if strings.Contains(joined, "-f flv") {
+		t.Errorf("did not expect RTMP flags in SRT output: %s", joined)
+	}
+}
+
+// TestArgsSRTPassesURLVerbatim confirms we don't mutate the SRT URL.
+// Receivers use varied streamid/passphrase/latency syntax — any
+// re-encoding (e.g. %3A for ':') breaks the handshake.
+func TestArgsSRTPassesURLVerbatim(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.OutputMode = OutputSRT
+	cfg.IngestURL = "srt://ingest.example.com:9999?streamid=abc-input:secret&latency=4000"
+	cfg.StreamName = "ignored-for-srt"
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "srt://ingest.example.com:9999?streamid=abc-input:secret&latency=4000") {
+		t.Errorf("expected SRT URL passed verbatim, got: %s", joined)
+	}
+	if strings.Contains(joined, "%3A") {
+		t.Errorf("URL must not URL-encode the colon in streamid: %s", joined)
+	}
+}
+
+// TestSRTRequiresOnlyURL verifies that SRT validates with just a URL
+// (no stream key), since the streamid goes inside the URL.
+func TestSRTRequiresOnlyURL(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.OutputMode = OutputSRT
+	cfg.IngestURL = "srt://example.com:9999?streamid=foo"
+	cfg.StreamName = ""
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("SRT with URL-only should validate, got: %v", err)
+	}
+}
+
+func TestArgsHLSToggleAlongsideRTMP(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.IngestURL = "rtmp://x"
+	cfg.StreamName = "abc"
+	cfg.EnableHLS = true
+	cfg.HLSDir = "/tmp/hls"
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	// Primary + HLS sidecar share one encoder via the tee muxer —
+	// so the args should NOT have separate -f flv / -f hls outputs,
+	// they should be a single -f tee with two bracketed targets.
+	if !strings.Contains(joined, "-f tee ") {
+		t.Errorf("expected tee muxer to fan out one encoder to RTMP+HLS: %s", joined)
+	}
+	if !strings.Contains(joined, "[f=flv:tcp_keepalive=1") {
+		t.Errorf("expected tee primary slave spec: %s", joined)
+	}
+	if !strings.Contains(joined, "[f=hls:hls_time=6") {
+		t.Errorf("expected tee HLS slave spec: %s", joined)
+	}
+	// HLS must NOT use -c copy on raw input — that produces invalid
+	// HLS because inputs are uyvy422/PCM, not H.264/AAC. tee shares
+	// the global -c:v libx264 / -c:a aac_at across both targets.
+	if strings.Contains(joined, "-c copy") {
+		t.Errorf("HLS must not use -c copy on raw inputs: %s", joined)
+	}
+}
+
+func TestArgsHLSOnly(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.IngestURL = ""
+	cfg.StreamName = ""
+	cfg.EnableHLS = true
+	cfg.HLSDir = "/tmp/hls"
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "-f flv") {
+		t.Errorf("did not expect RTMP output for HLS-only: %s", joined)
+	}
+	if !strings.Contains(joined, "-f hls") {
+		t.Errorf("expected HLS output: %s", joined)
+	}
+}
+
+func TestValidateRequiresAnyOutput(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.IngestURL = ""
+	cfg.StreamName = ""
+	cfg.EnableHLS = false
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validate to fail when no output is configured")
+	}
+}
+
+// FFmpeg 8.1.1 (Homebrew on Apple Silicon) real output. Note `indev`
+// (not "input device") — the section-header detection must remain
+// robust against the prefix wording change across FFmpeg versions.
+const ffmpeg8AVFoundationOutput = `[AVFoundation indev @ 0x7c4c14140] AVFoundation video devices:
+[AVFoundation indev @ 0x7c4c14140] [0] OBS Virtual Camera
+[AVFoundation indev @ 0x7c4c14140] [1] FaceTime HD Camera
+[AVFoundation indev @ 0x7c4c14140] [2] Ssimpson Camera
+[AVFoundation indev @ 0x7c4c14140] [3] Ssimpson Desk View Camera
+[AVFoundation indev @ 0x7c4c14140] [4] Capture screen 0
+[AVFoundation indev @ 0x7c4c14140] AVFoundation audio devices:
+[AVFoundation indev @ 0x7c4c14140] [0] NDI Audio
+[AVFoundation indev @ 0x7c4c14140] [1] MacBook Air Microphone
+[AVFoundation indev @ 0x7c4c14140] [2] Ssimpson Microphone
+[in#0 @ 0x7c4c14000] Error opening input: Input/output error`
+
+func TestMatchAVFoundationDevicesAgainstFFmpeg8Fixture(t *testing.T) {
+	// Continuity Camera Desk View — name with multiple words including
+	// "Desk View". The regex must capture the full name despite the
+	// embedded "Desk" word which the parser doesn't special-case.
+	matches := matchAVFoundationDevices(ffmpeg8AVFoundationOutput, "Ssimpson Desk View Camera", "video")
+	if len(matches) != 1 || matches[0] != "3" {
+		t.Fatalf("expected [3] for Desk View Camera, got %v", matches)
+	}
+	// Audio name should not match a video device with the same word.
+	matches = matchAVFoundationDevices(ffmpeg8AVFoundationOutput, "Ssimpson Camera", "audio")
+	if len(matches) != 0 {
+		t.Errorf("video-only name should not match in audio section: %v", matches)
+	}
+	// Capture screen 0 — name contains a digit at the end. Confirms
+	// the regex doesn't greedily eat the trailing "0".
+	matches = matchAVFoundationDevices(ffmpeg8AVFoundationOutput, "Capture screen 0", "video")
+	if len(matches) != 1 || matches[0] != "4" {
+		t.Errorf("expected [4] for Capture screen 0, got %v", matches)
+	}
+}
+
+func TestMatchAVFoundationDevicesDetectsDuplicateNames(t *testing.T) {
+	// Two HDMI capture cards both reporting the same name — a real-world
+	// AVFoundation case that the old chooseAVFoundationDeviceIndex would
+	// silently resolve to the first match, picking the wrong twin.
+	output := `[AVFoundation indev] AVFoundation video devices:
+[AVFoundation indev] [0] FaceTime HD Camera
+[AVFoundation indev] [1] USB Capture HDMI
+[AVFoundation indev] [2] USB Capture HDMI
+[AVFoundation indev] AVFoundation audio devices:
+[AVFoundation indev] [0] MacBook Air Microphone`
+
+	matches := matchAVFoundationDevices(output, "USB Capture HDMI", "video")
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 matches, got %d (%v)", len(matches), matches)
+	}
+	if matches[0] != "1" || matches[1] != "2" {
+		t.Fatalf("expected indexes 1,2, got %v", matches)
 	}
 }
 
