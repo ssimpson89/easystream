@@ -549,6 +549,10 @@ func (s *Supervisor) recordLogs(r io.Reader) {
 				s.status.AudioDetectedAt = now
 			}
 			s.mu.Unlock()
+			// Push the new audio level to SSE subscribers so the
+			// dashboard meter updates live. FFmpeg emits this stat
+			// every 1 second; the hub coalesces if needed.
+			s.emitStateChange()
 			continue
 		}
 		// Skip ametadata frame-header lines (file=/dev/stderr output).

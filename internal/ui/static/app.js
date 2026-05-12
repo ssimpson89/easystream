@@ -871,7 +871,10 @@ document.addEventListener("alpine:init", () => {
         twitch:     "rtmp://live.twitch.tv/app",
       };
       const SRT = {
-        "srt-cloudflare": "srt://live.cloudflare.com:778",
+        // Cloudflare's SRT receiver uses AES-256 — pbkeylen=32 must be
+        // explicit because libsrt defaults to 16 (AES-128) which
+        // Cloudflare rejects with a silent "stream has not started".
+        "srt-cloudflare": "srt://live.cloudflare.com:778?pbkeylen=32",
       };
       if (RTMP[platform]) {
         this.outputMode = "rtmp";
