@@ -476,7 +476,17 @@ document.addEventListener("alpine:init", () => {
       }
       // Audio source
       let aSource;
-      if (this.isSDISource) {
+      // Supervisor signals "running with silent audio because the
+      // configured mic vanished" via audioFallbackDevice. Surface
+      // that first so the operator sees what's happening: silent
+      // audio is live, and we'll reconnect when the mic returns.
+      const fallback = this.stream?.audioFallbackDevice;
+      if (fallback) {
+        aSource = {
+          icon: "mic", label: "Audio", status: "yellow",
+          detail: `${fallback} disconnected — silent audio (will reconnect when mic returns)`,
+        };
+      } else if (this.isSDISource) {
         aSource = { icon: "mic", label: "Audio", status: "green", detail: "Embedded SDI audio" };
       } else if (this.isNetworkSource) {
         aSource = this.networkNoAudio
