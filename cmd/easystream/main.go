@@ -35,7 +35,21 @@ import (
 // aren't on it. Without this, every FFmpeg probe (device list,
 // encoder detect, framerate) silently returns empty and the daemon
 // fails to start with a confusing error.
+//
+// Prefers `ffmpeg-full` (Homebrew keg-only formula that bundles all
+// codecs + libsrt) over the default `ffmpeg` formula, since the
+// stripped-down default is missing protocols people actually need
+// (SRT, RIST, etc.). EasyStream auto-picks ffmpeg-full when present.
 func findFFmpeg() string {
+	// Keg-only ffmpeg-full first — most feature-complete on Homebrew.
+	for _, candidate := range []string{
+		"/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg", // Apple Silicon
+		"/usr/local/opt/ffmpeg-full/bin/ffmpeg",    // Intel
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
 	if p, err := exec.LookPath("ffmpeg"); err == nil {
 		return p
 	}
