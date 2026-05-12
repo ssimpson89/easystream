@@ -472,10 +472,16 @@ func (c Config) hlsOutputArgs() []string {
 // primaryTeeSlave returns the tee-muxer slave spec for the primary
 // destination. Slave options inside [...] are colon-separated; the
 // URL follows after ']' and may contain any character except '|'.
+//
+// muxdelay and muxpreload are deliberately NOT included here even
+// though the non-tee SRT path sets them: they're global format-
+// context options that the tee slave option parser rejects with
+// "Unknown option 'muxdelay'". The tee path still gets low-latency
+// behaviour from -flush_packets and the encoder's own VBV settings.
 func (c Config) primaryTeeSlave() (string, error) {
 	switch c.OutputMode {
 	case OutputSRT:
-		return "[f=mpegts:flush_packets=1:muxdelay=0:muxpreload=0]" + c.OutputURL(), nil
+		return "[f=mpegts:flush_packets=1]" + c.OutputURL(), nil
 	case OutputRTMP, "":
 		opts := []string{"f=flv"}
 		if c.Network.TCPKeepalive {
@@ -903,18 +909,62 @@ func (c Config) buildNetworkInput() inputBuild {
 		scheme = strings.ToLower(url[:i])
 	}
 
-	var args []string
+	// Per-input flags apply to the next -i. These override the
+	// global -fflags nobuffer / -flags low_delay defaults that
+	// are tuned for capture devices (where we want minimum
+	// latency) but actively hurt network ingest:
+	//
+	//   +discardcorrupt  drops frames that reference pictures we
+	//                    haven't received yet — happens when an
+	//                    RTSP/SRT pull starts mid-GOP before the
+	//                    next IDR arrives. Without this the H.264
+	//                    decoder logs "mmco: unref short failure"
+	//                    and never produces a clean frame.
+	//   +genpts          regenerate PTS for sources that ship
+	//                    weird timestamps (negative start times,
+	//                    non-monotonic clocks, etc.).
+	//   analyzeduration  and probesize: cap how long FFmpeg
+	//                    inspects the input before emitting the
+	//                    first output. Default is 5 seconds /
+	//                    5 MB; 1 s / 1 MB is plenty for a stream
+	//                    that's already announcing its codec.
+	args := []string{
+		"-fflags", "+discardcorrupt+genpts",
+		"-analyzeduration", "1000000",
+		"-probesize", "1000000",
+	}
+
 	switch scheme {
 	case "rtsp", "rtsps":
 		// TCP avoids the UDP-RTSP packet-loss / NAT-traversal pain
 		// that's typical on church LANs with PoE switches.
-		args = append(args, "-rtsp_transport", "tcp")
+		// -rtsp_flags prefer_tcp ensures TCP is used for media too,
+		// not just control.
+		args = append(args,
+			"-rtsp_transport", "tcp",
+			"-rtsp_flags", "prefer_tcp",
+		)
 	case "srt":
-		// libsrt reads everything else from the URL.
+		// libsrt reads transport options from URL params (latency,
+		// passphrase, streamid, etc.). Nothing to add here.
 	case "udp", "rtp":
 		// MPEG-TS over UDP tends to be bursty; bigger fifo prevents
-		// drops on the source side.
-		args = append(args, "-fifo_size", "1000000", "-overrun_nonfatal", "1")
+		// drops on the source side, overrun_nonfatal keeps us
+		// running through transient overruns.
+		args = append(args,
+			"-fifo_size", "1000000",
+			"-overrun_nonfatal", "1",
+		)
+	case "http", "https":
+		// HLS / progressive HTTP pulls: auto-reconnect on transient
+		// network blips. -reconnect_streamed 1 resumes mid-stream
+		// instead of erroring at the first disconnect.
+		args = append(args,
+			"-reconnect", "1",
+			"-reconnect_streamed", "1",
+			"-reconnect_delay_max", "5",
+			"-multiple_requests", "1",
+		)
 	}
 	args = append(args, "-i", url)
 

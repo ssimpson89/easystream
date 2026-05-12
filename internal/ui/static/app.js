@@ -457,13 +457,28 @@ document.addEventListener("alpine:init", () => {
       } else if (this.videoSourceValue === "test-video::") {
         v = { icon: "video", label: "Video", status: "green", detail: "Test pattern" };
       } else if (this.isNetworkSource) {
-        // Network sources can't be presence-checked locally — the URL
-        // is reachable or it isn't, and FFmpeg surfaces that at start.
+        // Network sources can't be presence-checked the way hardware
+        // devices can. Use the running ffmpeg's progress as the
+        // signal: encoder fps > 0 means frames are flowing through
+        // the pipeline (bitrate aggregation is unreliable under
+        // the tee muxer, so we key off fps instead).
         const url = (this.networkUrl || "").trim();
         if (!url) {
           v = { icon: "video", label: "Video", status: "red", detail: "Enter a network URL" };
+        } else if (this.stream?.state === "running") {
+          const fps = this.stream?.lastProgress?.fps || 0;
+          if (fps > 0) {
+            v = { icon: "video", label: "Video", status: "green", detail: `${url} (${fps.toFixed(0)} fps)` };
+          } else {
+            v = { icon: "video", label: "Video", status: "yellow",
+                  detail: `${url} — connected, waiting for frames` };
+          }
+        } else if (this.stream?.state === "failed") {
+          v = { icon: "video", label: "Video", status: "red",
+                detail: this.stream?.lastError || `Could not reach ${url}` };
         } else {
-          v = { icon: "video", label: "Video", status: "green", detail: url };
+          v = { icon: "video", label: "Video", status: "yellow",
+                detail: `${url} — not verified (start stream to check)` };
         }
       } else {
         const presence = this.devicePresence("video");
