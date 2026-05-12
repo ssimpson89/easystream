@@ -127,7 +127,7 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		if platformBackend == "" {
 			platformBackend = ffmpeg.PlatformBackend()
 		}
-		stableNeeded := platformBackend == "avfoundation" || platformBackend == "dshow"
+		stableNeeded := platformBackend == "avfoundation" || platformBackend == "dshow" || platformBackend == "v4l2"
 		if needsName && stableNeeded && in.VideoDevice != "" && in.VideoDeviceName == "" {
 			s.mu.Unlock()
 			writeError(w, http.StatusBadRequest,

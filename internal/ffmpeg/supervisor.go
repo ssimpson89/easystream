@@ -9,6 +9,7 @@ import (
 	"log"
 	"math/rand"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -514,6 +515,21 @@ func (s *Supervisor) recordLogs(r io.Reader) {
 	}
 }
 
+// permissionDeniedMessage returns OS-appropriate guidance for the
+// "permission denied" FFmpeg error. macOS users need to grant TCC
+// privacy permissions; Linux users typically need to be added to the
+// `video` (and possibly `audio`) groups for /dev/video* access.
+func permissionDeniedMessage() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "Permission denied. On macOS, grant camera/microphone access in System Settings > Privacy & Security."
+	case "linux":
+		return "Permission denied. On Linux, ensure the easystream user is in the 'video' (and 'audio') groups: sudo usermod -aG video,audio $USER (then log out + back in)."
+	default:
+		return "Permission denied. The OS denied access to the capture device — check your platform's permission model."
+	}
+}
+
 // redactStreamKey replaces occurrences of the stream key in a log line
 // with "<redacted>" so the key never appears in logs or the /status API.
 func redactStreamKey(line, key string) string {
@@ -563,7 +579,7 @@ func classifyFFmpegError(line string) string {
 		return "Capture device not found. Plug it in or pick a different source."
 	case strings.Contains(l, "permission denied"),
 		strings.Contains(l, "operation not permitted"):
-		return "Permission denied. On macOS, grant camera/microphone access in System Settings > Privacy."
+		return permissionDeniedMessage()
 	case strings.Contains(l, "device or resource busy"),
 		strings.Contains(l, "device i/o error"),
 		strings.Contains(l, "no av capture device"):

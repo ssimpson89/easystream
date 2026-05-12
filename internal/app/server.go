@@ -29,6 +29,11 @@ type ServerConfig struct {
 	ScheduleStore   *schedule.Store
 	HLSServer       *hls.Server
 	DataDir         string
+	// FFmpegBinary is the absolute path to ffmpeg picked at startup
+	// (cmd/easystream/main.go findFFmpeg). Defaults to plain "ffmpeg"
+	// if the caller didn't resolve a path, in which case the daemon
+	// relies on $PATH lookup.
+	FFmpegBinary string
 }
 
 // Server wires the EasyStream HTTP API + background controllers together.
@@ -123,6 +128,9 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 
 	defaultCfg := ffmpeg.DefaultConfig()
+	if cfg.FFmpegBinary != "" {
+		defaultCfg.Binary = cfg.FFmpegBinary
+	}
 	if cfg.HLSServer != nil {
 		defaultCfg.HLSDir = cfg.HLSServer.Dir()
 	}
@@ -164,9 +172,10 @@ func NewServer(cfg ServerConfig) *Server {
 			if persisted.Encoder != "" {
 				defaultCfg.Encoder = persisted.Encoder
 			}
-			// Resolve AVFoundation device names to current indexes. Device
-			// indexes shift between reboots or when USB devices are
-			// plugged/unplugged; the persisted name is the stable identifier.
+			// Resolve device names to their CURRENT identifiers. Device
+			// addressing shifts between reboots / USB replugs; the
+			// persisted name is the stable identifier. Symmetric on
+			// macOS (AVFoundation indexes) and Linux (/dev/videoN paths).
 			backend := defaultCfg.Input.Backend
 			if backend == "" {
 				backend = ffmpeg.PlatformBackend()
@@ -191,6 +200,37 @@ func NewServer(cfg ServerConfig) *Server {
 							defaultCfg.Input.AudioDeviceName, defaultCfg.Input.AudioDevice, resolved)
 					}
 					defaultCfg.Input.AudioDevice = resolved
+				}
+			}
+			if backend == "v4l2" && defaultCfg.Input.VideoDeviceName != "" {
+				resolved, err := ffmpeg.ResolveV4L2DevicePathStrict(
+					defaultCfg.Input.VideoDeviceName, defaultCfg.Input.VideoDevice)
+				if err == nil && resolved != defaultCfg.Input.VideoDevice {
+					cfg.Logger.Printf("resolved v4l2 video device %q from %s → %s",
+						defaultCfg.Input.VideoDeviceName, defaultCfg.Input.VideoDevice, resolved)
+					defaultCfg.Input.VideoDevice = resolved
+				}
+			}
+			// Legacy back-fill: a config saved before the strict-resolver
+			// branch has a path/index but no device name. We must
+			// back-fill from the current scan so the strict resolver
+			// (used at FFmpeg start) doesn't silently skip resolution
+			// — that fall-through is the exact wrong-source bug we
+			// closed for new configs.
+			if defaultCfg.Input.Kind != ffmpeg.InputTestVideo &&
+				defaultCfg.Input.VideoDevice != "" &&
+				defaultCfg.Input.VideoDeviceName == "" {
+				devScan := devices.NewScanner(defaultCfg.Binary).Scan()
+				for _, d := range devScan.Video {
+					if d.Backend == backend && d.Index == defaultCfg.Input.VideoDevice {
+						defaultCfg.Input.VideoDeviceName = d.Name
+						cfg.Logger.Printf("back-filled legacy video device name: %s = %q", d.Index, d.Name)
+						break
+					}
+				}
+				if defaultCfg.Input.VideoDeviceName == "" {
+					cfg.Logger.Printf("WARNING: legacy config references video device %q but no current device matches — re-pick in Settings",
+						defaultCfg.Input.VideoDevice)
 				}
 			}
 			cfg.Logger.Printf("loaded persisted stream config from %s", configPath)

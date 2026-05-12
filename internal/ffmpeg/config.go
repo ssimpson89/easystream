@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -439,9 +440,10 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 
 	case EncoderVAAPI:
 		// VA-API (Linux Intel/AMD). Requires a DRM render device.
-		// The video filter chain needs hwupload and format conversion.
+		// Multi-GPU systems (iGPU + dGPU) expose renderD128 AND
+		// renderD129 — pinning to 128 silently picks the wrong card.
 		return []string{
-			"-vaapi_device", "/dev/dri/renderD128",
+			"-vaapi_device", pickVAAPIRenderNode(),
 			"-c:v", "h264_vaapi",
 			"-profile:v", "high",
 			"-level", "41",
@@ -632,10 +634,23 @@ func (c Config) buildInputs() (inputBuild, error) {
 		}, nil
 
 	case "v4l2":
+		// Resolve the v4l2 device strictly by its kernel-reported name
+		// (/sys/class/video4linux/videoN/name). Symmetrical to the
+		// AVFoundation strict path: a missing/renamed device aborts
+		// the start rather than silently going live on whatever sits
+		// at the stale /dev/videoN path.
+		device := c.Input.VideoDevice
+		if c.Input.VideoDeviceName != "" {
+			resolved, err := ResolveV4L2DevicePathStrict(c.Input.VideoDeviceName, c.Input.VideoDevice)
+			if err != nil {
+				return inputBuild{}, fmt.Errorf("video source: %w", err)
+			}
+			device = resolved
+		}
 		if c.Input.AudioDevice != "" {
 			return inputBuild{
 				args: []string{
-					"-f", "v4l2", "-i", c.Input.VideoDevice,
+					"-f", "v4l2", "-i", device,
 					"-f", "alsa", "-i", c.Input.AudioDevice,
 				},
 				videoMap: "0:v", audioMap: "1:a",
@@ -643,15 +658,24 @@ func (c Config) buildInputs() (inputBuild, error) {
 		}
 		return inputBuild{
 			args: []string{
-				"-f", "v4l2", "-i", c.Input.VideoDevice,
+				"-f", "v4l2", "-i", device,
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
 		}, nil
 
 	case "decklink":
+		// DeckLink addresses by name (BlackMagic appends "(2)", "(3)"
+		// to disambiguate identical hardware). When a card is removed,
+		// the remaining ones get re-numbered — verify the saved name
+		// is still in `ffmpeg -list_devices` output before spawning,
+		// otherwise the operator sees a cryptic FFmpeg error.
+		device := c.Input.VideoDevice
+		if err := verifyDeckLinkDevicePresent(c.Binary, device); err != nil {
+			return inputBuild{}, fmt.Errorf("video source: %w", err)
+		}
 		return inputBuild{
-			args:     []string{"-f", "decklink", "-audio_input", "embedded", "-i", c.Input.VideoDevice},
+			args:     []string{"-f", "decklink", "-audio_input", "embedded", "-i", device},
 			videoMap: "0:v", audioMap: "0:a",
 		}, nil
 
@@ -786,6 +810,103 @@ func resolveAVFoundationDeviceIndex(binary, deviceName, kind, fallbackIndex stri
 		}
 		return "", fmt.Errorf("%w: %q is ambiguous (%d devices share this name, none at saved index %q)",
 			ErrDeviceNotFound, deviceName, len(matches), fallbackIndex)
+	}
+}
+
+// verifyDeckLinkDevicePresent runs FFmpeg's decklink listing and
+// returns nil if the named device is present. Used as a preflight in
+// buildInputs so a missing DeckLink (one of three was unplugged and
+// the rest got renumbered) surfaces a clean ErrDeviceNotFound instead
+// of a cryptic FFmpeg failure once we spawn the encoder.
+func verifyDeckLinkDevicePresent(binary, deviceName string) error {
+	if deviceName == "" {
+		return fmt.Errorf("%w: empty DeckLink device name", ErrDeviceNotFound)
+	}
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, binary, "-hide_banner", "-f", "decklink", "-list_devices", "1", "-i", "dummy").CombinedOutput()
+	// FFmpeg's decklink listing format: [decklink @ 0x...] 'DeckLink Mini Recorder HD'
+	target := strings.TrimSpace(strings.ToLower(deviceName))
+	for _, line := range strings.Split(string(out), "\n") {
+		// Single-quoted name extraction; case-insensitive equality.
+		if i := strings.Index(line, "'"); i >= 0 {
+			if j := strings.Index(line[i+1:], "'"); j >= 0 {
+				name := strings.TrimSpace(strings.ToLower(line[i+1 : i+1+j]))
+				if name == target {
+					return nil
+				}
+			}
+		}
+	}
+	return fmt.Errorf("%w: DeckLink %q not in current device list", ErrDeviceNotFound, deviceName)
+}
+
+// pickVAAPIRenderNode returns the first readable /dev/dri/renderD12X
+// node. Multi-GPU machines have several; rootless containers may have
+// none. Falls back to renderD128 (the kernel's first allocation) so
+// existing configs aren't disturbed.
+func pickVAAPIRenderNode() string {
+	for i := 128; i < 144; i++ {
+		path := fmt.Sprintf("/dev/dri/renderD%d", i)
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return "/dev/dri/renderD128"
+}
+
+// ResolveV4L2DevicePathStrict resolves a saved v4l2 device-name to its
+// CURRENT /dev/videoN path by reading /sys/class/video4linux/. This
+// closes the same wrong-source bug class on Linux as the AVFoundation
+// strict resolver does on macOS: when USB renumeration shifts what
+// /dev/video0 points at, we refuse to start FFmpeg on the new device.
+//
+// fallbackPath is used as a tie-breaker when multiple v4l2 nodes share
+// the same name (rare — capture cards expose sub-device nodes; the
+// device scanner filters those out, but a duplicate-name dual-camera
+// case can still happen). If a candidate's path matches the saved
+// fallbackPath we prefer it; otherwise ambiguity is an error.
+func ResolveV4L2DevicePathStrict(deviceName, fallbackPath string) (string, error) {
+	if deviceName == "" {
+		return "", fmt.Errorf("%w: empty device name", ErrDeviceNotFound)
+	}
+	entries, err := os.ReadDir("/sys/class/video4linux")
+	if err != nil {
+		// /sys not present (non-Linux, stripped container) — let the
+		// caller use the persisted path as-is.
+		return fallbackPath, nil
+	}
+	type cand struct{ path string }
+	var matches []cand
+	for _, e := range entries {
+		nm := e.Name()
+		if !strings.HasPrefix(nm, "video") {
+			continue
+		}
+		raw, err := os.ReadFile("/sys/class/video4linux/" + nm + "/name")
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(string(raw)), deviceName) {
+			matches = append(matches, cand{path: "/dev/" + nm})
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("%w: %q not under /sys/class/video4linux", ErrDeviceNotFound, deviceName)
+	case 1:
+		return matches[0].path, nil
+	default:
+		for _, m := range matches {
+			if m.path == fallbackPath {
+				return m.path, nil
+			}
+		}
+		return "", fmt.Errorf("%w: %q ambiguous (%d matches, none at saved path %q)",
+			ErrDeviceNotFound, deviceName, len(matches), fallbackPath)
 	}
 }
 

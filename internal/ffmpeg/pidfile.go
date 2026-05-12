@@ -1,6 +1,7 @@
 package ffmpeg
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -103,12 +104,37 @@ func isEasyStreamFFmpegProcess(pid int) bool {
 	return isFFmpegCommandLine(line) && isEasyStreamCommandLine(line)
 }
 
+// processCommand returns the full command line of pid.
+//
+// On Linux, read /proc/<pid>/cmdline directly: no subprocess, no PATH
+// dependency, and no truncation. procps `ps -o command=` defaults to
+// COLUMNS-truncated output, which silently breaks the orphan reaper
+// because the EasyStream marker substrings (e.g. rtp://127.0.0.1:52001)
+// can fall past the cutoff.
+//
+// On macOS, fall back to BSD `ps -ww` which gives unlimited width.
 func processCommand(pid int) (string, error) {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	if path := fmt.Sprintf("/proc/%d/cmdline", pid); fileExists(path) {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		// /proc/<pid>/cmdline separates argv with NULs and ends with a
+		// trailing NUL. Replace NULs with spaces so the marker-substring
+		// checks see a normal command line.
+		s := strings.ReplaceAll(strings.TrimRight(string(raw), "\x00"), "\x00", " ")
+		return s, nil
+	}
+	out, err := exec.Command("ps", "-ww", "-p", strconv.Itoa(pid), "-o", "command=").Output()
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func isFFmpegCommandLine(line string) bool {

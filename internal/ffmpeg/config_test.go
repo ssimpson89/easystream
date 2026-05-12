@@ -249,6 +249,42 @@ func TestValidateRequiresAnyOutput(t *testing.T) {
 	}
 }
 
+// FFmpeg 8.1.1 (Homebrew on Apple Silicon) real output. Note `indev`
+// (not "input device") — the section-header detection must remain
+// robust against the prefix wording change across FFmpeg versions.
+const ffmpeg8AVFoundationOutput = `[AVFoundation indev @ 0x7c4c14140] AVFoundation video devices:
+[AVFoundation indev @ 0x7c4c14140] [0] OBS Virtual Camera
+[AVFoundation indev @ 0x7c4c14140] [1] FaceTime HD Camera
+[AVFoundation indev @ 0x7c4c14140] [2] Ssimpson Camera
+[AVFoundation indev @ 0x7c4c14140] [3] Ssimpson Desk View Camera
+[AVFoundation indev @ 0x7c4c14140] [4] Capture screen 0
+[AVFoundation indev @ 0x7c4c14140] AVFoundation audio devices:
+[AVFoundation indev @ 0x7c4c14140] [0] NDI Audio
+[AVFoundation indev @ 0x7c4c14140] [1] MacBook Air Microphone
+[AVFoundation indev @ 0x7c4c14140] [2] Ssimpson Microphone
+[in#0 @ 0x7c4c14000] Error opening input: Input/output error`
+
+func TestMatchAVFoundationDevicesAgainstFFmpeg8Fixture(t *testing.T) {
+	// Continuity Camera Desk View — name with multiple words including
+	// "Desk View". The regex must capture the full name despite the
+	// embedded "Desk" word which the parser doesn't special-case.
+	matches := matchAVFoundationDevices(ffmpeg8AVFoundationOutput, "Ssimpson Desk View Camera", "video")
+	if len(matches) != 1 || matches[0] != "3" {
+		t.Fatalf("expected [3] for Desk View Camera, got %v", matches)
+	}
+	// Audio name should not match a video device with the same word.
+	matches = matchAVFoundationDevices(ffmpeg8AVFoundationOutput, "Ssimpson Camera", "audio")
+	if len(matches) != 0 {
+		t.Errorf("video-only name should not match in audio section: %v", matches)
+	}
+	// Capture screen 0 — name contains a digit at the end. Confirms
+	// the regex doesn't greedily eat the trailing "0".
+	matches = matchAVFoundationDevices(ffmpeg8AVFoundationOutput, "Capture screen 0", "video")
+	if len(matches) != 1 || matches[0] != "4" {
+		t.Errorf("expected [4] for Capture screen 0, got %v", matches)
+	}
+}
+
 func TestMatchAVFoundationDevicesDetectsDuplicateNames(t *testing.T) {
 	// Two HDMI capture cards both reporting the same name — a real-world
 	// AVFoundation case that the old chooseAVFoundationDeviceIndex would

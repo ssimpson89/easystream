@@ -6,10 +6,17 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 	"time"
+
+	// Embed Go's tzdata. macOS and most Linux distros ship system
+	// zoneinfo, but minimal containers, NixOS images without
+	// `localization.timeZone`, and older systems can have stale or
+	// missing zones — which silently breaks DST-aware schedule firing.
+	_ "time/tzdata"
 
 	"github.com/joho/godotenv"
 	"github.com/ssimpson89/easystream/internal/app"
@@ -20,6 +27,30 @@ import (
 	"github.com/ssimpson89/easystream/internal/version"
 	"github.com/ssimpson89/easystream/internal/youtube"
 )
+
+// findFFmpeg locates the ffmpeg binary across common install locations.
+// macOS apps launched from Finder/launchd inherit a minimal PATH
+// (/usr/bin:/bin:/usr/sbin:/sbin) — Homebrew (/opt/homebrew/bin on
+// Apple Silicon, /usr/local/bin on Intel) and MacPorts (/opt/local/bin)
+// aren't on it. Without this, every FFmpeg probe (device list,
+// encoder detect, framerate) silently returns empty and the daemon
+// fails to start with a confusing error.
+func findFFmpeg() string {
+	if p, err := exec.LookPath("ffmpeg"); err == nil {
+		return p
+	}
+	for _, candidate := range []string{
+		"/opt/homebrew/bin/ffmpeg",
+		"/usr/local/bin/ffmpeg",
+		"/opt/local/bin/ffmpeg",
+		"/usr/bin/ffmpeg",
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return "ffmpeg" // last resort; supervisor will surface the error
+}
 
 func main() {
 	logger := log.New(os.Stdout, "easystream ", log.LstdFlags|log.LUTC)
@@ -93,6 +124,9 @@ func main() {
 	}
 	logger.Printf("HLS output directory: %s", hlsDir)
 
+	ffmpegBin := findFFmpeg()
+	logger.Printf("ffmpeg binary: %s", ffmpegBin)
+
 	server := app.NewServer(app.ServerConfig{
 		Addr:            addr,
 		WebFS:           ui.FS(),
@@ -102,6 +136,7 @@ func main() {
 		ScheduleStore:   schedStore,
 		HLSServer:       hlsServer,
 		DataDir:         dataDir,
+		FFmpegBinary:    ffmpegBin,
 	})
 	defer server.Close()
 
