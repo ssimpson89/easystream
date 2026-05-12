@@ -26,10 +26,10 @@ func TestArgsIncludeBandwidthAndRecoveryOptions(t *testing.T) {
 		"-maxrate 10000k",   // CBR target
 		"-bufsize 10000k",   // 1s VBV (bufsize == maxrate) — true CBR
 		"-g 60",             // 2-second keyframe interval
-		"-bf 2",             // YT: 2 B-frames
-		"-refs 1",           // YT: 1 reference frame
+		"-bf 2",             // YT: 2 B-frames (refs is left at veryfast default of 1)
 		"-profile:v high",   // YT requires High profile for CABAC
 		"-colorspace bt709", // YT: Rec.709 SDR
+		"-color_range tv",   // explicit limited-range VUI signaling
 		"filler=1",          // VBV filler NALs maintain hard-CBR
 		"open-gop=0",        // Closed GOP
 		"scenecut=0",        // No scene-change keyframes; predictable segmenting
@@ -78,7 +78,7 @@ func TestArgsIncludesPreviewAudioMeterOutput(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, expected := range []string{
 		"rtp://127.0.0.1:52001?pkt_size=1200",
-		"-map 1:a -vn -c:a libopus -ar 48000 -ac 2 -b:a 64k",
+		"-map [a_preview] -c:a libopus -ar 48000 -ac 2 -b:a 64k",
 		"-flush_packets 1 -muxdelay 0 -muxpreload 0 -payload_type 111 -f rtp rtp://127.0.0.1:52002?pkt_size=1200",
 	} {
 		if !strings.Contains(joined, expected) {
