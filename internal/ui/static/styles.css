@@ -701,19 +701,24 @@ label:where(:not(.checkbox-row)) {
   accent-color: var(--accent);
   cursor: pointer;
 }
-.checkbox-row .row-hint {
+.row-hint {
   display: block;
   color: var(--muted);
   font-size: 12px;
   font-weight: 400;
-  margin-top: 2px;
+  margin-top: 4px;
+  text-transform: none;
+  letter-spacing: normal;
+  line-height: 1.4;
 }
+.checkbox-row .row-hint { margin-top: 2px; }
 
 /* Highlighted code-style readout for the SRT-listener "give this URL
  * to your upstream encoder" hint. Wider than inline <code>, with a
  * left border so it reads as a callout. */
 .publish-url {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   margin: 8px 0 12px;
@@ -724,28 +729,50 @@ label:where(:not(.checkbox-row)) {
   overflow-x: auto;
 }
 .publish-url.warn {
+  /* The warn variant is a flowing paragraph (text + inline code),
+     not a one-line URL callout — undo the flex layout so the text
+     wraps normally instead of becoming separate flex items. */
+  display: block;
   border-left-color: var(--warn);
   color: var(--muted);
   font-size: 13px;
+  line-height: 1.5;
+}
+.publish-url.warn code {
+  user-select: text;
 }
 .publish-url code {
   flex: 1 1 auto;
   font-size: 13px;
   color: var(--text);
   word-break: break-all;
+  /* Single click selects the entire URL so a keyboard- or
+     touch-user can copy without an accurate triple-click. */
+  user-select: all;
 }
-.publish-url .btn-link {
-  flex: 0 0 auto;
-  background: transparent;
+.publish-url .button { flex: 0 0 auto; }
+
+/* IP picker chip — shown when the host has multiple non-loopback
+   addresses and the operator may need to swap which one the publish
+   URL displays. Renders inline with the surrounding hint text. */
+.ip-chip {
+  display: inline-block;
+  margin: 2px 4px 2px 0;
+  padding: 2px 8px;
+  background: var(--panel-2);
   border: 1px solid var(--line);
+  border-radius: 4px;
   color: var(--text);
-  padding: 4px 10px;
-  border-radius: 6px;
-  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
-  min-height: 0;
+  cursor: pointer;
 }
-.publish-url .btn-link:hover { background: var(--panel); }
+.ip-chip:hover { background: var(--panel); }
+.ip-chip.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, var(--panel-2));
+}
+.row-hint.warn { color: var(--warn); }
 input, select, textarea {
   width: 100%;
   min-height: 40px;

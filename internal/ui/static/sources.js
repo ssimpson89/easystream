@@ -56,7 +56,7 @@ window.EasyStreamSources = (() => {
       { key: "test-video", value: "test-video::", label: "  Test pattern (no hardware)", disabled: false },
       { key: "group:network", value: "__group:network", label: "Network stream", disabled: true },
       { key: "network", value: NETWORK_SENTINEL, label: "  Pull from URL (RTSP / SRT / UDP / HTTP)", disabled: false },
-      { key: "srt-listener", value: SRT_LISTENER_SENTINEL, label: "  Receive SRT push (listen on a port)", disabled: false },
+      { key: "srt-listener", value: SRT_LISTENER_SENTINEL, label: "  Receive a stream from OBS / vMix / encoder (SRT)", disabled: false },
     ];
     for (const t of TYPE_ORDER) {
       const matches = (devices?.video || []).filter((d) => d.type === t);
