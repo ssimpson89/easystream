@@ -68,6 +68,11 @@ document.addEventListener("alpine:init", () => {
     networkUrl:       "",
     networkNoAudio:   false,
     sourceIsHDR:      false,
+    // SRT listener mode: EasyStream binds a local port and waits
+    // for an upstream encoder to push to it.
+    srtListenPort:       9999,
+    srtListenPassphrase: "",
+    localIPs:            [],
     selectedPreset:   "recommended",
     selectedEncoder:  "libx264",
     outputMode:       "rtmp",
@@ -264,6 +269,7 @@ document.addEventListener("alpine:init", () => {
       this.health            = data.health     || {};
       this.capabilities      = data.capabilities || this.capabilities;
       this.activeBroadcastId = data.activeBroadcastId || "";
+      this.localIPs          = data.localIPs || [];
       this.syncFormFromConfig(data.config);
     },
 
@@ -313,12 +319,14 @@ document.addEventListener("alpine:init", () => {
       if (!this._dirtyAudio) {
         this.audioSourceValue = config.input?.audioDevice || "";
       }
-      // Network source: hydrate URL + NoAudio flag from server (unless
+      // Network + SRT-listener: hydrate fields from server (unless
       // operator is actively typing).
       if (!this._dirtyVideo) {
         this.networkUrl = config.input?.url || "";
         this.networkNoAudio = !!config.input?.noAudio;
         this.sourceIsHDR = !!config.input?.sourceIsHdr;
+        this.srtListenPort = config.input?.srtListenPort || 9999;
+        this.srtListenPassphrase = config.input?.srtListenPassphrase || "";
       }
     },
 
@@ -442,8 +450,20 @@ document.addEventListener("alpine:init", () => {
       return "Ready to stream.";
     },
     get currentPreset() { return this.presets.find((p) => p.id === this.selectedPreset); },
-    get isSDISource()     { return S.decodeSourceValue(this.videoSourceValue)?.kind === "sdi"; },
-    get isNetworkSource() { return S.decodeSourceValue(this.videoSourceValue)?.kind === "network"; },
+    get isSDISource()        { return S.decodeSourceValue(this.videoSourceValue)?.kind === "sdi"; },
+    get isNetworkSource()    { return S.decodeSourceValue(this.videoSourceValue)?.kind === "network"; },
+    get isSRTListenerSource() { return S.decodeSourceValue(this.videoSourceValue)?.kind === "srt-listener"; },
+    // The URL operators hand the upstream encoder so it knows where
+    // to push. Uses the first detected non-loopback IPv4 — if there
+    // are multiple, we render them all in the UI hint.
+    get srtListenerPublishURL() {
+      const ip = (this.localIPs && this.localIPs[0]) || "<your-ip>";
+      const port = this.srtListenPort || 9999;
+      const pass = (this.srtListenPassphrase || "").trim();
+      return pass
+        ? `srt://${ip}:${port}?passphrase=${encodeURIComponent(pass)}`
+        : `srt://${ip}:${port}`;
+    },
     get destinationLabel() {
       if (this.activeBroadcastId) return "YouTube";
       if (this.outputMode === "hls") return "Local HLS";
@@ -768,6 +788,14 @@ document.addEventListener("alpine:init", () => {
         payload.input.url = (this.networkUrl || "").trim();
         payload.input.noAudio = !!this.networkNoAudio;
       }
+      // SRT listener: carry port + passphrase + NoAudio.
+      if (decoded.kind === "srt-listener") {
+        payload.input.srtListenPort = Number(this.srtListenPort) || 9999;
+        if (this.srtListenPassphrase) {
+          payload.input.srtListenPassphrase = this.srtListenPassphrase;
+        }
+        payload.input.noAudio = !!this.networkNoAudio;
+      }
       // HDR flag applies to any non-test source.
       if (decoded.kind !== "test-video") {
         payload.input.sourceIsHdr = !!this.sourceIsHDR;
@@ -815,6 +843,12 @@ document.addEventListener("alpine:init", () => {
       if (nextKind === "network" && prevKind !== "network") {
         this.networkNoAudio = false;
       }
+      // Same defensive reset for SRT-listener mode: most upstream
+      // encoders push audio, so default NoAudio off when picking
+      // this source kind for the first time.
+      if (nextKind === "srt-listener" && prevKind !== "srt-listener") {
+        this.networkNoAudio = false;
+      }
       // Picking "Network stream" without a URL would POST invalid
       // config (backend requires Input.URL) and show a save-failed
       // toast. Defer save until the operator types a URL.
@@ -824,6 +858,10 @@ document.addEventListener("alpine:init", () => {
       }
       this.saveConfig().then(() => this.preview?.refresh());
     },
+    onSRTListenPortChange()       { this._dirtyVideo = true; },
+    onSRTListenPortBlur()         { this.saveConfig().then(() => this.preview?.refresh()); },
+    onSRTListenPassphraseChange() { this._dirtyVideo = true; },
+    onSRTListenPassphraseBlur()   { this.saveConfig(); },
     onNetworkUrlChange()    { this._dirtyVideo = true; },
     onNetworkUrlBlur()      {
       // Blank URL means nothing valid to save yet. Skip.

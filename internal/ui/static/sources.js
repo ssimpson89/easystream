@@ -20,14 +20,17 @@ window.EasyStreamSources = (() => {
     }
   }
 
-  // NETWORK_SENTINEL is a placeholder value used in the <select>
-  // when the operator picks "Network stream". The actual URL lives
-  // in a separate text input; we only need a stable marker here.
-  const NETWORK_SENTINEL = "network::";
+  // Sentinel values used as <select> option values for non-device
+  // sources. The actual configuration (URL, port, passphrase) lives
+  // in separate fields; the sentinel just keeps the dropdown's
+  // selected state stable across edits.
+  const NETWORK_SENTINEL       = "network::";
+  const SRT_LISTENER_SENTINEL  = "srt-listener::";
 
   function encodeSourceValue(input, devices) {
     if (!input || input.kind === "test-video") return "test-video::";
     if (input.kind === "network") return NETWORK_SENTINEL;
+    if (input.kind === "srt-listener") return SRT_LISTENER_SENTINEL;
     const kind = input.kind || "webcam";
     const backend = input.backend || "avfoundation";
     let device = input.videoDevice || "";
@@ -42,6 +45,7 @@ window.EasyStreamSources = (() => {
     if (!value) return null;
     if (value === "test-video::") return { kind: "test-video", backend: "lavfi", videoDevice: "" };
     if (value === NETWORK_SENTINEL) return { kind: "network", backend: "", videoDevice: "" };
+    if (value === SRT_LISTENER_SENTINEL) return { kind: "srt-listener", backend: "", videoDevice: "" };
     const [kind, backend, ...rest] = value.split(":");
     return { kind, backend, videoDevice: rest.join(":") };
   }
@@ -51,7 +55,8 @@ window.EasyStreamSources = (() => {
       { key: "group:test", value: "__group:test", label: "Test source", disabled: true },
       { key: "test-video", value: "test-video::", label: "  Test pattern (no hardware)", disabled: false },
       { key: "group:network", value: "__group:network", label: "Network stream", disabled: true },
-      { key: "network", value: NETWORK_SENTINEL, label: "  RTSP / SRT / UDP / HTTP URL", disabled: false },
+      { key: "network", value: NETWORK_SENTINEL, label: "  Pull from URL (RTSP / SRT / UDP / HTTP)", disabled: false },
+      { key: "srt-listener", value: SRT_LISTENER_SENTINEL, label: "  Receive SRT push (listen on a port)", disabled: false },
     ];
     for (const t of TYPE_ORDER) {
       const matches = (devices?.video || []).filter((d) => d.type === t);

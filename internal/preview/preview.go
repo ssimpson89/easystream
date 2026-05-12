@@ -551,6 +551,20 @@ func previewInputs(config ffmpeg.Config) previewInputBuild {
 		// other doesn't).
 		netArgs, audioMap := ffmpeg.NetworkInputArgs(config.Input.URL, config.Input.NoAudio)
 		return previewInputBuild{args: netArgs, videoMap: "0:v", audioMap: audioMap}
+	case ffmpeg.InputSRTListener:
+		// SRT listener mode binds a port locally. The preview's own
+		// ffmpeg can't bind the same port (collision), so show a
+		// black placeholder until the main stream starts — then the
+		// main stream's [v_preview] RTP feed takes over via the
+		// shared 127.0.0.1:52001 UDP listener.
+		return previewInputBuild{
+			args: []string{
+				"-re",
+				"-f", "lavfi", "-i", "color=size=640x360:rate=15:color=0x111418",
+				"-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:beep_factor=0",
+			},
+			videoMap: "0:v", audioMap: "1:a",
+		}
 	default:
 		backend := config.Input.Backend
 		if backend == "" {

@@ -42,6 +42,14 @@ const (
 	// http:// or https:// (HLS, MPEG-TS over HTTP). The URL goes
 	// in Input.URL.
 	InputNetwork InputKind = "network"
+	// InputSRTListener binds an SRT listener on a local port and
+	// waits for an upstream encoder to push to it. EasyStream is
+	// the SRT server; the operator hands the upstream encoder a
+	// "srt://<our-ip>:<port>[?passphrase=...]" URL. Useful for
+	// vMix / OBS / hardware encoders that prefer to push rather
+	// than be pulled from. Uses Input.SRTListenPort and
+	// Input.SRTListenPassphrase.
+	InputSRTListener InputKind = "srt-listener"
 )
 
 type Input struct {
@@ -72,6 +80,46 @@ type Input struct {
 	// because the tone-map chain costs CPU and is wrong for
 	// SDR sources (where it'd compress contrast unnecessarily).
 	SourceIsHDR bool `json:"sourceIsHdr,omitempty"`
+	// SRTListenPort is the local UDP port the SRT listener binds
+	// to when Kind == InputSRTListener. Defaults to 9999 when
+	// zero. Range-checked in Validate.
+	SRTListenPort int `json:"srtListenPort,omitempty"`
+	// SRTListenPassphrase optionally encrypts the SRT connection
+	// from the upstream encoder. libsrt requires 10-79 characters.
+	// Empty disables encryption.
+	SRTListenPassphrase string `json:"srtListenPassphrase,omitempty"`
+}
+
+// defaultSRTListenPort is the SRT listener port used when the
+// operator doesn't pick one explicitly. Matches the convention in
+// the Haivision examples and most upstream encoder docs.
+const defaultSRTListenPort = 9999
+
+// srtListenerLatencyUS is the receive-buffer latency (microseconds)
+// for SRT listener mode. libsrt defaults to 120 ms which is too
+// tight for the public internet; 300 ms gives upstream encoders
+// some headroom for jitter without adding much end-to-end delay.
+const srtListenerLatencyUS = 300000
+
+// SRTListenerURL builds the FFmpeg-side ingest URL for an SRT
+// listener configuration. Returns the form
+//
+//	srt://0.0.0.0:<port>?mode=listener&latency=300000[&passphrase=<x>]
+//
+// libsrt rejects URLs with an empty host (the "srt://:port" form),
+// so we use 0.0.0.0 to bind on every interface. Operators hand
+// upstream encoders the *external* form (srt://<our-ip>:<port>...)
+// — that variant is built UI-side from the local network IPs we
+// expose in the API status snapshot.
+func SRTListenerURL(port int, passphrase string) string {
+	if port == 0 {
+		port = defaultSRTListenPort
+	}
+	q := fmt.Sprintf("mode=listener&latency=%d", srtListenerLatencyUS)
+	if passphrase != "" {
+		q += "&passphrase=" + neturl.QueryEscape(passphrase)
+	}
+	return fmt.Sprintf("srt://0.0.0.0:%d?%s", port, q)
 }
 
 // networkInputSchemes is the allowlist of URL schemes we accept for
@@ -382,6 +430,23 @@ func (c Config) Validate() error {
 		scheme := strings.ToLower(url[:i])
 		if !networkInputSchemes[scheme] {
 			return fmt.Errorf("unsupported network input scheme %q; supported: rtsp, rtsps, srt, udp, rtp, http, https", scheme)
+		}
+	case InputSRTListener:
+		// Port must be in the user range (>1023 avoids requiring
+		// privileged binds) and not collide with the EasyStream
+		// web UI port — operators occasionally guess 8080.
+		port := c.Input.SRTListenPort
+		if port == 0 {
+			port = defaultSRTListenPort
+		}
+		if port < 1024 || port > 65535 {
+			return fmt.Errorf("SRT listener port must be 1024–65535, got %d", port)
+		}
+		// libsrt requires 10–79 char passphrases when set.
+		if pp := c.Input.SRTListenPassphrase; pp != "" {
+			if n := len(pp); n < 10 || n > 79 {
+				return fmt.Errorf("SRT passphrase must be 10–79 characters, got %d", n)
+			}
 		}
 	default:
 		if strings.TrimSpace(c.Input.VideoDevice) == "" {
@@ -1007,6 +1072,13 @@ func (c Config) buildInputs() (inputBuild, error) {
 	}
 	if c.Input.Kind == InputNetwork {
 		return c.buildNetworkInput(), nil
+	}
+	if c.Input.Kind == InputSRTListener {
+		args, audioMap := NetworkInputArgs(
+			SRTListenerURL(c.Input.SRTListenPort, c.Input.SRTListenPassphrase),
+			c.Input.NoAudio,
+		)
+		return inputBuild{args: args, videoMap: "0:v", audioMap: audioMap}, nil
 	}
 
 	backend := defaultString(c.Input.Backend, PlatformBackend())

@@ -286,7 +286,48 @@
               </label>
             </div>
 
-            <label x-show="!isSDISource && !isNetworkSource">
+            <!-- SRT listener: EasyStream binds a port and waits for
+                 the upstream encoder to push to it. Operator hands
+                 the upstream encoder the publish URL we render below. -->
+            <div class="sub-form" x-show="isSRTListenerSource">
+              <label>Listen port
+                <input type="number" min="1024" max="65535"
+                       x-model.number="srtListenPort"
+                       @input="onSRTListenPortChange()" @blur="onSRTListenPortBlur()"
+                       placeholder="9999">
+              </label>
+              <label>Passphrase (optional)
+                <input type="password" autocomplete="off"
+                       x-model="srtListenPassphrase"
+                       @input="onSRTListenPassphraseChange()" @blur="onSRTListenPassphraseBlur()"
+                       placeholder="10–79 characters, leave blank for no encryption">
+              </label>
+              <p class="hint">
+                Point your upstream encoder (OBS, vMix, hardware) at this URL:
+              </p>
+              <p class="publish-url"><code x-text="srtListenerPublishURL"></code></p>
+              <p class="hint" x-show="(localIPs || []).length > 1">
+                Multiple interfaces detected. If the encoder is on a different
+                LAN segment, swap the IP for one it can reach:
+                <template x-for="ip in localIPs" :key="ip">
+                  <span><code x-text="ip"></code>&nbsp;</span>
+                </template>
+              </p>
+              <p class="hint">
+                Make sure UDP port <code x-text="srtListenPort || 9999"></code>
+                is open in your firewall. Audio is expected to come from the
+                upstream encoder.
+              </p>
+              <label class="checkbox-row">
+                <input type="checkbox" x-model="networkNoAudio" @change="onNetworkNoAudioToggle()">
+                <span>
+                  Upstream has no audio
+                  <span class="row-hint">Substitute a silent track.</span>
+                </span>
+              </label>
+            </div>
+
+            <label x-show="!isSDISource && !isNetworkSource && !isSRTListenerSource">
               Audio source
               <select x-ref="audioSourceSelect" x-model="audioSourceValue" @change="onAudioSourceChange()">
                 <template x-for="d in audioSourceOptions()" :key="d.key">

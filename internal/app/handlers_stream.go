@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -11,6 +12,34 @@ import (
 	"github.com/ssimpson89/easystream/internal/quality"
 	"github.com/ssimpson89/easystream/internal/version"
 )
+
+// localNetworkIPs returns the machine's non-loopback IPv4 addresses
+// in display order. The UI shows these to the operator when they
+// configure an SRT listener so they know what URL to hand an
+// upstream encoder (srt://<one-of-these-ips>:<port>).
+//
+// Filters out loopback (127.x.x.x) and IPv6 link-local addresses
+// since neither is useful for "give this address to another
+// machine on the LAN."
+func localNetworkIPs() []string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok || ipNet.IP.IsLoopback() {
+			continue
+		}
+		ip4 := ipNet.IP.To4()
+		if ip4 == nil {
+			continue // skip IPv6 for now — operators expect "192.168.x.x"
+		}
+		out = append(out, ip4.String())
+	}
+	return out
+}
 
 // --- Status ---
 
@@ -41,6 +70,10 @@ func (s *Server) statusSnapshot() map[string]any {
 		"health":            health,
 		"confidence":        confidence,
 		"activeBroadcastId": broadcastID,
+		// Local network IPs so the UI can construct the upstream
+		// publish URL for SRT-listener mode (operator hands their
+		// vMix/OBS one of these as srt://<ip>:<port>).
+		"localIPs": localNetworkIPs(),
 	}
 	if s.adaptive != nil {
 		result["adaptive"] = s.adaptive.State()

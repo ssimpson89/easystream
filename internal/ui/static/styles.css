@@ -708,6 +708,23 @@ label:where(:not(.checkbox-row)) {
   font-weight: 400;
   margin-top: 2px;
 }
+
+/* Highlighted code-style readout for the SRT-listener "give this URL
+ * to your upstream encoder" hint. Wider than inline <code>, with a
+ * left border so it reads as a callout. */
+.publish-url {
+  margin: 8px 0 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent);
+  background: var(--panel-2);
+  border-radius: 4px;
+  overflow-x: auto;
+}
+.publish-url code {
+  font-size: 13px;
+  color: var(--text);
+  word-break: break-all;
+}
 input, select, textarea {
   width: 100%;
   min-height: 40px;

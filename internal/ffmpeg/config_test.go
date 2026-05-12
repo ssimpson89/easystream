@@ -226,6 +226,74 @@ func TestNetworkInputValidateRequiresURL(t *testing.T) {
 	}
 }
 
+func srtListenerCfg(port int, passphrase string) Config {
+	cfg := DefaultConfig()
+	cfg.Input = Input{
+		Kind:                InputSRTListener,
+		SRTListenPort:       port,
+		SRTListenPassphrase: passphrase,
+	}
+	cfg.IngestURL = "rtmp://localhost"
+	cfg.StreamName = "test"
+	return cfg
+}
+
+func TestSRTListenerURLConstruction(t *testing.T) {
+	got := SRTListenerURL(9000, "")
+	want := "srt://0.0.0.0:9000?mode=listener&latency=300000"
+	if got != want {
+		t.Errorf("SRTListenerURL(9000,\"\") = %q, want %q", got, want)
+	}
+
+	got = SRTListenerURL(0, "") // 0 → default 9999
+	want = "srt://0.0.0.0:9999?mode=listener&latency=300000"
+	if got != want {
+		t.Errorf("SRTListenerURL(0,\"\") fell-through default port: got %q", got)
+	}
+
+	got = SRTListenerURL(9999, "MySecretPwd")
+	if !strings.Contains(got, "passphrase=MySecretPwd") {
+		t.Errorf("expected passphrase in listener URL: %q", got)
+	}
+	// libsrt rejects srt://:port (empty host) — must use 0.0.0.0.
+	if strings.Contains(got, "srt://:") {
+		t.Errorf("listener URL must not have empty host: %q", got)
+	}
+}
+
+func TestArgsSRTListenerInput(t *testing.T) {
+	cfg := srtListenerCfg(9000, "")
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, expected := range []string{
+		"-fflags discardcorrupt+genpts",
+		"-i srt://0.0.0.0:9000?mode=listener&latency=300000",
+		"-map [v]",
+		"-map [a_enc]",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Errorf("expected %q in SRT listener args: %s", expected, joined)
+		}
+	}
+}
+
+func TestSRTListenerValidateRejectsPrivilegedPort(t *testing.T) {
+	cfg := srtListenerCfg(80, "")
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation to reject port < 1024")
+	}
+}
+
+func TestSRTListenerValidateRejectsShortPassphrase(t *testing.T) {
+	cfg := srtListenerCfg(9999, "short")
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation to reject < 10-char passphrase")
+	}
+}
+
 func TestHDRSourceAddsTonemapChain(t *testing.T) {
 	cfg := networkInputCfg("rtsp://hdr-camera.local/feed")
 	cfg.Input.SourceIsHDR = true
