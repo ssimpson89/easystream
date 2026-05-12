@@ -263,13 +263,29 @@
                 </template>
               </select>
             </label>
-            <label x-show="!isSDISource">
+            <div x-show="isNetworkSource">
+              <label>Network URL
+                <input x-model="networkUrl" @input="onNetworkUrlChange()" @blur="onNetworkUrlBlur()"
+                       autocomplete="off" spellcheck="false"
+                       placeholder="rtsp://camera.local:554/stream1">
+              </label>
+              <p class="hint">Supported schemes: <code>rtsp://</code>, <code>rtsps://</code>, <code>srt://</code>, <code>udp://</code>, <code>rtp://</code>, <code>http(s)://</code>. Include credentials in the URL when the source requires them (e.g. <code>rtsp://user:pass@host/path</code>).</p>
+              <label class="checkbox-row">
+                <input type="checkbox" x-model="networkNoAudio" @change="onNetworkNoAudioToggle()">
+                Source has no audio (substitute silent track)
+              </label>
+            </div>
+            <label x-show="!isSDISource && !isNetworkSource">
               Audio source
               <select x-ref="audioSourceSelect" x-model="audioSourceValue" @change="onAudioSourceChange()">
                 <template x-for="d in audioSourceOptions()" :key="d.key">
                   <option :value="d.value" :disabled="d.disabled" x-text="d.label"></option>
                 </template>
               </select>
+            </label>
+            <label class="checkbox-row" x-show="videoSourceValue !== '' && videoSourceValue !== 'test-video::'">
+              <input type="checkbox" x-model="sourceIsHDR" @change="onHDRToggle()">
+              Source is HDR (PQ/HLG) — tone-map to SDR
             </label>
             <div class="device-status-row">
               <p class="hint" x-text="deviceStatusText"></p>

@@ -65,6 +65,9 @@ document.addEventListener("alpine:init", () => {
     // Form mirror — kept in sync with server unless dirty=true.
     videoSourceValue: "",
     audioSourceValue: "",
+    networkUrl:       "",
+    networkNoAudio:   false,
+    sourceIsHDR:      false,
     selectedPreset:   "recommended",
     selectedEncoder:  "libx264",
     outputMode:       "rtmp",
@@ -297,6 +300,13 @@ document.addEventListener("alpine:init", () => {
       if (!this._dirtyAudio) {
         this.audioSourceValue = config.input?.audioDevice || "";
       }
+      // Network source: hydrate URL + NoAudio flag from server (unless
+      // operator is actively typing).
+      if (!this._dirtyVideo) {
+        this.networkUrl = config.input?.url || "";
+        this.networkNoAudio = !!config.input?.noAudio;
+        this.sourceIsHDR = !!config.input?.sourceIsHdr;
+      }
     },
 
     // ============================================================
@@ -419,7 +429,8 @@ document.addEventListener("alpine:init", () => {
       return "Ready to stream.";
     },
     get currentPreset() { return this.presets.find((p) => p.id === this.selectedPreset); },
-    get isSDISource()   { return S.decodeSourceValue(this.videoSourceValue)?.kind === "sdi"; },
+    get isSDISource()     { return S.decodeSourceValue(this.videoSourceValue)?.kind === "sdi"; },
+    get isNetworkSource() { return S.decodeSourceValue(this.videoSourceValue)?.kind === "network"; },
     get destinationLabel() {
       if (this.activeBroadcastId) return "YouTube";
       if (this.outputMode === "hls") return "Local HLS";
@@ -445,6 +456,15 @@ document.addEventListener("alpine:init", () => {
         v = { icon: "video", label: "Video", status: "red", detail: "No video source picked" };
       } else if (this.videoSourceValue === "test-video::") {
         v = { icon: "video", label: "Video", status: "green", detail: "Test pattern" };
+      } else if (this.isNetworkSource) {
+        // Network sources can't be presence-checked locally — the URL
+        // is reachable or it isn't, and FFmpeg surfaces that at start.
+        const url = (this.networkUrl || "").trim();
+        if (!url) {
+          v = { icon: "video", label: "Video", status: "red", detail: "Enter a network URL" };
+        } else {
+          v = { icon: "video", label: "Video", status: "green", detail: url };
+        }
       } else {
         const presence = this.devicePresence("video");
         if (presence.connected) {
@@ -458,8 +478,22 @@ document.addEventListener("alpine:init", () => {
       }
       // Audio source
       let aSource;
-      if (this.isSDISource) {
+      // Supervisor signals "running with silent audio because the
+      // configured mic vanished" via audioFallbackDevice. Surface
+      // that first so the operator sees what's happening: silent
+      // audio is live, and we'll reconnect when the mic returns.
+      const fallback = this.stream?.audioFallbackDevice;
+      if (fallback) {
+        aSource = {
+          icon: "mic", label: "Audio", status: "yellow",
+          detail: `${fallback} disconnected — silent audio (will reconnect when mic returns)`,
+        };
+      } else if (this.isSDISource) {
         aSource = { icon: "mic", label: "Audio", status: "green", detail: "Embedded SDI audio" };
+      } else if (this.isNetworkSource) {
+        aSource = this.networkNoAudio
+          ? { icon: "mic", label: "Audio", status: "yellow", detail: "Silent — source has no audio" }
+          : { icon: "mic", label: "Audio", status: "green", detail: "Embedded from network source" };
       } else if (!this.audioSourceValue) {
         aSource = { icon: "mic", label: "Audio", status: "yellow", detail: "No audio source — silence will be sent" };
       } else {
@@ -676,6 +710,15 @@ document.addEventListener("alpine:init", () => {
           audioDevice: this.audioSourceValue || "",
         },
       };
+      // Network source: carry URL + NoAudio flag.
+      if (decoded.kind === "network") {
+        payload.input.url = (this.networkUrl || "").trim();
+        payload.input.noAudio = !!this.networkNoAudio;
+      }
+      // HDR flag applies to any non-test source.
+      if (decoded.kind !== "test-video") {
+        payload.input.sourceIsHdr = !!this.sourceIsHDR;
+      }
       // Persist device names so the backend can resolve stable
       // AVFoundation indexes even when indexes shift between reboots.
       const vDev = (this.devices.video || []).find(
@@ -707,7 +750,32 @@ document.addEventListener("alpine:init", () => {
     onVideoSourceChange() {
       this._dirtyVideo = true;
       if (this.isSDISource) this.audioSourceValue = "";
+      // Picking "Network stream" without a URL would POST invalid
+      // config (backend requires Input.URL) and show a save-failed
+      // toast. Defer save until the operator types a URL.
+      if (this.isNetworkSource && !(this.networkUrl || "").trim()) {
+        this.preview?.refresh();
+        return;
+      }
       this.saveConfig().then(() => this.preview?.refresh());
+    },
+    onNetworkUrlChange()    { this._dirtyVideo = true; },
+    onNetworkUrlBlur()      {
+      // Blank URL means nothing valid to save yet. Skip.
+      if (!(this.networkUrl || "").trim()) return;
+      this.saveConfig();
+    },
+    onNetworkNoAudioToggle() {
+      this._dirtyVideo = true;
+      // NoAudio is only meaningful once a URL exists.
+      if (!(this.networkUrl || "").trim()) return;
+      this.saveConfig();
+    },
+    onHDRToggle() {
+      this._dirtyVideo = true;
+      // Same guard for network sources without a URL yet.
+      if (this.isNetworkSource && !(this.networkUrl || "").trim()) return;
+      this.saveConfig();
     },
     onAudioSourceChange()   { this._dirtyAudio = true; this.saveConfig(); },
     onEncoderChange()       { this.saveConfig().then(() => this.showToast("Encoder saved")); },

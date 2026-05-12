@@ -42,6 +42,12 @@ type Status struct {
 	AudioRMSdB      float64   `json:"audioRmsDb"`      // finite dB value; lower = quieter, -120 = silence floor
 	AudioRMSAt      time.Time `json:"audioRmsAt"`      // when AudioRMSdB was last updated
 	AudioDetectedAt time.Time `json:"audioDetectedAt"` // when audio above silence floor was last seen
+	// AudioFallbackDevice names the configured mic that's currently
+	// missing from the device list — FFmpeg is running with silent
+	// audio substituted in. The supervisor watches for the device to
+	// come back and restarts the stream when it does. Empty when no
+	// fallback is active.
+	AudioFallbackDevice string `json:"audioFallbackDevice,omitempty"`
 }
 
 type SupervisorConfig struct {
@@ -224,6 +230,35 @@ func (s *Supervisor) Restart(reason string) bool {
 	return true
 }
 
+// watchAudioRecovery polls the system device list for deviceName and
+// requests a supervisor restart once it reappears. Used when the
+// configured audio device was missing at start and we substituted
+// silent audio. Exits when the runOnce that spawned it returns (via
+// the done channel) or when the supervisor is shutting down.
+//
+// 10-second poll interval is a compromise: short enough that the
+// operator gets their mic back inside a Sunday's first hymn if they
+// plugged it in late, long enough that we're not hammering
+// avfoundation's device enumeration every second.
+func (s *Supervisor) watchAudioRecovery(ctx context.Context, deviceName string, done <-chan struct{}) {
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-tick.C:
+			if _, err := ResolveAVFoundationDeviceIndexStrict(s.ffmpeg.Binary, deviceName, "audio", ""); err == nil {
+				s.logger.Printf("supervisor: audio device %q returned — restarting with real audio", deviceName)
+				s.Restart("audio device " + deviceName + " reconnected")
+				return
+			}
+		}
+	}
+}
+
 func (s *Supervisor) Stop() {
 	s.mu.Lock()
 	cancel := s.cancel
@@ -382,10 +417,18 @@ func (s *Supervisor) run(ctx context.Context) {
 }
 
 func (s *Supervisor) runOnce(ctx context.Context) error {
-	args, err := s.ffmpeg.Args()
+	// Use Build (not Args) so the inputBuild fallback metadata flows
+	// here in one shot. A separate later probe could see a different
+	// answer than buildInputs did — e.g. mic reappeared between
+	// buildInputs running and supervisor probing — leaving the
+	// recovery watcher unstarted while ffmpeg is silently running on
+	// the lavfi silent input.
+	built, err := s.ffmpeg.Build()
 	if err != nil {
 		return err
 	}
+	args := built.Args
+	audioFallback := built.AudioFallbackDevice
 
 	// Use plain exec.Command (not CommandContext) so shutdown/restart can send
 	// SIGTERM before SIGKILL. Setpgid lets us signal the whole FFmpeg process
@@ -422,6 +465,7 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	s.status.AudioRMSdB = 0
 	s.status.AudioRMSAt = time.Time{}
 	s.status.AudioDetectedAt = time.Time{}
+	s.status.AudioFallbackDevice = audioFallback
 	s.status.UpdatedAt = time.Now().UTC()
 	preset := s.status.ActivePresetID
 	outputMode := s.ffmpeg.OutputMode
@@ -434,6 +478,19 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	// from handleStart until something else triggers a publish.
 	s.emitStateChange()
 	s.logger.Printf("stream-start: preset=%s output=%s pid=%d", preset, outputMode, cmd.Process.Pid)
+
+	// Audio-device recovery watcher. When buildInputs fell back to
+	// silent audio because the configured mic is missing, poll for
+	// it to come back and request a restart so the next ffmpeg run
+	// picks up the real audio device. Without this, an unplugged
+	// mic would stay silent until the operator notices and manually
+	// restarts.
+	if audioFallback != "" {
+		s.logger.Printf("supervisor: audio device %q missing — running with silent audio, watching for reconnect", audioFallback)
+		watchDone := make(chan struct{})
+		go s.watchAudioRecovery(ctx, audioFallback, watchDone)
+		defer close(watchDone)
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)

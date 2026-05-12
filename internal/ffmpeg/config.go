@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -35,6 +36,12 @@ const (
 	InputHDMI      InputKind = "hdmi"
 	InputSDI       InputKind = "sdi"
 	InputTestVideo InputKind = "test-video"
+	// InputNetwork ingests from a URL. The scheme determines the
+	// FFmpeg transport: rtsp://, rtsps:// (IP cameras), srt://
+	// (pull from another encoder), udp:// (multicast MPEG-TS),
+	// http:// or https:// (HLS, MPEG-TS over HTTP). The URL goes
+	// in Input.URL.
+	InputNetwork InputKind = "network"
 )
 
 type Input struct {
@@ -45,6 +52,111 @@ type Input struct {
 	VideoDeviceName string    `json:"videoDeviceName,omitempty"`
 	AudioDeviceName string    `json:"audioDeviceName,omitempty"`
 	Format          string    `json:"format"`
+	// URL is used when Kind == InputNetwork. Carries the full
+	// rtsp/srt/udp/http URL the operator pasted, including any
+	// query parameters, credentials, or stream names.
+	URL string `json:"url,omitempty"`
+	// NoAudio disables FFmpeg's attempt to map an audio stream
+	// from the source. Useful for network sources (HDMI capture
+	// over RTSP without embedded audio, video-only DASH feeds)
+	// where the source has no audio track; without this flag
+	// FFmpeg errors at startup. When set, a silent stereo track
+	// is substituted instead.
+	NoAudio bool `json:"noAudio,omitempty"`
+	// SourceIsHDR signals that the input carries HDR transfer
+	// characteristics (PQ/HLG, BT.2020 primaries). When set, the
+	// video filter graph prepends a tone-map chain that converts
+	// to SDR Rec.709 before scaling. Without it, the encoder
+	// outputs SDR-tagged frames with HDR pixel data — colors
+	// clip ugly on YouTube and most playback paths. Opt-in
+	// because the tone-map chain costs CPU and is wrong for
+	// SDR sources (where it'd compress contrast unnecessarily).
+	SourceIsHDR bool `json:"sourceIsHdr,omitempty"`
+}
+
+// networkInputSchemes is the allowlist of URL schemes we accept for
+// InputNetwork sources. file://, pipe:, concat:, and similar are
+// deliberately excluded to keep ingest a strictly network operation.
+var networkInputSchemes = map[string]bool{
+	"rtsp":  true,
+	"rtsps": true,
+	"srt":   true,
+	"udp":   true,
+	"rtp":   true,
+	"http":  true,
+	"https": true,
+}
+
+// RedactedCredentialSentinel is the placeholder substituted for URL
+// credentials when an Input.URL is serialised for API responses. The
+// configUpdate handler treats incoming URLs containing this sentinel
+// as "operator didn't change credentials" and preserves the stored
+// value, so the round-trip never exposes secrets to the UI.
+const RedactedCredentialSentinel = "REDACTED"
+
+// secretQueryParams names URL query parameters whose values are
+// always sensitive. Their values are scrubbed alongside any
+// userinfo (user:pass@) component when an Input.URL is serialised.
+var secretQueryParams = map[string]bool{
+	"passphrase": true,
+	"password":   true,
+	"token":      true,
+	"key":        true,
+	"secret":     true,
+}
+
+// RedactURLCredentials returns u with any embedded credentials
+// replaced by RedactedCredentialSentinel. Specifically:
+//   - userinfo (rtsp://user:pass@host/path → rtsp://REDACTED:REDACTED@host/path)
+//   - secret query parameters (srt://host:port?passphrase=X → ?passphrase=REDACTED)
+//
+// Used to scrub network-input URLs before sending them to UI clients
+// or writing to logs, so RTSP camera passwords and SRT passphrases
+// don't leak to anyone watching the dashboard SSE stream.
+func RedactURLCredentials(u string) string {
+	if u == "" {
+		return u
+	}
+	parsed, err := neturl.Parse(u)
+	if err != nil {
+		// Couldn't parse — fall back to substring stripping for
+		// the obvious user:pass@ form.
+		return redactRawURL(u)
+	}
+	if parsed.User != nil {
+		parsed.User = neturl.UserPassword(RedactedCredentialSentinel, RedactedCredentialSentinel)
+	}
+	if parsed.RawQuery != "" {
+		q := parsed.Query()
+		changed := false
+		for k := range q {
+			if secretQueryParams[strings.ToLower(k)] {
+				q.Set(k, RedactedCredentialSentinel)
+				changed = true
+			}
+		}
+		if changed {
+			parsed.RawQuery = q.Encode()
+		}
+	}
+	return parsed.String()
+}
+
+// redactRawURL strips userinfo from a URL we couldn't fully parse.
+// Used only as a fallback; the parsed path handles everything we
+// expect to see.
+func redactRawURL(u string) string {
+	schemeIdx := strings.Index(u, "://")
+	if schemeIdx < 0 {
+		return u
+	}
+	rest := u[schemeIdx+3:]
+	atIdx := strings.Index(rest, "@")
+	slashIdx := strings.Index(rest, "/")
+	if atIdx < 0 || (slashIdx >= 0 && atIdx > slashIdx) {
+		return u
+	}
+	return u[:schemeIdx+3] + RedactedCredentialSentinel + ":" + RedactedCredentialSentinel + rest[atIdx:]
 }
 
 // OutputMode selects the *primary* destination FFmpeg sends to.
@@ -225,8 +337,26 @@ func (c Config) Validate() error {
 	if c.Preset.ID == "" {
 		return errors.New("quality preset is required")
 	}
-	if c.Input.Kind != InputTestVideo && strings.TrimSpace(c.Input.VideoDevice) == "" {
-		return errors.New("video device is required")
+	switch c.Input.Kind {
+	case InputTestVideo:
+		// no device required
+	case InputNetwork:
+		url := strings.TrimSpace(c.Input.URL)
+		if url == "" {
+			return errors.New("network input URL is required")
+		}
+		i := strings.Index(url, "://")
+		if i <= 0 {
+			return fmt.Errorf("network input URL must include a scheme like rtsp:// or srt://, got %q", url)
+		}
+		scheme := strings.ToLower(url[:i])
+		if !networkInputSchemes[scheme] {
+			return fmt.Errorf("unsupported network input scheme %q; supported: rtsp, rtsps, srt, udp, rtp, http, https", scheme)
+		}
+	default:
+		if strings.TrimSpace(c.Input.VideoDevice) == "" {
+			return errors.New("video device is required")
+		}
 	}
 	if c.EnableHLS && strings.TrimSpace(c.HLSDir) == "" {
 		return errors.New("HLS output directory is required when EnableHLS is true")
@@ -372,7 +502,20 @@ func (c Config) Args() ([]string, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
+	inputs, err := c.buildInputs()
+	if err != nil {
+		return nil, err
+	}
+	return c.argsWithInputs(inputs)
+}
 
+// argsWithInputs builds the full argv given an already-resolved
+// inputBuild. Used by both Args (which calls buildInputs internally)
+// and Build (which exposes the inputBuild's fallback metadata to
+// the supervisor). Splitting keeps buildInputs's silent-audio fallback
+// decision and the supervisor's recovery-watcher target perfectly in
+// sync.
+func (c Config) argsWithInputs(inputs inputBuild) ([]string, error) {
 	args := []string{
 		"-hide_banner",
 		"-nostdin",
@@ -381,11 +524,6 @@ func (c Config) Args() ([]string, error) {
 		"-flags", "low_delay",
 		"-progress", "pipe:1",
 		"-stats_period", "1",
-	}
-
-	inputs, err := c.buildInputs()
-	if err != nil {
-		return nil, err
 	}
 	args = append(args, inputs.args...)
 
@@ -428,11 +566,27 @@ func (c Config) Args() ([]string, error) {
 	// pay the scale cost on the frames we'll actually keep. Halving
 	// 30→15 in front of scale saves ~50% of the preview-leg scaler
 	// work — on a high-FPS source like a 60p capture, much more.
+	//
+	// HDR→SDR tone-map chain. Converts PQ/HLG (BT.2020) source pixels
+	// to Rec.709 SDR before downstream scaling. Skipped for SDR
+	// sources because the linear-light conversion costs real CPU and
+	// compresses contrast on already-SDR material.
+	//
+	// Chain: zscale to linear (npl=100 SDR target), float32 for
+	// tonemap precision, primaries to bt709, hable tonemap with
+	// desat=0 (preserve saturation), zscale back to bt709/limited,
+	// format to yuv420p for the encoder.
+	tonemap := ""
+	if c.Input.SourceIsHDR {
+		tonemap = "zscale=t=linear:npl=100,format=gbrpf32le," +
+			"zscale=p=bt709,tonemap=tonemap=hable:desat=0," +
+			"zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
+	}
 	videoChain := fmt.Sprintf(
-		"[%s]%sscale=%d:%d:force_original_aspect_ratio=decrease,"+
+		"[%s]%s%sscale=%d:%d:force_original_aspect_ratio=decrease,"+
 			"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,split=2[v][v_pre_src];"+
 			"[v_pre_src]fps=%d,scale=640:360:force_original_aspect_ratio=decrease[v_preview]",
-		inputs.videoMap, deint, w, h, w, h, previewFPS,
+		inputs.videoMap, deint, tonemap, w, h, w, h, previewFPS,
 	)
 	audioChain := fmt.Sprintf(
 		"[%s]aresample=async=1:min_hard_comp=0.100000:osr=48000,asplit=3[a_enc][a_preview][a_stats];"+
@@ -716,9 +870,65 @@ type inputBuild struct {
 	args     []string // -f / -i / etc. for each input
 	videoMap string   // e.g. "0:v" or "0:v:0"
 	audioMap string   // e.g. "0:a" or "1:a"
+	// audioFallbackDevice is set when buildInputs substituted silent
+	// audio because the configured audio device couldn't be resolved.
+	// Names the missing device so the supervisor can watch for it to
+	// come back. Empty when audio was resolved normally or when the
+	// input path doesn't support silent-audio fallback.
+	audioFallbackDevice string
 }
 
 const silentAudio = "anullsrc=channel_layout=stereo:sample_rate=48000"
+
+// buildNetworkInput constructs FFmpeg input args for a URL-based
+// source (RTSP camera, SRT pull, UDP multicast, HTTP/HLS).
+//
+// Each scheme gets transport tuning that matches what production
+// rigs use:
+//   - rtsp / rtsps: TCP transport so we don't lose packets the way
+//     UDP RTSP does on lossy LANs; reduced socket-buffer timeouts.
+//   - srt: rely on URL params (latency, passphrase, streamid, etc.)
+//   - udp / rtp: prefer larger fifo so packet bursts don't drop.
+//   - http / https: behave like a normal pull; rely on TCP.
+//
+// Audio: we map 0:a for the network source by default; most live
+// network sources (IP cameras, SRT pulls, broadcast HLS) carry an
+// audio track. If the operator marks NoAudio (or the source is
+// known to be video-only), we add a silent stereo lavfi input as a
+// second source and the audio map points there instead.
+func (c Config) buildNetworkInput() inputBuild {
+	url := strings.TrimSpace(c.Input.URL)
+	scheme := ""
+	if i := strings.Index(url, "://"); i > 0 {
+		scheme = strings.ToLower(url[:i])
+	}
+
+	var args []string
+	switch scheme {
+	case "rtsp", "rtsps":
+		// TCP avoids the UDP-RTSP packet-loss / NAT-traversal pain
+		// that's typical on church LANs with PoE switches.
+		args = append(args, "-rtsp_transport", "tcp")
+	case "srt":
+		// libsrt reads everything else from the URL.
+	case "udp", "rtp":
+		// MPEG-TS over UDP tends to be bursty; bigger fifo prevents
+		// drops on the source side.
+		args = append(args, "-fifo_size", "1000000", "-overrun_nonfatal", "1")
+	}
+	args = append(args, "-i", url)
+
+	build := inputBuild{
+		args:     args,
+		videoMap: "0:v",
+		audioMap: "0:a",
+	}
+	if c.Input.NoAudio {
+		build.args = append(build.args, "-f", "lavfi", "-i", silentAudio)
+		build.audioMap = "1:a"
+	}
+	return build
+}
 
 // buildInputs constructs FFmpeg input flags. When the capture source has no
 // audio (or audio isn't applicable), it adds a silent audio track as a
@@ -745,6 +955,9 @@ func (c Config) buildInputs() (inputBuild, error) {
 			audioMap: "1:a",
 		}, nil
 	}
+	if c.Input.Kind == InputNetwork {
+		return c.buildNetworkInput(), nil
+	}
 
 	backend := defaultString(c.Input.Backend, PlatformBackend())
 	if c.Input.Kind == InputSDI && backend != "decklink" {
@@ -764,15 +977,21 @@ func (c Config) buildInputs() (inputBuild, error) {
 			}
 			device = resolved
 		}
-		// Audio device: same strictness when a name is persisted. An
-		// empty audio device is legitimate (silent audio fallback).
+		// Audio device: try strict resolution, but if the configured
+		// mic isn't present right now, FALL BACK to silent audio
+		// rather than refusing to start. Losing audio mid-Sunday is
+		// recoverable (the supervisor watches for the device to come
+		// back and restarts); losing the whole stream is not.
 		audio := c.Input.AudioDevice
+		audioFallback := ""
 		if c.Input.AudioDeviceName != "" {
 			resolved, err := ResolveAVFoundationDeviceIndexStrict(c.Binary, c.Input.AudioDeviceName, "audio", c.Input.AudioDevice)
 			if err != nil {
-				return inputBuild{}, fmt.Errorf("audio source: %w", err)
+				audio = "" // triggers silent-audio branch below
+				audioFallback = c.Input.AudioDeviceName
+			} else {
+				audio = resolved
 			}
-			audio = resolved
 		}
 		fps := ProbeAVFoundationFramerate(c.Binary, device, c.Preset.FPS)
 		if audio != "" {
@@ -787,6 +1006,7 @@ func (c Config) buildInputs() (inputBuild, error) {
 				"-f", "lavfi", "-i", silentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
+			audioFallbackDevice: audioFallback,
 		}, nil
 
 	case "dshow":
@@ -913,6 +1133,37 @@ func chooseAVFoundationFramerate(output string, targetFPS int) (string, bool) {
 		return bestFPS, true
 	}
 	return "", false
+}
+
+// BuildResult bundles Args's command-line output with metadata about
+// what buildInputs actually did. The supervisor uses this metadata
+// (e.g. AudioFallbackDevice) to drive recovery watchers consistent
+// with the FFmpeg invocation we just started — not a separate later
+// probe whose answer could differ from what buildInputs decided.
+type BuildResult struct {
+	Args                []string
+	AudioFallbackDevice string
+}
+
+// Build is the supervisor-facing entry point. It runs buildInputs +
+// Args in one call and returns both the argv FFmpeg will see and the
+// fallback metadata buildInputs produced. Consistency is the point:
+// if buildInputs substituted silent audio, BuildResult.AudioFallbackDevice
+// names the missing mic — and that mic is the one we should watch for,
+// not whatever a later re-probe happens to find.
+func (c Config) Build() (BuildResult, error) {
+	if err := c.Validate(); err != nil {
+		return BuildResult{}, err
+	}
+	inputs, err := c.buildInputs()
+	if err != nil {
+		return BuildResult{}, err
+	}
+	args, err := c.argsWithInputs(inputs)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	return BuildResult{Args: args, AudioFallbackDevice: inputs.audioFallbackDevice}, nil
 }
 
 // ErrDeviceNotFound is returned when an AVFoundation device cannot be
