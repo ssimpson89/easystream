@@ -35,6 +35,12 @@ const (
 	InputHDMI      InputKind = "hdmi"
 	InputSDI       InputKind = "sdi"
 	InputTestVideo InputKind = "test-video"
+	// InputNetwork ingests from a URL. The scheme determines the
+	// FFmpeg transport: rtsp://, rtsps:// (IP cameras), srt://
+	// (pull from another encoder), udp:// (multicast MPEG-TS),
+	// http:// or https:// (HLS, MPEG-TS over HTTP). The URL goes
+	// in Input.URL.
+	InputNetwork InputKind = "network"
 )
 
 type Input struct {
@@ -45,6 +51,30 @@ type Input struct {
 	VideoDeviceName string    `json:"videoDeviceName,omitempty"`
 	AudioDeviceName string    `json:"audioDeviceName,omitempty"`
 	Format          string    `json:"format"`
+	// URL is used when Kind == InputNetwork. Carries the full
+	// rtsp/srt/udp/http URL the operator pasted, including any
+	// query parameters, credentials, or stream names.
+	URL string `json:"url,omitempty"`
+	// NoAudio disables FFmpeg's attempt to map an audio stream
+	// from the source. Useful for network sources (HDMI capture
+	// over RTSP without embedded audio, video-only DASH feeds)
+	// where the source has no audio track; without this flag
+	// FFmpeg errors at startup. When set, a silent stereo track
+	// is substituted instead.
+	NoAudio bool `json:"noAudio,omitempty"`
+}
+
+// networkInputSchemes is the allowlist of URL schemes we accept for
+// InputNetwork sources. file://, pipe:, concat:, and similar are
+// deliberately excluded to keep ingest a strictly network operation.
+var networkInputSchemes = map[string]bool{
+	"rtsp":  true,
+	"rtsps": true,
+	"srt":   true,
+	"udp":   true,
+	"rtp":   true,
+	"http":  true,
+	"https": true,
 }
 
 // OutputMode selects the *primary* destination FFmpeg sends to.
@@ -225,8 +255,26 @@ func (c Config) Validate() error {
 	if c.Preset.ID == "" {
 		return errors.New("quality preset is required")
 	}
-	if c.Input.Kind != InputTestVideo && strings.TrimSpace(c.Input.VideoDevice) == "" {
-		return errors.New("video device is required")
+	switch c.Input.Kind {
+	case InputTestVideo:
+		// no device required
+	case InputNetwork:
+		url := strings.TrimSpace(c.Input.URL)
+		if url == "" {
+			return errors.New("network input URL is required")
+		}
+		i := strings.Index(url, "://")
+		if i <= 0 {
+			return fmt.Errorf("network input URL must include a scheme like rtsp:// or srt://, got %q", url)
+		}
+		scheme := strings.ToLower(url[:i])
+		if !networkInputSchemes[scheme] {
+			return fmt.Errorf("unsupported network input scheme %q; supported: rtsp, rtsps, srt, udp, rtp, http, https", scheme)
+		}
+	default:
+		if strings.TrimSpace(c.Input.VideoDevice) == "" {
+			return errors.New("video device is required")
+		}
 	}
 	if c.EnableHLS && strings.TrimSpace(c.HLSDir) == "" {
 		return errors.New("HLS output directory is required when EnableHLS is true")
@@ -720,6 +768,56 @@ type inputBuild struct {
 
 const silentAudio = "anullsrc=channel_layout=stereo:sample_rate=48000"
 
+// buildNetworkInput constructs FFmpeg input args for a URL-based
+// source (RTSP camera, SRT pull, UDP multicast, HTTP/HLS).
+//
+// Each scheme gets transport tuning that matches what production
+// rigs use:
+//   - rtsp / rtsps: TCP transport so we don't lose packets the way
+//     UDP RTSP does on lossy LANs; reduced socket-buffer timeouts.
+//   - srt: rely on URL params (latency, passphrase, streamid, etc.)
+//   - udp / rtp: prefer larger fifo so packet bursts don't drop.
+//   - http / https: behave like a normal pull; rely on TCP.
+//
+// Audio: we map 0:a for the network source by default; most live
+// network sources (IP cameras, SRT pulls, broadcast HLS) carry an
+// audio track. If the operator marks NoAudio (or the source is
+// known to be video-only), we add a silent stereo lavfi input as a
+// second source and the audio map points there instead.
+func (c Config) buildNetworkInput() inputBuild {
+	url := strings.TrimSpace(c.Input.URL)
+	scheme := ""
+	if i := strings.Index(url, "://"); i > 0 {
+		scheme = strings.ToLower(url[:i])
+	}
+
+	var args []string
+	switch scheme {
+	case "rtsp", "rtsps":
+		// TCP avoids the UDP-RTSP packet-loss / NAT-traversal pain
+		// that's typical on church LANs with PoE switches.
+		args = append(args, "-rtsp_transport", "tcp")
+	case "srt":
+		// libsrt reads everything else from the URL.
+	case "udp", "rtp":
+		// MPEG-TS over UDP tends to be bursty; bigger fifo prevents
+		// drops on the source side.
+		args = append(args, "-fifo_size", "1000000", "-overrun_nonfatal", "1")
+	}
+	args = append(args, "-i", url)
+
+	build := inputBuild{
+		args:     args,
+		videoMap: "0:v",
+		audioMap: "0:a",
+	}
+	if c.Input.NoAudio {
+		build.args = append(build.args, "-f", "lavfi", "-i", silentAudio)
+		build.audioMap = "1:a"
+	}
+	return build
+}
+
 // buildInputs constructs FFmpeg input flags. When the capture source has no
 // audio (or audio isn't applicable), it adds a silent audio track as a
 // second input. RTMP streams require an audio track; YouTube rejects video-
@@ -744,6 +842,9 @@ func (c Config) buildInputs() (inputBuild, error) {
 			videoMap: "0:v",
 			audioMap: "1:a",
 		}, nil
+	}
+	if c.Input.Kind == InputNetwork {
+		return c.buildNetworkInput(), nil
 	}
 
 	backend := defaultString(c.Input.Backend, PlatformBackend())

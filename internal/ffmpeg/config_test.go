@@ -151,6 +151,81 @@ func TestChooseAVFoundationDeviceIndex(t *testing.T) {
 	}
 }
 
+func networkInputCfg(url string) Config {
+	cfg := DefaultConfig()
+	cfg.Input = Input{Kind: InputNetwork, URL: url}
+	cfg.IngestURL = "rtmp://localhost"
+	cfg.StreamName = "test"
+	return cfg
+}
+
+func TestArgsNetworkInputRTSP(t *testing.T) {
+	cfg := networkInputCfg("rtsp://camera.local:554/stream1")
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, expected := range []string{
+		"-rtsp_transport tcp",
+		"-i rtsp://camera.local:554/stream1",
+		"-map [v]",
+		"-map [a_enc]",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Errorf("expected %q in args: %s", expected, joined)
+		}
+	}
+}
+
+func TestArgsNetworkInputSRTPull(t *testing.T) {
+	cfg := networkInputCfg("srt://upstream.example.com:9999?streamid=read:test")
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-i srt://upstream.example.com:9999?streamid=read:test") {
+		t.Errorf("expected SRT pull input verbatim: %s", joined)
+	}
+	if strings.Contains(joined, "-rtsp_transport") {
+		t.Errorf("did not expect RTSP transport on SRT pull: %s", joined)
+	}
+}
+
+func TestArgsNetworkInputNoAudioAddsSilentTrack(t *testing.T) {
+	cfg := networkInputCfg("rtsp://hdmi-only-camera/feed")
+	cfg.Input.NoAudio = true
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "anullsrc=channel_layout=stereo") {
+		t.Errorf("expected silent audio lavfi input when NoAudio set: %s", joined)
+	}
+	if !strings.Contains(joined, "-map [a_enc]") {
+		t.Errorf("expected encoded audio mapped: %s", joined)
+	}
+}
+
+func TestNetworkInputValidateRejectsBadSchemes(t *testing.T) {
+	cfg := networkInputCfg("file:///etc/passwd")
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation to reject file:// scheme")
+	}
+}
+
+func TestNetworkInputValidateRequiresURL(t *testing.T) {
+	cfg := networkInputCfg("")
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation to require URL for network input")
+	}
+}
+
 func TestArgsSRTOutput(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.OutputMode = OutputSRT
