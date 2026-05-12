@@ -263,18 +263,29 @@
                 </template>
               </select>
             </label>
-            <div x-show="isNetworkSource">
+
+            <!-- Network-source-specific controls grouped in a sub-form card -->
+            <div class="sub-form" x-show="isNetworkSource">
               <label>Network URL
                 <input x-model="networkUrl" @input="onNetworkUrlChange()" @blur="onNetworkUrlBlur()"
                        autocomplete="off" spellcheck="false"
                        placeholder="rtsp://camera.local:554/stream1">
               </label>
-              <p class="hint">Supported schemes: <code>rtsp://</code>, <code>rtsps://</code>, <code>srt://</code>, <code>udp://</code>, <code>rtp://</code>, <code>http(s)://</code>. Include credentials in the URL when the source requires them (e.g. <code>rtsp://user:pass@host/path</code>).</p>
+              <p class="hint">
+                Supports <code>rtsp://</code>, <code>rtsps://</code>, <code>srt://</code>,
+                <code>udp://</code>, <code>rtp://</code>, and <code>http(s)://</code>.
+                Include credentials in the URL when the source requires them
+                (e.g. <code>rtsp://user:pass@host/path</code>).
+              </p>
               <label class="checkbox-row">
                 <input type="checkbox" x-model="networkNoAudio" @change="onNetworkNoAudioToggle()">
-                Source has no audio (substitute silent track)
+                <span>
+                  Source has no audio
+                  <span class="row-hint">EasyStream will substitute a silent track.</span>
+                </span>
               </label>
             </div>
+
             <label x-show="!isSDISource && !isNetworkSource">
               Audio source
               <select x-ref="audioSourceSelect" x-model="audioSourceValue" @change="onAudioSourceChange()">
@@ -283,10 +294,21 @@
                 </template>
               </select>
             </label>
-            <label class="checkbox-row" x-show="videoSourceValue !== '' && videoSourceValue !== 'test-video::'">
-              <input type="checkbox" x-model="sourceIsHDR" @change="onHDRToggle()">
-              Source is HDR (PQ/HLG) — tone-map to SDR
-            </label>
+
+            <!-- Power-user toggle hidden behind a disclosure so it doesn't
+                 clutter the panel for the 99% of operators who don't have
+                 HDR capture hardware. -->
+            <details class="advanced" x-show="videoSourceValue !== '' && videoSourceValue !== 'test-video::'">
+              <summary>Advanced</summary>
+              <label class="checkbox-row">
+                <input type="checkbox" x-model="sourceIsHDR" @change="onHDRToggle()">
+                <span>
+                  Source is HDR (PQ / HLG)
+                  <span class="row-hint">Tone-map to SDR Rec.709 for YouTube.</span>
+                </span>
+              </label>
+            </details>
+
             <div class="device-status-row">
               <p class="hint" x-text="deviceStatusText"></p>
               <button class="button button-sm" @click="scanDevices(true)">Refresh</button>
