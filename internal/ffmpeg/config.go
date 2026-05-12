@@ -57,7 +57,7 @@ type OutputMode string
 
 const (
 	OutputRTMP OutputMode = "rtmp" // RTMP/RTMPS push (YouTube, Twitch, etc.)
-	OutputSRT  OutputMode = "srt"  // SRT push (Cloudflare Stream, custom receivers)
+	OutputSRT  OutputMode = "srt"  // SRT push
 	// Legacy "hls" value is recognised on the load path (server.go,
 	// handleConfigUpdate, configResponse) for migrating older configs.
 	// New code should not emit it as a primary mode.
@@ -85,7 +85,7 @@ type EncoderInfo struct {
 // knownEncoders lists all encoders we know how to configure, in display order.
 var knownEncoders = []EncoderInfo{
 	{EncoderX264, "Software (x264)", "CPU-based, true CBR, widest compatibility. Required for SRT destinations.", true},
-	{EncoderVideoToolbox, "Apple VideoToolbox", "macOS hardware encoder. Soft CBR — not used for SRT (Cloudflare rejects sub-target bitrates).", false},
+	{EncoderVideoToolbox, "Apple VideoToolbox", "macOS hardware encoder. Soft CBR — not used for SRT, which requires true CBR.", false},
 	{EncoderNVENC, "NVIDIA NVENC", "NVIDIA GPU hardware encoder", false},
 	{EncoderVAAPI, "VA-API", "Linux Intel/AMD GPU hardware encoder", false},
 	{EncoderQSV, "Intel QuickSync", "Intel GPU hardware encoder", false},
@@ -253,14 +253,10 @@ func (c Config) primaryRunnable() bool {
 
 // EffectiveEncoder returns the encoder to use.
 //
-// For SRT destinations we always use libx264 regardless of what the
-// operator picked, because Apple's h264_videotoolbox does soft CBR
-// (it's a quality target — encoder produces what content needs, even
-// with -constant_bit_rate=1) and SRT receivers like Cloudflare Stream
-// reject sub-target streams as "not broadcasting". libx264 with
-// nal-hrd=cbr produces true strict CBR via bitstream stuffing. This
-// silent override is a usability trade-off: the alternative is a
-// hardware-accelerated stream Cloudflare won't accept.
+// SRT destinations always use libx264. Apple's h264_videotoolbox is a
+// quality-target encoder (soft CBR — it produces what the content needs
+// even with -constant_bit_rate=1) and SRT receivers expect a true CBR
+// stream that matches the declared bitrate.
 func (c Config) EffectiveEncoder() Encoder {
 	if c.OutputMode == OutputSRT {
 		return EncoderX264
@@ -273,13 +269,11 @@ func (c Config) EffectiveEncoder() Encoder {
 
 func (c Config) OutputURL() string {
 	if c.OutputMode == OutputSRT {
-		// SRT URL formats vary widely across receivers (Cloudflare
-		// uses streamid=<id>:<password>, MediaMTX uses
-		// streamid=publish:<name>, others use the raw key). The user
-		// pastes the complete URL — we pass it through verbatim
-		// without manipulating streamid or other params. Trying to
-		// be smart here causes URL-encoding of colons (Cloudflare
-		// rejects %3A) and other corruption.
+		// SRT URL formats vary by receiver (streamid syntax,
+		// passphrase, latency, etc.). The user pastes the complete
+		// URL; we pass it through verbatim. Mutating it would
+		// URL-encode characters like ':' that some receivers
+		// require literal.
 		return c.IngestURL
 	}
 	// RTMP: append stream key as a path segment.
@@ -311,45 +305,67 @@ func (c Config) Args() ([]string, error) {
 		return nil, err
 	}
 	args = append(args, inputs.args...)
-	args = append(args, "-map", inputs.videoMap, "-map", inputs.audioMap)
 
 	encoder := c.EffectiveEncoder()
 	gop := fmt.Sprintf("%d", c.Preset.GOP())
-
-	// Build video filter chain. SDI/DeckLink sources may be interlaced
-	// so we auto-deinterlace with yadif, then scale + pad to the target
-	// resolution preserving aspect ratio.
-	//
-	// scale/pad accept W:H (colon-separated) — NOT W x H. The pad filter
-	// in particular doesn't recognise "1920x1080" as a dimension pair.
-	var vf string
 	w, h := c.Preset.Width, c.Preset.Height
+
+	// Single -filter_complex graph for video and audio. We branch
+	// audio with asplit so the encoder consumes a clean stream and
+	// the astats/ametadata stderr-print path runs on its own copy.
+	// Mixing astats into the encode path would synchronously block
+	// the filter graph on stderr writes — producing exactly the
+	// "MediaSource readyState: closed" failure browsers/players
+	// throw when AAC frames arrive with non-uniform PTS deltas.
+	//
+	// SDI/DeckLink can be interlaced, so the software path deint with
+	// yadif (no-op on progressive). VideoToolbox handles progressive
+	// natively; scale_vt would need hwaccel frames AVFoundation can't
+	// produce, so the CPU scaler runs cheaply alongside the GPU
+	// encoder.
+	var videoChain string
 	if encoder == EncoderVideoToolbox {
-		// VideoToolbox encoder handles progressive webcam/OBS input natively
-		// so we skip yadif deinterlacing. scale_vt requires hwaccel frames
-		// which AVFoundation doesn't produce, so we keep the CPU scaler
-		// (cheap relative to encoding).
-		vf = fmt.Sprintf(
-			"scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black",
-			w, h, w, h,
+		videoChain = fmt.Sprintf(
+			"[%s]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black[v]",
+			inputs.videoMap, w, h, w, h,
 		)
 	} else {
-		// Software path: yadif deint=interlaced is a no-op on progressive
-		// sources but catches real interlaced SDI/DeckLink input.
-		vf = fmt.Sprintf(
-			"yadif=deint=interlaced,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black",
-			w, h, w, h,
+		videoChain = fmt.Sprintf(
+			"[%s]yadif=deint=interlaced,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black[v]",
+			inputs.videoMap, w, h, w, h,
 		)
 	}
+
+	// Audio resampler:
+	//   async=1            broadcast-standard soft sync — pad/trim
+	//                      only on stream start, never warps PTS
+	//                      deltas mid-stream (a continuous warping
+	//                      resampler produces AAC frames whose
+	//                      PTS deltas drift off 1024/48000 s and
+	//                      strict demuxers/players reject them).
+	//   min_hard_comp=0.1  fall back to hard pad/trim only after
+	//                      100 ms of accumulated drift.
+	//   osr=48000          pin output rate so the encoder always
+	//                      sees 48 kHz regardless of source rate.
+	// astats + ametadata feeds the audio confidence pill via stderr,
+	// but it runs on a side branch and never touches the encoder.
+	audioChain := fmt.Sprintf(
+		"[%s]aresample=async=1:min_hard_comp=0.100000:osr=48000,asplit=2[a_enc][a_stats];"+
+			"[a_stats]astats=metadata=1:reset=1:length=1,"+
+			"ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr,anullsink",
+		inputs.audioMap,
+	)
+
+	args = append(args, "-filter_complex", videoChain+";"+audioChain)
+	args = append(args, "-map", "[v]", "-map", "[a_enc]")
 
 	// Encoder settings aligned with YouTube's H.264 recommendations:
 	//   - High profile where supported (CABAC, 8-bit 4:2:0)
 	//   - 2 B-frames, 1 reference frame, progressive scan (software)
-	//   - CBR via -b:v == -maxrate, 2x bufsize for ~2s buffer
+	//   - CBR via -b:v == -maxrate, bufsize == maxrate for 1s VBV
 	//   - 2-second keyframe interval (GOP = FPS * 2)
 	//   - Rec.709 color primaries / transfer / matrix for SDR
-	//   - 128 kbps AAC stereo at 48 kHz
-	args = append(args, "-vf", vf)
+	//   - AAC stereo at 48 kHz, encoder selected per platform
 	args = append(args, c.encoderArgs(encoder, gop)...)
 	args = append(args,
 		"-b:v", c.Preset.VideoBitrate(),
@@ -361,32 +377,10 @@ func (c Config) Args() ([]string, error) {
 		"-color_primaries", "bt709",
 		"-color_trc", "bt709",
 		"-colorspace", "bt709",
-		// Audio filter chain:
-		//   1. aresample=async=1000:first_pts=0 — explicit resampler
-		//      handles mic→encoder rate mismatch (AVFoundation captures
-		//      MacBook mics at 44.1k, we force 48k). Without an explicit
-		//      filter FFmpeg's implicit resampler can desync over time,
-		//      producing periodic audio dropouts (~1 cutout/second on
-		//      affected systems). async=1000 corrects PTS drift up to
-		//      1s smoothly; first_pts=0 zero-aligns the audio start.
-		//   2. astats=metadata=1:reset=1:length=1 — emits per-second
-		//      RMS stats consumed by the supervisor for silent-audio
-		//      detection (stuck mic, wrong source).
-		//   3. ametadata=print — writes the stats to /dev/stderr; this
-		//      bypasses -loglevel warning suppression while keeping
-		//      stdout reserved for FFmpeg's progress stream.
-		"-af", "aresample=async=1000:first_pts=0,astats=metadata=1:reset=1:length=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr",
-		"-c:a", "aac",
+	)
+	args = append(args, c.audioEncoderArgs()...)
+	args = append(args,
 		"-b:a", c.Preset.AudioBitrate(),
-		// 48 kHz over YouTube's recommended 44.1 kHz for stereo:
-		//   - matches every other live destination's preferred rate
-		//     (Cloudflare Stream, Twitch, MediaMTX, SRT receivers)
-		//   - matches the broadcast/SDI standard, so HDMI/SDI feeds
-		//     pass through without resampling
-		//   - YouTube accepts 48 kHz fine — their 44.1 stereo line is
-		//     a recommendation, not a requirement
-		//   - aresample (above) handles 44.1→48 for consumer macOS
-		//     mics smoothly via async=1000 PTS correction
 		"-ar", "48000",
 		"-ac", "2",
 	)
@@ -396,14 +390,15 @@ func (c Config) Args() ([]string, error) {
 	if c.primaryRunnable() {
 		switch c.OutputMode {
 		case OutputSRT:
+			// MPEG-TS over SRT. -flush_packets 1 + -muxdelay 0
+			// -muxpreload 0 keep the muxer low-latency: each packet
+			// is flushed immediately and the muxer doesn't hold
+			// audio waiting for video PTS (default muxdelay 0.7 s).
 			args = append(args,
 				"-f", "mpegts",
-				// resend_headers: re-emit PAT/PMT periodically so a
-				// receiver joining mid-stream (or reconnecting after a
-				// blip) can decode without waiting for a full keyframe
-				// interval. initial_discontinuity primes the receiver.
-				"-mpegts_flags", "+resend_headers+initial_discontinuity",
 				"-flush_packets", "1",
+				"-muxdelay", "0",
+				"-muxpreload", "0",
 				c.OutputURL(),
 			)
 		default: // OutputRTMP and "" both go here
@@ -478,11 +473,10 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 		//
 		// -constant_bit_rate 1 forces true CBR. Without it, VideoToolbox
 		// defaults to VBR — which drops the bitrate well below the
-		// configured target for low-motion content (a static OBS scene
-		// can come in at 1-2 Mbps even when -b:v says 10 Mbps). Cloudflare
-		// Stream and other live receivers expect a constant bitrate at
-		// or near the target and treat sub-threshold streams as "not
-		// broadcasting".  Requires macOS 13+ / current VideoToolbox.
+		// configured target for low-motion content (a static scene can
+		// come in at 1-2 Mbps even when -b:v says 10 Mbps). Live ingest
+		// receivers expect a constant rate at or near the target.
+		// Requires macOS 13+ / current VideoToolbox.
 		return []string{
 			"-c:v", "h264_videotoolbox",
 			"-profile:v", "high",
@@ -542,19 +536,16 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 		}
 
 	default: // libx264 (software)
+		// Industry-standard live H.264 CBR settings:
+		//   filler=1     VBV filler NALs to maintain hard-CBR without
+		//                emitting HRD parameters in the SPS VUI.
+		//   open-gop=0   closed GOP — every keyframe is IDR, no frames
+		//                reference across keyframe boundaries.
+		//   scenecut=0   no scene-change keyframes; keyframes only at
+		//                the configured GOP boundary so receivers
+		//                segment predictably.
 		// No -tune zerolatency: it disables B-frames, which YouTube
-		// explicitly recommends keeping (2 B-frames). Latency doesn't
-		// matter for broadcast streaming.
-		//
-		// x264-params:
-		//   nal-hrd=cbr   signal CBR in the bitstream HRD parameters
-		//                 (Cloudflare and other strict receivers check
-		//                 this and may reject streams without it)
-		//   open-gop=0    closed GOP — every keyframe is IDR, no
-		//                 frames reference across keyframe boundaries
-		//   scenecut=0    no scene-change keyframes; keyframes only at
-		//                 the configured GOP boundary, so receivers
-		//                 segment predictably
+		// explicitly recommends keeping (2 B-frames).
 		return []string{
 			"-c:v", "libx264",
 			"-preset", "veryfast",
@@ -564,9 +555,24 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 			"-sc_threshold", "0",
 			"-bf", "2",
 			"-refs", "1",
-			"-x264-params", "nal-hrd=cbr:open-gop=0:scenecut=0:keyint=" + gop + ":min-keyint=" + gop,
+			"-x264-params", "filler=1:open-gop=0:scenecut=0:keyint=" + gop + ":min-keyint=" + gop,
 		}
 	}
+}
+
+// audioEncoderArgs picks the best available AAC-LC encoder for the
+// current platform. On macOS we prefer aac_at (Apple AudioToolbox),
+// which produces noticeably better quality per bit than FFmpeg's
+// native encoder at 128–192 kbps — particularly on music and choir
+// content — and is what OBS Studio ships on macOS. Elsewhere we
+// fall back to the native aac encoder with -aac_coder twoloop
+// (the higher-quality two-loop search coder, not the default fast
+// coder which can produce frames strict demuxers reject).
+func (c Config) audioEncoderArgs() []string {
+	if runtime.GOOS == "darwin" {
+		return []string{"-c:a", "aac_at"}
+	}
+	return []string{"-c:a", "aac", "-aac_coder", "twoloop"}
 }
 
 // previewEncoderArgs returns lightweight encoder flags for the secondary

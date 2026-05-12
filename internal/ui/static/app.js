@@ -864,24 +864,14 @@ document.addEventListener("alpine:init", () => {
     // QUICK FILL + UTIL
     // ============================================================
     quickFill(platform) {
-      // RTMP presets switch outputMode to rtmp; SRT presets switch to srt.
       const RTMP = {
         youtube:    "rtmps://a.rtmps.youtube.com/live2",
         cloudflare: "rtmps://live.cloudflare.com:443/live/",
         twitch:     "rtmp://live.twitch.tv/app",
       };
-      const SRT = {
-        // Cloudflare's SRT receiver uses AES-256 — pbkeylen=32 must be
-        // explicit because libsrt defaults to 16 (AES-128) which
-        // Cloudflare rejects with a silent "stream has not started".
-        "srt-cloudflare": "srt://live.cloudflare.com:778?pbkeylen=32",
-      };
       if (RTMP[platform]) {
         this.outputMode = "rtmp";
         this.ingestUrl = RTMP[platform];
-      } else if (SRT[platform]) {
-        this.outputMode = "srt";
-        this.ingestUrl = SRT[platform];
       } else {
         return;
       }

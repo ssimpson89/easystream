@@ -30,12 +30,12 @@ func TestArgsIncludeBandwidthAndRecoveryOptions(t *testing.T) {
 		"-refs 1",           // YT: 1 reference frame
 		"-profile:v high",   // YT requires High profile for CABAC
 		"-colorspace bt709", // YT: Rec.709 SDR
-		"nal-hrd=cbr",       // CBR signalling in bitstream HRD
-		"open-gop=0",        // Closed GOP (Cloudflare hard requirement)
+		"filler=1",          // VBV filler NALs maintain hard-CBR
+		"open-gop=0",        // Closed GOP
 		"scenecut=0",        // No scene-change keyframes; predictable segmenting
 		"-tcp_keepalive 1",
 		"-rw_timeout 12000000",
-		"aresample=async=1000:first_pts=0", // explicit resampler — fixes mic 44.1→48 drift
+		"aresample=async=1:min_hard_comp=0.100000:osr=48000", // soft drift correction; no PTS-warping
 		"ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr",
 		"rtmps://a.rtmps.youtube.com/live2/abc-def-ghi",
 	} {
@@ -164,7 +164,6 @@ func TestArgsSRTOutput(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, expected := range []string{
 		"-f mpegts",
-		"+resend_headers+initial_discontinuity",
 		"-flush_packets 1",
 		"srt://example.com:9999",
 	} {
@@ -178,13 +177,12 @@ func TestArgsSRTOutput(t *testing.T) {
 }
 
 // TestArgsSRTPassesURLVerbatim confirms we don't mutate the SRT URL.
-// SRT URL formats vary too much across receivers (Cloudflare's
-// "streamid=id:password" gets URL-encoded to "streamid=id%3Apassword"
-// if we touch it, which Cloudflare rejects). User pastes the full URL.
+// Receivers use varied streamid/passphrase/latency syntax — any
+// re-encoding (e.g. %3A for ':') breaks the handshake.
 func TestArgsSRTPassesURLVerbatim(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.OutputMode = OutputSRT
-	cfg.IngestURL = "srt://live.cloudflare.com:778?streamid=abc-input:secret&latency=4000"
+	cfg.IngestURL = "srt://ingest.example.com:9999?streamid=abc-input:secret&latency=4000"
 	cfg.StreamName = "ignored-for-srt"
 
 	args, err := cfg.Args()
@@ -192,11 +190,11 @@ func TestArgsSRTPassesURLVerbatim(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "srt://live.cloudflare.com:778?streamid=abc-input:secret&latency=4000") {
+	if !strings.Contains(joined, "srt://ingest.example.com:9999?streamid=abc-input:secret&latency=4000") {
 		t.Errorf("expected SRT URL passed verbatim, got: %s", joined)
 	}
 	if strings.Contains(joined, "%3A") {
-		t.Errorf("URL must not URL-encode the colon in Cloudflare-style streamid: %s", joined)
+		t.Errorf("URL must not URL-encode the colon in streamid: %s", joined)
 	}
 }
 

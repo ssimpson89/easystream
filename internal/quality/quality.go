@@ -66,7 +66,7 @@ var Presets = []Preset{
 		Height:       720,
 		FPS:          30,
 		VideoKbps:    4000,
-		AudioKbps:    128,
+		AudioKbps:    160,
 		UploadTarget: "6 Mbps or better",
 	},
 	{
@@ -77,8 +77,22 @@ var Presets = []Preset{
 		Height:       720,
 		FPS:          60,
 		VideoKbps:    6000,
-		AudioKbps:    128,
+		AudioKbps:    160,
 		UploadTarget: "9 Mbps or better",
+	},
+	{
+		// Lower-bitrate 1080p30 for destinations that cap below
+		// YouTube's recommended 10 Mbps. Below YouTube's published
+		// guidance but produces fine 1080p30 quality.
+		ID:           "balanced",
+		Name:         "Balanced (1080p)",
+		Description:  "1080p at 30fps at a CDN-friendly 7 Mbps bitrate. Useful for destinations that cap below YouTube's recommended 10 Mbps.",
+		Width:        1920,
+		Height:       1080,
+		FPS:          30,
+		VideoKbps:    7000,
+		AudioKbps:    160,
+		UploadTarget: "10 Mbps or better",
 	},
 	{
 		ID:           "recommended",
@@ -88,7 +102,7 @@ var Presets = []Preset{
 		Height:       1080,
 		FPS:          30,
 		VideoKbps:    10000,
-		AudioKbps:    128,
+		AudioKbps:    160,
 		UploadTarget: "13 Mbps or better",
 	},
 	{
@@ -99,13 +113,14 @@ var Presets = []Preset{
 		Height:       1080,
 		FPS:          60,
 		VideoKbps:    12000,
-		AudioKbps:    128,
+		AudioKbps:    160,
 		UploadTarget: "16 Mbps or better",
 	},
 }
 
 func Default() Preset {
-	return Presets[3]
+	p, _ := ByID("recommended")
+	return p
 }
 
 func ByID(id string) (Preset, bool) {

@@ -499,17 +499,12 @@
             </div>
 
             <div x-show="outputMode === 'srt'">
-              <div class="quick-fill">
-                <span class="quick-fill-label">Quick fill:</span>
-                <button class="button button-sm" @click="quickFill('srt-cloudflare')">Cloudflare Stream</button>
-              </div>
               <label>SRT URL
                 <input x-model="ingestUrl" @input="onIngestChange()" @blur="onIngestBlur()"
                        autocomplete="off" spellcheck="false"
                        placeholder="srt://ingest.example.com:9999?streamid=YOUR-KEY">
               </label>
               <p class="hint">Paste the complete SRT URL including <code>streamid=</code> and any other parameters. EasyStream pushes MPEG-TS and does not modify the URL.</p>
-              <p class="hint"><strong>Cloudflare Stream:</strong> the URL must include <code>pbkeylen=32</code> — Cloudflare uses AES-256, libsrt defaults to AES-128, mismatch causes a silent "Stream has not started" with no error. The Cloudflare quick-fill button above includes this. If you pasted the URL manually from Cloudflare's dashboard, append <code>&amp;pbkeylen=32</code>.</p>
             </div>
           </section>
 
