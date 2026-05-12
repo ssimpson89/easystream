@@ -445,12 +445,21 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 		// Apple VideoToolbox (macOS). Uses hardware H.264 on Apple Silicon
 		// or Intel. Supports -profile and -level but not x264 presets.
 		// -allow_sw 1 falls back to software if hardware is busy.
+		//
+		// -constant_bit_rate 1 forces true CBR. Without it, VideoToolbox
+		// defaults to VBR — which drops the bitrate well below the
+		// configured target for low-motion content (a static OBS scene
+		// can come in at 1-2 Mbps even when -b:v says 10 Mbps). Cloudflare
+		// Stream and other live receivers expect a constant bitrate at
+		// or near the target and treat sub-threshold streams as "not
+		// broadcasting".  Requires macOS 13+ / current VideoToolbox.
 		return []string{
 			"-c:v", "h264_videotoolbox",
 			"-profile:v", "high",
 			"-level:v", "4.1",
 			"-allow_sw", "1",
 			"-realtime", "1",
+			"-constant_bit_rate", "1",
 		}
 
 	case EncoderNVENC:
