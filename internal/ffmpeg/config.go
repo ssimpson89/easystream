@@ -159,6 +159,36 @@ func redactRawURL(u string) string {
 	return u[:schemeIdx+3] + RedactedCredentialSentinel + ":" + RedactedCredentialSentinel + rest[atIdx:]
 }
 
+// urlInLogRegex matches URL-shaped substrings inside a free-form
+// log line. Matches the schemes we accept for ingest/egress
+// (RTMP/SRT/RTSP/HTTP/UDP/RTP), stopping at whitespace or the
+// trailing punctuation FFmpeg uses around URLs in error messages.
+var urlInLogRegex = regexp.MustCompile(`(?i)(rtmp|rtmps|rtsp|rtsps|srt|http|https|udp|rtp)://[^\s'"]+`)
+
+// RedactURLsInLog scans a free-form log line for URLs and runs each
+// one through RedactURLCredentials. FFmpeg routinely echoes the full
+// ingest/destination URL (with userinfo or query-string secrets) in
+// error messages and connect logs. Without this, those secrets land
+// in /status.lastLogLine, the logger output, and any SSE consumer.
+func RedactURLsInLog(line string) string {
+	return urlInLogRegex.ReplaceAllStringFunc(line, func(match string) string {
+		// The regex may grab a trailing ',', ')', or '.' that's
+		// punctuation from the surrounding log message, not part of
+		// the URL. Strip those before redacting and reattach after.
+		trailing := ""
+		for len(match) > 0 {
+			last := match[len(match)-1]
+			if last == ',' || last == '.' || last == ')' || last == ']' || last == ';' || last == ':' {
+				trailing = string(last) + trailing
+				match = match[:len(match)-1]
+				continue
+			}
+			break
+		}
+		return RedactURLCredentials(match) + trailing
+	})
+}
+
 // OutputMode selects the *primary* destination FFmpeg sends to.
 // HLS is no longer one of the mutually-exclusive primaries — it is an
 // independent toggle (Config.EnableHLS) that runs alongside any primary
@@ -938,12 +968,7 @@ func (c Config) buildNetworkInput() inputBuild {
 	case "rtsp", "rtsps":
 		// TCP avoids the UDP-RTSP packet-loss / NAT-traversal pain
 		// that's typical on church LANs with PoE switches.
-		// -rtsp_flags prefer_tcp ensures TCP is used for media too,
-		// not just control.
-		args = append(args,
-			"-rtsp_transport", "tcp",
-			"-rtsp_flags", "prefer_tcp",
-		)
+		args = append(args, "-rtsp_transport", "tcp")
 	case "srt":
 		// libsrt reads transport options from URL params (latency,
 		// passphrase, streamid, etc.). Nothing to add here.

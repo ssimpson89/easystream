@@ -50,6 +50,53 @@ func TestRedactURLCredentialsEmpty(t *testing.T) {
 	}
 }
 
+func TestRedactURLsInLog(t *testing.T) {
+	cases := []struct {
+		name, in string
+		want     []string // substrings that must be present
+		banned   []string // substrings that must NOT be present
+	}{
+		{
+			name:   "rtsp connect-refused error with userinfo",
+			in:     "[rtsp @ 0x123] method DESCRIBE failed: rtsp://admin:Sup3rSecret@cam.local:554/path",
+			want:   []string{"rtsp://REDACTED:REDACTED@cam.local:554/path"},
+			banned: []string{"Sup3rSecret", "admin:Sup"},
+		},
+		{
+			name:   "srt url with passphrase in query",
+			in:     "[srt] connection failed to srt://relay.example.com:9999?passphrase=Hunter2&streamid=foo",
+			want:   []string{"passphrase=REDACTED", "streamid=foo"},
+			banned: []string{"Hunter2"},
+		},
+		{
+			name:   "trailing punctuation preserved",
+			in:     "could not open 'rtsp://user:pass@host/path'.",
+			want:   []string{"rtsp://REDACTED:REDACTED@host/path", "."},
+			banned: []string{"user:pass"},
+		},
+		{
+			name: "no URL → unchanged",
+			in:   "[h264 @ 0x123] mmco: unref short failure",
+			want: []string{"mmco: unref short failure"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := RedactURLsInLog(c.in)
+			for _, w := range c.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("expected %q in result: %q", w, got)
+				}
+			}
+			for _, b := range c.banned {
+				if strings.Contains(got, b) {
+					t.Errorf("did not expect %q in result: %q", b, got)
+				}
+			}
+		})
+	}
+}
+
 func TestRedactStreamKey(t *testing.T) {
 	cases := []struct {
 		name string

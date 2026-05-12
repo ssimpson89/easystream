@@ -458,27 +458,34 @@ document.addEventListener("alpine:init", () => {
         v = { icon: "video", label: "Video", status: "green", detail: "Test pattern" };
       } else if (this.isNetworkSource) {
         // Network sources can't be presence-checked the way hardware
-        // devices can. Use the running ffmpeg's progress as the
-        // signal: encoder fps > 0 means frames are flowing through
-        // the pipeline (bitrate aggregation is unreliable under
-        // the tee muxer, so we key off fps instead).
-        const url = (this.networkUrl || "").trim();
-        if (!url) {
+        // devices can. We key off the live ffmpeg's progress: fps > 0
+        // means frames are flowing through the pipeline. The displayed
+        // URL is the SERVER-confirmed one (this.config.input.url, which
+        // round-trips through the redaction layer) — never the form
+        // mirror, because that might be a half-typed URL the operator
+        // is currently editing.
+        const formUrl = (this.networkUrl || "").trim();
+        const serverUrl = this.config?.input?.url || "";
+        const liveUrl = F.redactUrl(serverUrl || formUrl);
+        if (!formUrl) {
           v = { icon: "video", label: "Video", status: "red", detail: "Enter a network URL" };
         } else if (this.stream?.state === "running") {
           const fps = this.stream?.lastProgress?.fps || 0;
           if (fps > 0) {
-            v = { icon: "video", label: "Video", status: "green", detail: `${url} (${fps.toFixed(0)} fps)` };
+            v = { icon: "video", label: "Video", status: "green", detail: `${liveUrl} (${fps.toFixed(0)} fps)` };
           } else {
             v = { icon: "video", label: "Video", status: "yellow",
-                  detail: `${url} — connected, waiting for frames` };
+                  detail: `${liveUrl} — connected, waiting for frames` };
           }
+        } else if (this.stream?.state === "starting" || this.stream?.state === "restarting") {
+          v = { icon: "video", label: "Video", status: "yellow",
+                detail: `Connecting to ${liveUrl}…` };
         } else if (this.stream?.state === "failed") {
           v = { icon: "video", label: "Video", status: "red",
-                detail: this.stream?.lastError || `Could not reach ${url}` };
+                detail: this.stream?.lastError || `Could not reach ${liveUrl}` };
         } else {
           v = { icon: "video", label: "Video", status: "yellow",
-                detail: `${url} — not verified (start stream to check)` };
+                detail: `${F.redactUrl(formUrl)} — not verified (start stream to check)` };
         }
       } else {
         const presence = this.devicePresence("video");
@@ -497,7 +504,10 @@ document.addEventListener("alpine:init", () => {
       // configured mic vanished" via audioFallbackDevice. Surface
       // that first so the operator sees what's happening: silent
       // audio is live, and we'll reconnect when the mic returns.
-      const fallback = this.stream?.audioFallbackDevice;
+      // Skip for network sources where audio comes from the URL —
+      // the fallback would be a stale signal carried over from a
+      // previous local-device session.
+      const fallback = !this.isNetworkSource ? this.stream?.audioFallbackDevice : "";
       if (fallback) {
         aSource = {
           icon: "mic", label: "Audio", status: "yellow",
@@ -700,11 +710,21 @@ document.addEventListener("alpine:init", () => {
     // CONFIG SAVE
     // ============================================================
     async saveConfig() {
-      // Single in-flight save promise to prevent overlapping requests.
-      if (this._savePending) { await this._savePending; }
-      this._savePending = this._doSaveConfig();
-      try { return await this._savePending; }
-      finally { this._savePending = null; }
+      // Real serialisation: chain each call onto the previous promise
+      // so two concurrent callers can't both reassign _savePending and
+      // race their POSTs. The previous version awaited then assigned,
+      // which only deduplicated — two callers entering simultaneously
+      // both passed the await with stale state and both fired _doSaveConfig.
+      const prev = this._savePending || Promise.resolve();
+      const next = prev.then(() => this._doSaveConfig(), () => this._doSaveConfig());
+      this._savePending = next;
+      try {
+        return await next;
+      } finally {
+        // Clear only if no later caller already chained onto us — they'll
+        // own the slot until their own finally runs.
+        if (this._savePending === next) this._savePending = null;
+      }
     },
     async _doSaveConfig() {
       const decoded = S.decodeSourceValue(this.videoSourceValue) || S.decodeSourceValue(S.encodeSourceValue(this.config?.input, this.devices));

@@ -14,6 +14,7 @@
 package preview
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -350,11 +351,28 @@ func (s *Server) startSessionFFmpeg(sess *session, config ffmpeg.Config) error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, binary, args...)
+	// Capture stderr so we can redact URL credentials before logging.
+	// Without this, FFmpeg's connect-error messages echo the full
+	// RTSP/SRT URL (including userinfo / passphrase) to the parent's
+	// stderr unredacted.
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		sess.cmdMu.Unlock()
+		return fmt.Errorf("ffmpeg stderr pipe: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		cancel()
 		sess.cmdMu.Unlock()
 		return fmt.Errorf("ffmpeg start: %w", err)
 	}
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		scanner.Buffer(make([]byte, 0, 4096), 64*1024)
+		for scanner.Scan() {
+			s.logger.Printf("preview ffmpeg: %s", ffmpeg.RedactURLsInLog(scanner.Text()))
+		}
+	}()
 	sess.cmd = cmd
 	sess.ffmpegCtx = ctx
 	sess.cmdCancel = cancel
@@ -535,7 +553,7 @@ func previewInputs(config ffmpeg.Config) previewInputBuild {
 		}
 		switch scheme {
 		case "rtsp", "rtsps":
-			netArgs = append(netArgs, "-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp")
+			netArgs = append(netArgs, "-rtsp_transport", "tcp")
 		case "udp", "rtp":
 			netArgs = append(netArgs, "-fifo_size", "1000000", "-overrun_nonfatal", "1")
 		case "http", "https":

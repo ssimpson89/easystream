@@ -617,10 +617,15 @@ func (s *Supervisor) recordLogs(r io.Reader) {
 			continue
 		}
 
-		// FFmpeg echoes the full RTMP URL (including the stream key) when
-		// the destination rejects the connection. Redact before storing or
-		// logging so the key never leaks into log files or /status.
-		redacted := redactStreamKey(line, streamKey)
+		// FFmpeg echoes the full ingest/destination URL (including the
+		// RTMP stream key, RTSP userinfo, and SRT passphrase) when the
+		// peer rejects or the connection fails. Redact both before
+		// storing or logging so credentials never leak into log files
+		// or /status. RedactURLsInLog scans the line for URL-shaped
+		// substrings and scrubs userinfo + known secret query params
+		// from each. redactStreamKey handles RTMP stream keys that
+		// are part of the URL path (after the last "/").
+		redacted := RedactURLsInLog(redactStreamKey(line, streamKey))
 		hint := classifyFFmpegError(redacted)
 		s.mu.Lock()
 		s.status.LastLogLine = redacted
