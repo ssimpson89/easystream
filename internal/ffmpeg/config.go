@@ -865,15 +865,19 @@ func (c Config) buildInputs() (inputBuild, error) {
 			}
 			device = resolved
 		}
-		// Audio device: same strictness when a name is persisted. An
-		// empty audio device is legitimate (silent audio fallback).
+		// Audio device: try strict resolution, but if the configured
+		// mic isn't present right now, FALL BACK to silent audio
+		// rather than refusing to start. Losing audio mid-Sunday is
+		// recoverable (the supervisor watches for the device to come
+		// back and restarts); losing the whole stream is not.
 		audio := c.Input.AudioDevice
 		if c.Input.AudioDeviceName != "" {
 			resolved, err := ResolveAVFoundationDeviceIndexStrict(c.Binary, c.Input.AudioDeviceName, "audio", c.Input.AudioDevice)
 			if err != nil {
-				return inputBuild{}, fmt.Errorf("audio source: %w", err)
+				audio = "" // triggers silent-audio branch below
+			} else {
+				audio = resolved
 			}
-			audio = resolved
 		}
 		fps := ProbeAVFoundationFramerate(c.Binary, device, c.Preset.FPS)
 		if audio != "" {
@@ -1014,6 +1018,39 @@ func chooseAVFoundationFramerate(output string, targetFPS int) (string, bool) {
 		return bestFPS, true
 	}
 	return "", false
+}
+
+// AudioFallbackTarget returns the persisted audio-device name if the
+// configured device is currently missing AND the input path is one
+// where silent audio is substituted (today: AVFoundation). Returns ""
+// when no fallback is active (device present, or the input path
+// doesn't support fallback, or no audio device is configured).
+//
+// The supervisor calls this after building args to know whether to
+// start an audio-device watcher that signals a restart when the
+// device reappears. Probing here is purely informational; the actual
+// silent-audio substitution happens inside buildInputs.
+func (c Config) AudioFallbackTarget() string {
+	if c.Input.Kind == InputTestVideo || c.Input.Kind == InputNetwork {
+		return ""
+	}
+	backend := strings.ToLower(c.Input.Backend)
+	if backend == "" {
+		backend = PlatformBackend()
+	}
+	if backend != "avfoundation" {
+		// v4l2 and dshow paths still fail closed on missing audio.
+		// Extending the fallback to those is a follow-up.
+		return ""
+	}
+	name := strings.TrimSpace(c.Input.AudioDeviceName)
+	if name == "" {
+		return ""
+	}
+	if _, err := ResolveAVFoundationDeviceIndexStrict(c.Binary, name, "audio", c.Input.AudioDevice); err != nil {
+		return name
+	}
+	return ""
 }
 
 // ErrDeviceNotFound is returned when an AVFoundation device cannot be
