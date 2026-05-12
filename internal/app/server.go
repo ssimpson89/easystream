@@ -347,6 +347,12 @@ func (s *Server) Close() {
 	if s.preview != nil {
 		s.preview.Block() // tears down preview's child ffmpeg
 	}
+	// Close the hub last so any final publishState from supervisor/adaptive
+	// shutdown paths can still reach subscribers, then the hub wakes
+	// remaining SSE handlers so they exit their loops cleanly.
+	if s.hub != nil {
+		s.hub.Close()
+	}
 }
 
 // stopHealthPollerOnce is safe to call multiple times; closing an already-

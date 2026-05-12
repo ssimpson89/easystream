@@ -7,7 +7,7 @@
   --line-2:    #2c3544;
   --text:      #e6edf3;
   --muted:     #8b95a3;
-  --muted-2:   #6a7281;
+  --muted-2:   #7a8290;  /* bumped from #6a7281 for AA contrast on dark panel */
 
   /* Single saturated accent for the primary action — warm amber so it
      never reads as "developer tool blue" or competes with the live red. */
@@ -27,6 +27,42 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 [x-cloak] { display: none !important; }
+
+/* Visible focus ring on every interactive element. Inputs/selects use
+   their own ring (the border glow). Everything else inherits this. */
+:where(button, [role="button"], a, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+/* On the red live-banner, white ring reads better than amber. */
+.live-banner button:focus-visible { outline-color: #fff; }
+
+/* Skip-to-main link. Visible only when focused (keyboard users). */
+.skip-link {
+  position: absolute;
+  top: -40px; left: 8px;
+  z-index: 1000;
+  background: var(--accent);
+  color: var(--accent-on);
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-weight: 700;
+  text-decoration: none;
+  transition: top 0.15s;
+}
+.skip-link:focus { top: 8px; }
+
+/* Visually hidden but available to assistive tech. */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0,0,0,0);
+  white-space: nowrap;
+  border: 0;
+}
 
 html, body { height: 100%; }
 body {
@@ -69,7 +105,7 @@ h3 { font-size: 15px; font-weight: 700; }
   letter-spacing: 0.08em;
 }
 
-.hint { color: var(--muted); font-size: 13px; line-height: 1.5; }
+.hint { color: var(--muted); font-size: 13px; line-height: 1.5; text-transform: none; letter-spacing: normal; font-weight: 400; }
 
 code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
 
@@ -607,7 +643,7 @@ dd { margin: 4px 0 0; font-size: 20px; font-weight: 700; font-variant-numeric: t
 .button:hover:not(:disabled) { border-color: var(--line-2); }
 .button:disabled { opacity: 0.45; cursor: not-allowed; }
 
-.button-sm { min-height: 32px; font-size: 12px; padding: 0 12px; }
+.button-sm { min-height: 36px; font-size: 12px; padding: 0 12px; }
 
 .go-button { border-color: var(--good); background: var(--good); color: #07120a; padding: 0 18px; }
 .go-button:hover:not(:disabled) { filter: brightness(1.08); }
@@ -719,7 +755,7 @@ input:focus, select:focus, textarea:focus {
 /* =========== DAY PICKER =========== */
 .day-picker { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
 .day-btn {
-  min-width: 44px; min-height: 36px;
+  min-width: 44px; min-height: 44px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel-2);

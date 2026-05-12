@@ -75,6 +75,12 @@ type Supervisor struct {
 var errRestartRequested = errors.New("supervisor restart requested")
 
 // SetOnRestart installs a callback invoked when FFmpeg restarts.
+//
+// Contract: the callback is invoked without the supervisor lock held, so
+// the callback is free to call back into supervisor.Status() or anything
+// that itself takes the supervisor lock. Do not change this invocation
+// pattern without auditing every callback (adaptive controller +
+// app.Server.publishState rely on it).
 func (s *Supervisor) SetOnRestart(fn func()) {
 	s.mu.Lock()
 	s.onRestart = fn

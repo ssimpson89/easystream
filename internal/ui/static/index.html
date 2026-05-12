@@ -17,8 +17,10 @@
   </head>
   <body x-data="app" :class="{ 'is-live': isLive }" x-cloak>
 
+    <a href="#main-content" class="skip-link">Skip to main content</a>
+
     <!-- =============== LIVE BANNER (sticky, anchors the stop button) =============== -->
-    <div class="live-banner" x-show="isLive" x-transition.opacity>
+    <div class="live-banner" x-show="isLive" x-transition.opacity role="status" aria-live="polite" aria-atomic="false">
       <div class="live-banner-left">
         <span class="live-dot" aria-hidden="true"></span>
         <span class="live-label">LIVE</span>
@@ -34,7 +36,7 @@
     </div>
 
     <!-- =============== DASHBOARD =============== -->
-    <main class="shell" x-show="view === 'dashboard'">
+    <main class="shell" id="main-content" x-show="view === 'dashboard'">
       <header class="topbar">
         <div class="brand">
           <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
@@ -131,10 +133,14 @@
             <span x-show="liveEndsAt" x-text="`· ends ${liveEndsAt}`"></span>
           </p>
 
-          <!-- Big confidence pills: icon + dot + status word + detail. -->
-          <div class="live-pills">
+          <!-- Big confidence pills: icon + dot + status word + detail.
+               role=status + aria-live so a transition (e.g., audio goes
+               red) is announced. aria-label includes the status word so
+               severity is conveyed verbally, not only by color. -->
+          <div class="live-pills" role="status" aria-live="polite" aria-atomic="false">
             <template x-for="label in ['Encoder', 'Audio', 'Destination']" :key="label">
-              <div class="live-pill" :class="livePill(label).status">
+              <div class="live-pill" :class="livePill(label).status"
+                   :aria-label="`${label}: ${statusWord(livePill(label).status)}${livePill(label).detail ? ', ' + livePill(label).detail : ''}`">
                 <span class="live-pill-dot" aria-hidden="true">
                   <svg x-show="livePill(label).status === 'green'"  viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
                     <path d="M4 8l2.5 2.5L12 5" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
@@ -146,7 +152,7 @@
                     <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round"/>
                   </svg>
                 </span>
-                <span class="live-pill-info">
+                <span class="live-pill-info" aria-hidden="true">
                   <strong x-text="label"></strong>
                   <span x-text="livePill(label).detail || '—'"></span>
                 </span>
@@ -200,12 +206,13 @@
         </section>
 
         <!-- =========== PRE-FLIGHT (idle only) =========== -->
-        <section class="preflight" x-show="!isLive">
-          <p class="eyebrow">Pre-flight</p>
+        <section class="preflight" x-show="!isLive" aria-label="Pre-flight check">
+          <p class="eyebrow" aria-hidden="true">Pre-flight</p>
           <template x-for="row in preflightRows" :key="row.label">
-            <div class="pre-row" :class="row.status">
+            <div class="pre-row" :class="row.status"
+                 :aria-label="`${row.label}: ${statusWord(row.status)}${row.detail ? ', ' + row.detail : ''}`">
               <span class="pre-dot" :class="row.status" aria-hidden="true"></span>
-              <div class="pre-info">
+              <div class="pre-info" aria-hidden="true">
                 <strong x-text="row.label"></strong>
                 <span x-text="row.detail"></span>
               </div>
@@ -273,8 +280,9 @@
           <section class="panel" x-show="settingsTab === 'quality'" @click.away="presetMenuOpen = false">
             <h2>Video quality</h2>
             <p class="hint">Choose the quality that matches your upload speed.</p>
-            <div class="preset-dropdown">
+            <div class="preset-dropdown" @keydown.escape="presetMenuOpen = false">
               <button type="button" class="preset-trigger"
+                      aria-haspopup="listbox"
                       :aria-expanded="presetMenuOpen"
                       @click.stop="presetMenuOpen = !presetMenuOpen">
                 <span class="preset-trigger-content">
@@ -283,11 +291,14 @@
                 </span>
                 <span class="preset-caret" aria-hidden="true">▾</span>
               </button>
-              <div class="preset-menu" x-show="presetMenuOpen" @click.stop>
+              <div class="preset-menu" role="listbox" aria-label="Quality preset"
+                   x-show="presetMenuOpen" @click.stop>
                 <template x-for="p in presets" :key="p.id">
                   <button type="button"
+                          role="option"
                           class="preset-option"
                           :class="{ active: p.id === selectedPreset }"
+                          :aria-selected="p.id === selectedPreset"
                           @click="selectPreset(p.id)">
                     <strong x-text="presetTitle(p)"></strong>
                     <span class="preset-upload" x-text="`Min upload speed: ${p.uploadTarget}`"></span>
@@ -366,6 +377,7 @@
                     <button type="button" class="day-btn"
                             :class="{ selected: schedForm.days.includes(d.value) }"
                             :aria-pressed="schedForm.days.includes(d.value)"
+                            :aria-label="d.fullLabel"
                             @click="toggleDay(d.value)" x-text="d.label"></button>
                   </template>
                 </div>
@@ -498,8 +510,8 @@
     </main>
 
     <!-- =============== MODALS =============== -->
-    <div class="modal" x-show="ytModal.open" @click.self="ytModal.open = false" @keydown.escape.window="ytModal.open = false" x-transition.opacity role="dialog" aria-modal="true" aria-labelledby="ytModalTitle">
-      <div class="modal-card">
+    <div class="modal" x-show="ytModal.open" @click.self="closeYTModal()" @keydown.escape.window="closeYTModal()" x-transition.opacity role="dialog" aria-modal="true" aria-labelledby="ytModalTitle">
+      <div class="modal-card" x-ref="ytModalCard" @keydown.tab="trapModalTab('ytModalCard', $event)">
         <h2 id="ytModalTitle">Go Live on YouTube</h2>
         <p class="hint">Creates a YouTube broadcast and starts streaming immediately.</p>
         <label>Title <input x-model="ytModal.title"></label>
@@ -513,20 +525,20 @@
         <p class="modal-warn" x-show="ytModal.warn" x-text="ytModal.warn" role="alert"></p>
         <div class="form-actions">
           <button class="button go-button" @click="goLiveYouTube()" :disabled="ytModal.busy">Start streaming</button>
-          <button class="button" @click="ytModal.open = false">Cancel</button>
+          <button class="button" @click="closeYTModal()">Cancel</button>
         </div>
       </div>
     </div>
 
-    <div class="modal" x-show="customModal.open" @click.self="customModal.open = false" @keydown.escape.window="customModal.open = false" x-transition.opacity role="dialog" aria-modal="true" aria-labelledby="customModalTitle">
-      <div class="modal-card">
+    <div class="modal" x-show="customModal.open" @click.self="closeCustomModal()" @keydown.escape.window="closeCustomModal()" x-transition.opacity role="dialog" aria-modal="true" aria-labelledby="customModalTitle">
+      <div class="modal-card" x-ref="customModalCard" @keydown.tab="trapModalTab('customModalCard', $event)">
         <h2 id="customModalTitle">Start custom stream</h2>
         <p class="hint">Streaming to:</p>
         <p class="custom-dest" x-text="customDestLabel"></p>
         <p class="modal-warn" x-show="customModal.warn" x-text="customModal.warn" role="alert"></p>
         <div class="form-actions">
           <button class="button go-button" @click="startCustom()" :disabled="customModal.busy">Start streaming</button>
-          <button class="button" @click="customModal.open = false">Cancel</button>
+          <button class="button" @click="closeCustomModal()">Cancel</button>
         </div>
       </div>
     </div>

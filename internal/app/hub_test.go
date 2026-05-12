@@ -95,3 +95,40 @@ func TestHubManySubscribers(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestHubSubscriberCap(t *testing.T) {
+	h := newHub()
+	for i := 0; i < maxSubscribers; i++ {
+		if s := h.subscribe(); s == nil {
+			t.Fatalf("subscribe %d unexpectedly returned nil", i)
+		}
+	}
+	if s := h.subscribe(); s != nil {
+		t.Fatal("expected subscribe past cap to return nil")
+	}
+}
+
+func TestHubCloseStopsDelivery(t *testing.T) {
+	h := newHub()
+	s := h.subscribe()
+	if s == nil {
+		t.Fatal("initial subscribe failed")
+	}
+	h.Close()
+	// Subscriber should be woken so it can exit.
+	select {
+	case <-s.wakeup:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not wake subscriber")
+	}
+	if _, ok := s.drain(); ok {
+		t.Fatal("drain after Close should report closed")
+	}
+	// Subsequent operations are no-ops, not panics.
+	h.publish("state", []byte("after close"))
+	if s2 := h.subscribe(); s2 != nil {
+		t.Fatal("subscribe after Close should return nil")
+	}
+	// Idempotent.
+	h.Close()
+}

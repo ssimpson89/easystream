@@ -77,6 +77,8 @@ document.addEventListener("alpine:init", () => {
     // user is typing. Cleared after a save round-trip.
     _dirtyIngest:    false,
     _dirtyStreamKey: false,
+    _dirtyAudio:     false,
+    _dirtyVideo:     false,
 
     schedForm: { id: "", name: "", days: [], time: "09:00", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted", enabled: true },
     ovrForm:   { id: "", name: "", wallClock: "", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted" },
@@ -91,13 +93,13 @@ document.addEventListener("alpine:init", () => {
     _wasLive:       false,
 
     dayList: [
-      { value: "sunday",    label: "Sun" },
-      { value: "monday",    label: "Mon" },
-      { value: "tuesday",   label: "Tue" },
-      { value: "wednesday", label: "Wed" },
-      { value: "thursday",  label: "Thu" },
-      { value: "friday",    label: "Fri" },
-      { value: "saturday",  label: "Sat" },
+      { value: "sunday",    label: "Sun", fullLabel: "Sunday" },
+      { value: "monday",    label: "Mon", fullLabel: "Monday" },
+      { value: "tuesday",   label: "Tue", fullLabel: "Tuesday" },
+      { value: "wednesday", label: "Wed", fullLabel: "Wednesday" },
+      { value: "thursday",  label: "Thu", fullLabel: "Thursday" },
+      { value: "friday",    label: "Fri", fullLabel: "Friday" },
+      { value: "saturday",  label: "Sat", fullLabel: "Saturday" },
     ],
     tzList: [
       { value: "America/Chicago",     label: "Central (CST/CDT)" },
@@ -130,16 +132,28 @@ document.addEventListener("alpine:init", () => {
       // Connect to SSE — replaces 2-second polling entirely.
       this.connectSSE();
 
-      // Safety-net full state reload every 30 s in case SSE was dropped
-      // and EventSource hasn't reconnected yet.
-      this._safetyPoll = setInterval(() => {
-        if (!this.connectionOK) this.connectSSE();
-      }, 30000);
+      // Safety-net active probe every 30 s. ensureSSEHealthy() checks
+      // readyState rather than the soft connectionOK flag — a half-open
+      // socket whose error never fired (mobile background eviction)
+      // would otherwise sit stale.
+      this._safetyPoll = setInterval(() => this.ensureSSEHealthy(), 30000);
 
-      // Live-timer tick — drives uptime + countdown displays.
-      this._nowTimer = setInterval(() => { this.nowTick = Date.now(); }, 1000);
+      // Mobile browsers throttle and often kill SSE on background. When
+      // the tab returns, reconnect immediately so we don't show stale
+      // data while waiting for the safety poll.
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) this.ensureSSEHealthy();
+      });
 
-      // Watch isLive transitions to update title, favicon, and preview.
+      // Live-timer tick. Only running when a uptime/countdown is
+      // visible — gates on isLive or having a next event.
+      this.updateNowTimer();
+      this.$watch("isLive",         () => this.updateNowTimer());
+      this.$watch("nextEvent",      () => this.updateNowTimer());
+
+      // Watch isLive transitions to update title, favicon, preview, and
+      // any in-flight stop confirmation. Only act on real transitions
+      // (Alpine $watch fires on every reassignment of stream).
       this._wasLive = this.isLive;
       this.$watch("isLive", (now, prev) => {
         if (now === prev) return;
@@ -151,9 +165,17 @@ document.addEventListener("alpine:init", () => {
             ? "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230d1117'/%3E%3Ccircle cx='8' cy='8' r='5' fill='%23ff1a1a'/%3E%3C/svg%3E"
             : "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230d1117'/%3E%3Cpath d='M5 4 L12 8 L5 12 Z' fill='%232f81f7'/%3E%3C/svg%3E";
         }
+        // If the stream stops while the operator was mid-confirm, drop
+        // the confirm state — the banner is about to unmount.
+        if (!now) {
+          this.stopConfirm = false;
+          clearTimeout(this._stopTimer);
+        }
         // After main-stream FFmpeg or preview FFmpeg has swapped over,
-        // re-establish the preview PeerConnection so packets flow.
-        if (this.previewVisible) {
+        // re-establish the preview PeerConnection so packets flow. Only
+        // do this when the preview controller already has a connection
+        // — the init path handles cold start.
+        if (this.previewVisible && this.preview?.isRunning()) {
           setTimeout(() => this.preview?.refresh(), 1500);
         }
       });
@@ -173,6 +195,10 @@ document.addEventListener("alpine:init", () => {
       window.addEventListener("keydown",      () => this.preview?.resumeAudio());
       window.addEventListener("beforeunload", () => this.preview?.stop());
 
+      // Initial preview start. The $watch(isLive) above only acts on
+      // transitions; the very first paint needs an explicit start.
+      // preview.start() is idempotent (a `starting` flag inside the
+      // controller prevents the well-known double-fire).
       if (this.previewVisible) this.$nextTick(() => this.preview?.start());
     },
 
@@ -180,20 +206,36 @@ document.addEventListener("alpine:init", () => {
     // SSE — server-sent state
     // ============================================================
     connectSSE() {
+      // Null out the prior listener BEFORE close so a delayed onerror
+      // from the old connection can't flip connectionOK against the new one.
       if (this._eventSource) {
-        try { this._eventSource.close(); } catch (_) {}
+        const prev = this._eventSource;
+        prev.onerror = null;
+        try { prev.close(); } catch (_) {}
+        this._eventSource = null;
       }
       const es = new EventSource("/api/stream/state");
       this._eventSource = es;
-      es.addEventListener("state",     (e) => { this.connectionOK = true; this.applyState(JSON.parse(e.data)); });
-      es.addEventListener("schedules", (e) => { this.connectionOK = true; this.schedules = JSON.parse(e.data) || []; });
-      es.addEventListener("overrides", (e) => { this.connectionOK = true; this.overrides = JSON.parse(e.data) || []; });
-      es.addEventListener("open",      ()  => { this.connectionOK = true; });
+      es.addEventListener("state",     (e) => { if (this._eventSource === es) { this.connectionOK = true; this.applyState(JSON.parse(e.data)); }});
+      es.addEventListener("schedules", (e) => { if (this._eventSource === es) { this.connectionOK = true; this.schedules = JSON.parse(e.data) || []; }});
+      es.addEventListener("overrides", (e) => { if (this._eventSource === es) { this.connectionOK = true; this.overrides = JSON.parse(e.data) || []; }});
+      es.addEventListener("open",      ()  => { if (this._eventSource === es) { this.connectionOK = true; }});
       es.onerror = () => {
         // EventSource auto-reconnects with the `retry:` hint. Mark
         // disconnected so the topbar pill turns yellow.
-        this.connectionOK = false;
+        if (this._eventSource === es) this.connectionOK = false;
       };
+    },
+
+    // ensureSSEHealthy is called from the safety-poll interval and on
+    // visibilitychange. It actively probes EventSource.readyState rather
+    // than relying on a connectionOK flag that a half-open connection
+    // may never have cleared.
+    ensureSSEHealthy() {
+      const es = this._eventSource;
+      if (!es || es.readyState === EventSource.CLOSED) {
+        this.connectSSE();
+      }
     },
 
     applyState(data) {
@@ -221,17 +263,32 @@ document.addEventListener("alpine:init", () => {
       this.hasStreamKey    = !!config.hasStreamKey;
       this.outputMode      = config.outputMode || "rtmp";
       if (config.hlsUrl) this.hlsUrl = config.hlsUrl;
-      // Free-text fields: respect dirty flag.
-      if (!this._dirtyIngest)    this.ingestUrl = config.ingestUrl || "";
-      // Don't sync streamKey — server never sends the actual key, only hasStreamKey.
+      // Free-text fields: respect dirty flag so an SSE push doesn't
+      // overwrite what the user is actively typing or selecting.
+      if (!this._dirtyIngest) this.ingestUrl = config.ingestUrl || "";
+      // streamKey is write-only: server never sends it back.
 
-      // Re-resolve the video source by name in case AVFoundation indexes shifted.
-      const encoded = S.encodeSourceValue(config.input, this.devices);
-      if (encoded && encoded !== this.videoSourceValue) {
-        this.videoSourceValue = encoded;
-        this.$nextTick(() => this.syncSelectElements());
+      // Re-resolve the video source by name in case AVFoundation indexes
+      // shifted. Skip the re-encode when the current selection already
+      // decodes to the same kind/backend/device — avoids dropdown flicker
+      // when two devices share a name and .find() picks the first one.
+      if (!this._dirtyVideo) {
+        const encoded = S.encodeSourceValue(config.input, this.devices);
+        if (encoded && encoded !== this.videoSourceValue) {
+          // Only accept the new value if it actually decodes differently.
+          const cur = S.decodeSourceValue(this.videoSourceValue);
+          const next = S.decodeSourceValue(encoded);
+          const sameTriple = cur && next &&
+            cur.kind === next.kind && cur.backend === next.backend && cur.videoDevice === next.videoDevice;
+          if (!sameTriple) {
+            this.videoSourceValue = encoded;
+            this.$nextTick(() => this.syncSelectElements());
+          }
+        }
       }
-      this.audioSourceValue = config.input?.audioDevice || "";
+      if (!this._dirtyAudio) {
+        this.audioSourceValue = config.input?.audioDevice || "";
+      }
     },
 
     // ============================================================
@@ -402,6 +459,12 @@ document.addEventListener("alpine:init", () => {
       return c || { status: "unknown", detail: "" };
     },
 
+    // statusWord maps a traffic-light status to a single word so screen
+    // readers announce severity verbally, not just via the colored dot.
+    statusWord(s) {
+      return { green: "OK", yellow: "warning", red: "problem", off: "off", unknown: "unknown" }[s] || "";
+    },
+
     // ============================================================
     // STREAM CONTROLS
     // ============================================================
@@ -416,11 +479,49 @@ document.addEventListener("alpine:init", () => {
     openYTModal() {
       this.ytModal.warn = "";
       this.ytModal.title = this.nextEvent?.title || this.nextEvent?.name || "Live Stream";
+      this._modalReturnFocus = document.activeElement;
       this.ytModal.open = true;
+      this.$nextTick(() => this.focusModal("ytModalCard"));
     },
     openCustomModal() {
       this.customModal.warn = "";
+      this._modalReturnFocus = document.activeElement;
       this.customModal.open = true;
+      this.$nextTick(() => this.focusModal("customModalCard"));
+    },
+
+    // focusModal moves focus to the first focusable control inside the
+    // modal card. Returning focus to the trigger on close happens via
+    // closeModal below.
+    focusModal(refName) {
+      const card = this.$refs[refName];
+      if (!card) return;
+      const first = card.querySelector("input, select, textarea, button, [tabindex]");
+      if (first) first.focus();
+    },
+
+    // closeModal centralizes "modal close" logic: hide, restore focus
+    // to the trigger, clear any error state.
+    closeYTModal()     { this.ytModal.open = false;     this.restoreModalFocus(); },
+    closeCustomModal() { this.customModal.open = false; this.restoreModalFocus(); },
+    restoreModalFocus() {
+      const el = this._modalReturnFocus;
+      this._modalReturnFocus = null;
+      if (el && typeof el.focus === "function") el.focus();
+    },
+
+    // Tab-key focus trap. Cycles focus among the modal's focusables.
+    // Invoked from @keydown.tab on the modal card.
+    trapModalTab(refName, ev) {
+      const card = this.$refs[refName];
+      if (!card) return;
+      const items = Array.from(card.querySelectorAll("input, select, textarea, button, [tabindex]"))
+        .filter((el) => !el.disabled && el.offsetParent !== null);
+      if (items.length === 0) return;
+      const first = items[0], last = items[items.length - 1];
+      const active = document.activeElement;
+      if (ev.shiftKey && active === first) { ev.preventDefault(); last.focus(); }
+      else if (!ev.shiftKey && active === last) { ev.preventDefault(); first.focus(); }
     },
 
     async goLiveYouTube() {
@@ -521,10 +622,13 @@ document.addEventListener("alpine:init", () => {
       if (key) payload.streamName = key;
       try {
         await this.api("/api/config", { method: "POST", body: JSON.stringify(payload) });
-        // SSE will push the new config back. Clear write-only fields locally.
+        // SSE will push the new config back. Clear write-only fields
+        // and dirty flags so the next push can refresh the form.
         this.streamKey = "";
         this._dirtyIngest = false;
         this._dirtyStreamKey = false;
+        this._dirtyAudio = false;
+        this._dirtyVideo = false;
         return true;
       } catch (e) {
         this.showToast("Save failed: " + e.message);
@@ -533,10 +637,11 @@ document.addEventListener("alpine:init", () => {
     },
 
     onVideoSourceChange() {
+      this._dirtyVideo = true;
       if (this.isSDISource) this.audioSourceValue = "";
       this.saveConfig().then(() => this.preview?.refresh());
     },
-    onAudioSourceChange()   { this.saveConfig(); },
+    onAudioSourceChange()   { this._dirtyAudio = true; this.saveConfig(); },
     onEncoderChange()       { this.saveConfig().then(() => this.showToast("Encoder saved")); },
     onIngestChange()        { this._dirtyIngest = true; },
     onStreamKeyChange()     { this._dirtyStreamKey = true; },
@@ -703,9 +808,15 @@ document.addEventListener("alpine:init", () => {
       this.saveConfig();
       this.showToast(`${platform} URL filled — paste your stream key.`);
     },
-    copyHLSUrl() { navigator.clipboard.writeText(this.hlsUrl).then(() => this.showToast("HLS URL copied!")); },
+    copyHLSUrl() {
+      window.EasyStreamClipboard(this.hlsUrl).then((ok) => {
+        this.showToast(ok ? "HLS URL copied!" : "Copy failed — select the URL manually.");
+      });
+    },
     copyWatchURL(broadcastId) {
-      navigator.clipboard.writeText(`https://youtube.com/watch?v=${broadcastId}`).then(() => this.showToast("Watch link copied!"));
+      window.EasyStreamClipboard(`https://youtube.com/watch?v=${broadcastId}`).then((ok) => {
+        this.showToast(ok ? "Watch link copied!" : "Copy failed — open the link manually.");
+      });
     },
 
     presetTitle(p) { return F.presetTitle(p); },
@@ -722,5 +833,42 @@ document.addEventListener("alpine:init", () => {
       clearTimeout(this._toastTimer);
       this._toastTimer = setTimeout(() => { this.toast = ""; }, 3000);
     },
+
+    // updateNowTimer starts the 1s tick only when something visible
+    // depends on it (uptime when live, countdown when next event exists).
+    // Stopped otherwise to avoid needless reactive churn on idle dashboards
+    // and on the Settings view.
+    updateNowTimer() {
+      const need = this.isLive || !!this.nextEvent;
+      if (need && !this._nowTimer) {
+        this._nowTimer = setInterval(() => { this.nowTick = Date.now(); }, 1000);
+      } else if (!need && this._nowTimer) {
+        clearInterval(this._nowTimer);
+        this._nowTimer = null;
+      }
+    },
   }));
+
+  // copyToClipboard: graceful fallback for browsers without the async
+  // Clipboard API (older Safari, insecure origin, etc). Returns a
+  // Promise<boolean> indicating success so callers can toast appropriately.
+  window.EasyStreamClipboard = function copyToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text).then(() => true, () => false);
+    }
+    // Legacy execCommand fallback.
+    return new Promise((resolve) => {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (_) {}
+      document.body.removeChild(ta);
+      resolve(ok);
+    });
+  };
 });

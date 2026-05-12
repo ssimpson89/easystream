@@ -15,9 +15,15 @@ import (
 //
 // Scale: 1–3 subscribers ever (browser tabs on a single host).
 type hub struct {
-	mu   sync.Mutex
-	subs map[*sub]struct{}
+	mu     sync.Mutex
+	subs   map[*sub]struct{}
+	closed bool // when true, publish becomes a no-op and subscribe returns nil
 }
+
+// maxSubscribers caps concurrent SSE clients. Defense against a runaway
+// client (or HTTP/2 multiplexed reconnect storm) opening hundreds of
+// EventSources. Generous for the actual use case (1–3 tabs).
+const maxSubscribers = 32
 
 // sub is a single subscriber's view of the hub.
 type sub struct {
@@ -33,14 +39,21 @@ func newHub() *hub {
 
 // subscribe creates a new subscriber. The caller owns the returned *sub
 // and must call hub.unsubscribe when finished.
+//
+// Returns nil when the hub is closed or the subscriber cap is reached;
+// callers should treat that as "service unavailable" and return 503.
 func (h *hub) subscribe() *sub {
+	h.mu.Lock()
+	if h.closed || len(h.subs) >= maxSubscribers {
+		h.mu.Unlock()
+		return nil
+	}
 	s := &sub{
 		latest: make(map[string][]byte),
 		// Buffered: a writer that already has the signal pending
 		// doesn't block here; the next wake will see all latest values.
 		wakeup: make(chan struct{}, 1),
 	}
-	h.mu.Lock()
 	h.subs[s] = struct{}{}
 	h.mu.Unlock()
 	return s
@@ -62,9 +75,13 @@ func (h *hub) unsubscribe(s *sub) {
 
 // publish stores payload as the latest value for topic on every
 // subscriber. Old payloads for the same topic are dropped — clients only
-// ever care about the current snapshot. Non-blocking.
+// ever care about the current snapshot. Non-blocking. No-op after Close.
 func (h *hub) publish(topic string, payload []byte) {
 	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
 	subs := make([]*sub, 0, len(h.subs))
 	for s := range h.subs {
 		subs = append(subs, s)
@@ -89,7 +106,9 @@ func (h *hub) publish(topic string, payload []byte) {
 
 // drain returns and clears all pending payloads for s. Returns ok=false
 // when the subscription has been cancelled — the caller should exit its
-// loop in that case.
+// loop in that case. The returned map is handed to the caller; we allocate
+// a fresh empty map for future writes so the caller can iterate safely
+// without holding s.mu.
 func (s *sub) drain() (frames map[string][]byte, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -99,4 +118,30 @@ func (s *sub) drain() (frames map[string][]byte, ok bool) {
 	frames = s.latest
 	s.latest = make(map[string][]byte)
 	return frames, true
+}
+
+// Close marks the hub closed so future publishes are no-ops and future
+// subscribers are rejected. Existing subscribers are woken so they can
+// exit their loops. Safe to call multiple times.
+func (h *hub) Close() {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
+	h.closed = true
+	subs := make([]*sub, 0, len(h.subs))
+	for s := range h.subs {
+		subs = append(subs, s)
+	}
+	h.mu.Unlock()
+	for _, s := range subs {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		select {
+		case s.wakeup <- struct{}{}:
+		default:
+		}
+	}
 }

@@ -91,7 +91,11 @@ func (s *Server) pollStreamHealth() {
 	s.applyDestinationHealth(snap)
 }
 
-// healthChanged returns true if any field visible to the UI changed.
+// healthChanged returns true if any UI-visible field of the health
+// snapshot has changed. Fields intentionally ignored: LastUpdate (always
+// changes on every poll, would defeat coalescing), Source (set once),
+// HasBroadcast (handled by separate state transitions). If you start
+// rendering one of those, add it here.
 func healthChanged(a, b streamHealthSnapshot) bool {
 	if a.StreamStatus != b.StreamStatus || a.HealthStatus != b.HealthStatus {
 		return true
