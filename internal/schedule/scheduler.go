@@ -226,9 +226,9 @@ func (s *Scheduler) run(ctx context.Context) {
 }
 
 // tick runs the lifecycle state machine once. It is structured as:
-//   1. End the active event if it has run past its window.
-//   2. Look at the next few upcoming events; for each, advance whichever
-//      phase is due (prepare → preroll → transition).
+//  1. End the active event if it has run past its window.
+//  2. Look at the next few upcoming events; for each, advance whichever
+//     phase is due (prepare → preroll → transition).
 //
 // The function holds s.mu only for very short read/write segments —
 // long-running operations (API calls, FFmpeg start) happen lock-free.
@@ -296,7 +296,7 @@ func (s *Scheduler) advanceEvent(ctx context.Context, event Event, now time.Time
 		if alreadyActive || s.stream.IsStreaming() {
 			return
 		}
-		s.goLive(event)
+		s.goLive(ctx, event)
 	}
 }
 
@@ -404,14 +404,16 @@ func (s *Scheduler) clearIngest(eventKey string) {
 	delete(s.ingestCache, eventKey)
 }
 
-func (s *Scheduler) goLive(event Event) {
+func (s *Scheduler) goLive(parent context.Context, event Event) {
 	key := eventKey(event)
 	ingestURL, streamKey, ok := s.lookupIngest(key)
 	if !ok {
 		// App restarted between prepare and preroll. Re-create the
 		// stream now and re-bind it; the broadcast survived in the store.
+		// Derive from the scheduler context so Stop() cancels in-flight
+		// API calls instead of blocking for the 30s timeout.
 		s.logger.Printf("scheduler: ingest cache miss for %q — recreating stream", event.Name)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 		streamID, url, k, err := s.broadcast.CreateBoundStream(ctx, event.BroadcastID, event.PresetID)
 		cancel()
 		if err != nil {

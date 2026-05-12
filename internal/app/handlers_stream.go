@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -191,7 +192,9 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	// "stream ended" instead of spinning indefinitely.
 	if broadcastID != "" && s.ytClient != nil && s.ytAuth.IsAuthenticated() {
 		go func(id string) {
-			if err := s.ytClient.TransitionBroadcast(id, "complete"); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := s.ytClient.TransitionBroadcast(ctx, id, "complete"); err != nil {
 				s.logger.Printf("stop: complete broadcast %s: %v", id, err)
 			} else {
 				s.logger.Printf("stop: broadcast %s transitioned to complete", id)

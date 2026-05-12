@@ -81,7 +81,7 @@ type Stream struct {
 // testing→live→complete lifecycle so a transient FFmpeg restart doesn't
 // auto-end the broadcast and the explicit transition flow doesn't race
 // with YouTube's auto-start. recordFromStart ensures a VOD is created.
-func (c *Client) CreateBroadcast(title, description string, scheduledStart time.Time, privacy string) (*Broadcast, error) {
+func (c *Client) CreateBroadcast(ctx context.Context, title, description string, scheduledStart time.Time, privacy string) (*Broadcast, error) {
 	if privacy == "" {
 		privacy = "unlisted"
 	}
@@ -106,7 +106,7 @@ func (c *Client) CreateBroadcast(title, description string, scheduledStart time.
 			"selfDeclaredMadeForKids": false,
 		},
 	}
-	body, err := c.post("/liveBroadcasts?part=snippet,contentDetails,status", payload)
+	body, err := c.post(ctx, "/liveBroadcasts?part=snippet,contentDetails,status", payload)
 	if err != nil {
 		return nil, fmt.Errorf("create broadcast: %w", err)
 	}
@@ -114,10 +114,10 @@ func (c *Client) CreateBroadcast(title, description string, scheduledStart time.
 }
 
 // ListUpcomingBroadcasts returns broadcasts with status upcoming or active.
-func (c *Client) ListUpcomingBroadcasts() ([]Broadcast, error) {
+func (c *Client) ListUpcomingBroadcasts(ctx context.Context) ([]Broadcast, error) {
 	var all []Broadcast
 	for _, status := range []string{"upcoming", "active"} {
-		broadcasts, err := c.listBroadcasts(status)
+		broadcasts, err := c.listBroadcasts(ctx, status)
 		if err != nil {
 			return nil, err
 		}
@@ -126,9 +126,9 @@ func (c *Client) ListUpcomingBroadcasts() ([]Broadcast, error) {
 	return all, nil
 }
 
-func (c *Client) listBroadcasts(broadcastStatus string) ([]Broadcast, error) {
+func (c *Client) listBroadcasts(ctx context.Context, broadcastStatus string) ([]Broadcast, error) {
 	path := fmt.Sprintf("/liveBroadcasts?part=snippet,contentDetails,status&broadcastStatus=%s&maxResults=25", broadcastStatus)
-	body, err := c.get(path)
+	body, err := c.get(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("list broadcasts (%s): %w", broadcastStatus, err)
 	}
@@ -154,7 +154,7 @@ func (c *Client) listBroadcasts(broadcastStatus string) ([]Broadcast, error) {
 // active broadcasts from sharing the same ingest (which causes YouTube to
 // show the wrong watch page) and let us delete the stream cleanly when
 // the broadcast completes.
-func (c *Client) CreateStreamForBroadcast(title string, resolution string, fps int) (*Stream, error) {
+func (c *Client) CreateStreamForBroadcast(ctx context.Context, title string, resolution string, fps int) (*Stream, error) {
 	payload := map[string]any{
 		"snippet": map[string]any{
 			"title": title,
@@ -168,7 +168,7 @@ func (c *Client) CreateStreamForBroadcast(title string, resolution string, fps i
 			"isReusable": false,
 		},
 	}
-	body, err := c.post("/liveStreams?part=snippet,cdn,contentDetails,status", payload)
+	body, err := c.post(ctx, "/liveStreams?part=snippet,cdn,contentDetails,status", payload)
 	if err != nil {
 		return nil, fmt.Errorf("create stream: %w", err)
 	}
@@ -178,17 +178,17 @@ func (c *Client) CreateStreamForBroadcast(title string, resolution string, fps i
 // DeleteStream removes a live stream resource. Call this after a broadcast
 // transitions to complete; otherwise the per-broadcast non-reusable
 // streams accumulate on the channel and count against quota.
-func (c *Client) DeleteStream(streamID string) error {
+func (c *Client) DeleteStream(ctx context.Context, streamID string) error {
 	path := fmt.Sprintf("/liveStreams?id=%s", url.QueryEscape(streamID))
-	return c.delete(path)
+	return c.delete(ctx, path)
 }
 
 // GetStreamHealth returns the platform-reported health for a stream.
 // Use this while broadcasting to know whether YouTube is actually
 // receiving and accepting the feed.
-func (c *Client) GetStreamHealth(streamID string) (*StreamHealth, error) {
+func (c *Client) GetStreamHealth(ctx context.Context, streamID string) (*StreamHealth, error) {
 	path := fmt.Sprintf("/liveStreams?part=status&id=%s", url.QueryEscape(streamID))
-	body, err := c.get(path)
+	body, err := c.get(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("get stream health: %w", err)
 	}
@@ -235,9 +235,9 @@ func (c *Client) GetStreamHealth(streamID string) (*StreamHealth, error) {
 // GetConcurrentViewers returns the current number of viewers for a live
 // broadcast. Uses the videos.list endpoint with liveStreamingDetails part.
 // Returns -1 if the field is not available (e.g. broadcast not yet live).
-func (c *Client) GetConcurrentViewers(broadcastID string) (int, error) {
+func (c *Client) GetConcurrentViewers(ctx context.Context, broadcastID string) (int, error) {
 	path := fmt.Sprintf("/videos?part=liveStreamingDetails&id=%s", url.QueryEscape(broadcastID))
-	body, err := c.get(path)
+	body, err := c.get(ctx, path)
 	if err != nil {
 		return -1, fmt.Errorf("get concurrent viewers: %w", err)
 	}
@@ -266,10 +266,10 @@ func (c *Client) GetConcurrentViewers(broadcastID string) (int, error) {
 }
 
 // BindBroadcast binds a broadcast to a stream.
-func (c *Client) BindBroadcast(broadcastID, streamID string) error {
+func (c *Client) BindBroadcast(ctx context.Context, broadcastID, streamID string) error {
 	path := fmt.Sprintf("/liveBroadcasts/bind?id=%s&streamId=%s&part=id",
 		url.QueryEscape(broadcastID), url.QueryEscape(streamID))
-	_, err := c.post(path, nil)
+	_, err := c.post(ctx, path, nil)
 	if err != nil {
 		return fmt.Errorf("bind broadcast: %w", err)
 	}
@@ -280,10 +280,10 @@ func (c *Client) BindBroadcast(broadcastID, streamID string) error {
 //
 // Treats redundantTransition (we're already in the target state) as success
 // so retry loops exit cleanly when YouTube updates state independently.
-func (c *Client) TransitionBroadcast(broadcastID, status string) error {
+func (c *Client) TransitionBroadcast(ctx context.Context, broadcastID, status string) error {
 	path := fmt.Sprintf("/liveBroadcasts/transition?id=%s&broadcastStatus=%s&part=id,status",
 		url.QueryEscape(broadcastID), url.QueryEscape(status))
-	_, err := c.post(path, nil)
+	_, err := c.post(ctx, path, nil)
 	if err != nil {
 		if IsReason(err, "redundantTransition") {
 			return nil
@@ -314,7 +314,7 @@ func (c *Client) WaitStreamActive(ctx context.Context, streamID string, poll tim
 			return ctx.Err()
 		case <-timer.C:
 		}
-		h, err := c.GetStreamHealth(streamID)
+		h, err := c.GetStreamHealth(ctx, streamID)
 		if err == nil && h.StreamStatus == "active" {
 			return nil
 		}
@@ -325,20 +325,26 @@ func (c *Client) WaitStreamActive(ctx context.Context, streamID string, poll tim
 	}
 }
 
-func (c *Client) get(path string) ([]byte, error) {
-	return c.do("GET", path, nil)
+func (c *Client) get(ctx context.Context, path string) ([]byte, error) {
+	return c.do(ctx, "GET", path, nil)
 }
 
-func (c *Client) post(path string, payload any) ([]byte, error) {
-	return c.do("POST", path, payload)
+func (c *Client) post(ctx context.Context, path string, payload any) ([]byte, error) {
+	return c.do(ctx, "POST", path, payload)
 }
 
-func (c *Client) delete(path string) error {
-	_, err := c.do("DELETE", path, nil)
+func (c *Client) delete(ctx context.Context, path string) error {
+	_, err := c.do(ctx, "DELETE", path, nil)
 	return err
 }
 
-func (c *Client) do(method, path string, payload any) ([]byte, error) {
+// do issues an authenticated request bound to ctx. Cancellation /
+// deadlines on ctx propagate through to the HTTP transport, so the
+// scheduler's 30s prepare timeout actually times out the YouTube call.
+func (c *Client) do(ctx context.Context, method, path string, payload any) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	client, err := c.Auth.HTTPClient()
 	if err != nil {
 		return nil, err
@@ -353,7 +359,7 @@ func (c *Client) do(method, path string, payload any) ([]byte, error) {
 	} else if method == "POST" {
 		reqBody = strings.NewReader("")
 	}
-	req, err := http.NewRequest(method, apiBase+path, reqBody)
+	req, err := http.NewRequestWithContext(ctx, method, apiBase+path, reqBody)
 	if err != nil {
 		return nil, err
 	}

@@ -27,10 +27,10 @@ const maxSubscribers = 32
 
 // sub is a single subscriber's view of the hub.
 type sub struct {
-	mu      sync.Mutex
-	latest  map[string][]byte // topic → last payload
-	wakeup  chan struct{}     // signal: there is new data
-	closed  bool
+	mu     sync.Mutex
+	latest map[string][]byte // topic → last payload
+	wakeup chan struct{}     // signal: there is new data
+	closed bool
 }
 
 func newHub() *hub {

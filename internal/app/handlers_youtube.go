@@ -72,7 +72,7 @@ func (s *Server) handleYTBroadcasts(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, []any{})
 		return
 	}
-	broadcasts, err := s.ytClient.ListUpcomingBroadcasts()
+	broadcasts, err := s.ytClient.ListUpcomingBroadcasts(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -117,10 +117,13 @@ func (s *Server) handleGoLiveNow(w http.ResponseWriter, r *http.Request) {
 			s.preview.Unblock()
 		}
 		s.cancelTransitionGoroutine()
-		// Transition old broadcast to complete.
-		if err := s.ytClient.TransitionBroadcast(prevBroadcast, "complete"); err != nil {
+		// Transition old broadcast to complete (bounded so a hung YT API
+		// can't block the new go-live indefinitely).
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		if err := s.ytClient.TransitionBroadcast(ctx, prevBroadcast, "complete"); err != nil {
 			s.logger.Printf("go-live-now: complete previous broadcast %s: %v", prevBroadcast, err)
 		}
+		cancel()
 		s.mu.Lock()
 		s.activeBroadcastID = ""
 		s.activeStreamID = ""
@@ -130,8 +133,9 @@ func (s *Server) handleGoLiveNow(w http.ResponseWriter, r *http.Request) {
 		s.markIdle()
 	}
 
-	// Create broadcast.
-	broadcast, err := s.ytClient.CreateBroadcast(body.Title, body.Description, time.Now(), body.Privacy)
+	// Create broadcast + stream + bind, all tied to the request context so
+	// a client-side cancel or server shutdown unblocks the YouTube calls.
+	broadcast, err := s.ytClient.CreateBroadcast(r.Context(), body.Title, body.Description, time.Now(), body.Privacy)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "create broadcast: "+err.Error())
 		return
@@ -141,14 +145,14 @@ func (s *Server) handleGoLiveNow(w http.ResponseWriter, r *http.Request) {
 	// Reusing YouTube's named stream can leave multiple active broadcasts
 	// bound to the same ingest, causing the wrong watch page.
 	streamTitle := "EasyStream - " + body.Title + " - " + broadcast.ID
-	stream, err := s.ytClient.CreateStreamForBroadcast(streamTitle, config.Preset.Resolution(), config.Preset.FPS)
+	stream, err := s.ytClient.CreateStreamForBroadcast(r.Context(), streamTitle, config.Preset.Resolution(), config.Preset.FPS)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "create stream: "+err.Error())
 		return
 	}
 
 	// Bind.
-	if err := s.ytClient.BindBroadcast(broadcast.ID, stream.ID); err != nil {
+	if err := s.ytClient.BindBroadcast(r.Context(), broadcast.ID, stream.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "bind broadcast: "+err.Error())
 		return
 	}
@@ -233,16 +237,20 @@ func (s *Server) handleCompleteBroadcast(w http.ResponseWriter, r *http.Request)
 	}
 
 	if body.BroadcastID != "" {
-		if err := s.ytClient.TransitionBroadcast(body.BroadcastID, "complete"); err != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		if err := s.ytClient.TransitionBroadcast(ctx, body.BroadcastID, "complete"); err != nil {
 			s.logger.Printf("complete broadcast: %v", err)
 		}
+		cancel()
 	}
 	// Clean up the per-broadcast non-reusable stream so it doesn't
 	// accumulate on the channel. Failure is non-fatal.
 	if streamToDelete != "" {
-		if err := s.ytClient.DeleteStream(streamToDelete); err != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		if err := s.ytClient.DeleteStream(ctx, streamToDelete); err != nil {
 			s.logger.Printf("complete broadcast: delete stream %s: %v", streamToDelete, err)
 		}
+		cancel()
 	}
 
 	s.publishState()
@@ -271,10 +279,10 @@ func (s *Server) cancelTransitionGoroutine() {
 // transition is cancelled first.
 //
 // Flow:
-//   1. Poll liveStreams.status until streamStatus=="active" (YouTube
-//      requires ingest before accepting testing transition).
-//   2. Transition to "testing". redundantTransition is treated as success.
-//   3. Transition to "live". Same handling.
+//  1. Poll liveStreams.status until streamStatus=="active" (YouTube
+//     requires ingest before accepting testing transition).
+//  2. Transition to "testing". redundantTransition is treated as success.
+//  3. Transition to "live". Same handling.
 //
 // All steps respect ctx; cancellation stops the goroutine immediately.
 func (s *Server) startTransitionGoroutine(broadcastID, streamID string) {
@@ -355,7 +363,7 @@ func (s *Server) transitionWithRetry(ctx context.Context, broadcastID, status st
 		if !stillActive() {
 			return context.Canceled
 		}
-		err := s.ytClient.TransitionBroadcast(broadcastID, status)
+		err := s.ytClient.TransitionBroadcast(ctx, broadcastID, status)
 		if err == nil {
 			return nil
 		}

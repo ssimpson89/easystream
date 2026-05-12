@@ -44,9 +44,9 @@ type DeviceList struct {
 type Scanner struct {
 	binary string
 
-	mu        sync.Mutex
-	cache     *DeviceList
-	cachedAt  time.Time
+	mu       sync.Mutex
+	cache    *DeviceList
+	cachedAt time.Time
 }
 
 // NewScanner creates a device scanner.

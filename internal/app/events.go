@@ -123,9 +123,7 @@ func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-			if err := flushWithDeadline(rc, flusher); err != nil {
-				return
-			}
+			flushWithDeadline(rc, flusher)
 		}
 	}
 }

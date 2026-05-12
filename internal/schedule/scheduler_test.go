@@ -327,11 +327,11 @@ func TestManualStopSuppressesCurrentRecurringOccurrence(t *testing.T) {
 // CreateBroadcast so we can verify the backoff doesn't create one
 // orphan broadcast per tick.
 type failingBroadcastController struct {
-	mu             sync.Mutex
-	attempts       int
-	transitionMu   sync.Mutex
-	cancelCalls    int
-	completeCalls  int
+	mu            sync.Mutex
+	attempts      int
+	transitionMu  sync.Mutex
+	cancelCalls   int
+	completeCalls int
 }
 
 func (f *failingBroadcastController) IsAuthenticated() bool { return true }

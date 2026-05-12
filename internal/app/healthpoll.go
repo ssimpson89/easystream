@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -53,7 +54,11 @@ func (s *Server) pollStreamHealth() {
 		return
 	}
 
-	health, err := s.ytClient.GetStreamHealth(streamID)
+	// Bounded per-call deadline so a hung YouTube API doesn't pin the
+	// health poller goroutine past Server.Close.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	health, err := s.ytClient.GetStreamHealth(ctx, streamID)
 	if err != nil {
 		s.logger.Printf("health poll: %v", err)
 		return
@@ -70,7 +75,7 @@ func (s *Server) pollStreamHealth() {
 
 	// Fetch concurrent viewers if we have an active broadcast.
 	if broadcastID != "" {
-		if viewers, err := s.ytClient.GetConcurrentViewers(broadcastID); err != nil {
+		if viewers, err := s.ytClient.GetConcurrentViewers(ctx, broadcastID); err != nil {
 			s.logger.Printf("health poll: viewer count: %v", err)
 		} else if viewers >= 0 {
 			snap.ConcurrentViewers = &viewers

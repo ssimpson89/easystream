@@ -89,7 +89,7 @@ func (a *broadcastControllerAdapter) IsAuthenticated() bool {
 }
 
 func (a *broadcastControllerAdapter) CreateBroadcast(ctx context.Context, title, description string, scheduledStart time.Time, privacy string) (string, error) {
-	b, err := a.server.ytClient.CreateBroadcast(title, description, scheduledStart, privacy)
+	b, err := a.server.ytClient.CreateBroadcast(ctx, title, description, scheduledStart, privacy)
 	if err != nil {
 		return "", err
 	}
@@ -102,14 +102,15 @@ func (a *broadcastControllerAdapter) CreateBoundStream(ctx context.Context, broa
 		preset = quality.Default()
 	}
 	title := "EasyStream - " + preset.Name + " - " + time.Now().UTC().Format("20060102-150405")
-	stream, err := a.server.ytClient.CreateStreamForBroadcast(title, preset.Resolution(), preset.FPS)
+	stream, err := a.server.ytClient.CreateStreamForBroadcast(ctx, title, preset.Resolution(), preset.FPS)
 	if err != nil {
 		return "", "", "", err
 	}
-	if err := a.server.ytClient.BindBroadcast(broadcastID, stream.ID); err != nil {
+	if err := a.server.ytClient.BindBroadcast(ctx, broadcastID, stream.ID); err != nil {
 		// Best-effort cleanup of the orphan stream so we don't leak it
-		// on a transient bind failure.
-		_ = a.server.ytClient.DeleteStream(stream.ID)
+		// on a transient bind failure. Use a fresh background ctx so
+		// the cleanup still runs if ctx was cancelled mid-bind.
+		_ = a.server.ytClient.DeleteStream(context.Background(), stream.ID)
 		return "", "", "", err
 	}
 	return stream.ID, stream.IngestURL, stream.StreamKey, nil
@@ -127,11 +128,15 @@ func (a *broadcastControllerAdapter) CompleteBroadcast(broadcastID, streamID str
 	if broadcastID == "" {
 		return
 	}
-	if err := a.server.ytClient.TransitionBroadcast(broadcastID, "complete"); err != nil {
+	// Cleanup runs on Stop/Complete paths — give it a bounded deadline
+	// so it doesn't hang an HTTP handler.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := a.server.ytClient.TransitionBroadcast(ctx, broadcastID, "complete"); err != nil {
 		a.server.logger.Printf("complete broadcast %s: %v", broadcastID, err)
 	}
 	if streamID != "" {
-		if err := a.server.ytClient.DeleteStream(streamID); err != nil {
+		if err := a.server.ytClient.DeleteStream(ctx, streamID); err != nil {
 			a.server.logger.Printf("delete stream %s: %v", streamID, err)
 		}
 	}

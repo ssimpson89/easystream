@@ -165,6 +165,10 @@ func (a *Auth) Exchange(code, state string) error {
 		Expiry:       tok.Expiry,
 	}
 	a.state = ""
+	// Invalidate the cached HTTP client. It holds a TokenSource bound to
+	// the old token snapshot; using it after re-auth would keep talking
+	// to YouTube as the previous identity until the next Logout.
+	a.client = nil
 	a.mu.Unlock()
 
 	// Fetch channel info with the new token (non-fatal if it fails).
