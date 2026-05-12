@@ -30,7 +30,13 @@ func computeConfidence(stream ffmpeg.Status, health streamHealthSnapshot, broadc
 	case ffmpeg.StateDegraded:
 		enc.Status = "yellow"
 		enc.Detail = "Stalled or backed up"
-	case ffmpeg.StateRestarting, ffmpeg.StateStarting:
+	case ffmpeg.StateStarting:
+		// Initial connection — distinct from a restart loop.
+		enc.Status = "yellow"
+		enc.Detail = "Connecting..."
+	case ffmpeg.StateRestarting:
+		// Recovery: FFmpeg died and we're respawning. "Reconnecting"
+		// is the right word here.
 		enc.Status = "yellow"
 		enc.Detail = "Reconnecting"
 	case ffmpeg.StateFailed:
