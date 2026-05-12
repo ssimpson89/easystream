@@ -142,6 +142,16 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 				"video device name is required (capture device unplugged when this save was made? refresh devices and try again)")
 			return
 		}
+		// Network input URLs are returned to the UI with credentials
+		// redacted. When the UI saves back without editing those bits,
+		// the incoming URL still contains the REDACTED sentinel; that
+		// means "leave credentials alone", so we keep the stored URL.
+		// A genuine URL change (no sentinel) gets persisted as-is.
+		if in.Kind == ffmpeg.InputNetwork &&
+			in.URL != "" &&
+			strings.Contains(in.URL, ffmpeg.RedactedCredentialSentinel) {
+			in.URL = s.config.Input.URL
+		}
 		s.config.Input = in
 	}
 	if patch.Encoder != nil {
@@ -305,9 +315,19 @@ func (s *Server) configResponse(config ffmpeg.Config) map[string]any {
 		// separate boolean).
 		outputMode = "rtmp"
 	}
+	// Scrub credentials from network input URLs before serialising —
+	// rtsp://user:pass@host paths and srt://...?passphrase=... query
+	// strings get pushed to every connected UI tab via SSE state, and
+	// we don't want IP camera passwords or SRT passphrases visible
+	// there. The configUpdate handler detects the redacted form on
+	// save and preserves the stored value.
+	input := config.Input
+	if input.URL != "" {
+		input.URL = ffmpeg.RedactURLCredentials(input.URL)
+	}
 	result := map[string]any{
 		"ffmpegBinary": config.Binary,
-		"input":        config.Input,
+		"input":        input,
 		"preset":       config.Preset,
 		"encoder":      string(config.EffectiveEncoder()),
 		"outputMode":   outputMode,
