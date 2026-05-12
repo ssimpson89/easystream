@@ -372,6 +372,13 @@ func (s *Server) startSessionFFmpeg(sess *session, config ffmpeg.Config) error {
 		for scanner.Scan() {
 			s.logger.Printf("preview ffmpeg: %s", ffmpeg.RedactURLsInLog(scanner.Text()))
 		}
+		// Surface scanner errors (e.g. token-too-long on a line
+		// >64 KB) instead of silently dropping the rest of the
+		// stderr stream. Without this, a single long FFmpeg log
+		// line would stop the reader and hide subsequent errors.
+		if err := scanner.Err(); err != nil {
+			s.logger.Printf("preview ffmpeg: stderr reader error: %v", err)
+		}
 	}()
 	sess.cmd = cmd
 	sess.ffmpegCtx = ctx
@@ -538,38 +545,12 @@ func previewInputs(config ffmpeg.Config) previewInputBuild {
 	case ffmpeg.InputNetwork:
 		// Preview ingests the same URL as the main pipeline (separate
 		// ffmpeg process, separate RTSP/SRT connection to the source).
-		// Same per-input tuning as buildNetworkInput so a mid-GOP
-		// start doesn't produce a wall of mmco decoder errors and an
-		// empty WebRTC stream.
-		url := strings.TrimSpace(config.Input.URL)
-		scheme := ""
-		if i := strings.Index(url, "://"); i > 0 {
-			scheme = strings.ToLower(url[:i])
-		}
-		netArgs := []string{
-			"-fflags", "+discardcorrupt+genpts",
-			"-analyzeduration", "1000000",
-			"-probesize", "1000000",
-		}
-		switch scheme {
-		case "rtsp", "rtsps":
-			netArgs = append(netArgs, "-rtsp_transport", "tcp")
-		case "udp", "rtp":
-			netArgs = append(netArgs, "-fifo_size", "1000000", "-overrun_nonfatal", "1")
-		case "http", "https":
-			netArgs = append(netArgs,
-				"-reconnect", "1",
-				"-reconnect_streamed", "1",
-				"-reconnect_delay_max", "5",
-				"-multiple_requests", "1",
-			)
-		}
-		netArgs = append(netArgs, "-i", url)
-		if config.Input.NoAudio {
-			netArgs = append(netArgs, "-f", "lavfi", "-i", previewSilentAudio)
-			return previewInputBuild{args: netArgs, videoMap: "0:v", audioMap: "1:a"}
-		}
-		return previewInputBuild{args: netArgs, videoMap: "0:v", audioMap: "0:a"}
+		// Delegate to ffmpeg.NetworkInputArgs so the per-input flags
+		// and per-scheme tuning stay byte-identical to the main
+		// pipeline (no risk of drift if one path adds a flag and the
+		// other doesn't).
+		netArgs, audioMap := ffmpeg.NetworkInputArgs(config.Input.URL, config.Input.NoAudio)
+		return previewInputBuild{args: netArgs, videoMap: "0:v", audioMap: audioMap}
 	default:
 		backend := config.Input.Backend
 		if backend == "" {

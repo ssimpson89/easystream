@@ -40,7 +40,7 @@ func TestPreviewArgsHandleNetworkInput(t *testing.T) {
 
 	for _, expected := range []string{
 		"-rtsp_transport tcp",
-		"-fflags +discardcorrupt+genpts",
+		"-fflags discardcorrupt+genpts", // replaces global nobuffer
 		"-i rtsp://camera.local:554/stream1",
 	} {
 		if !strings.Contains(joined, expected) {
