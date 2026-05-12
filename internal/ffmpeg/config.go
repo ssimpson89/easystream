@@ -84,8 +84,8 @@ type EncoderInfo struct {
 
 // knownEncoders lists all encoders we know how to configure, in display order.
 var knownEncoders = []EncoderInfo{
-	{EncoderX264, "Software (x264)", "CPU-based, always available, widest compatibility", true},
-	{EncoderVideoToolbox, "Apple VideoToolbox", "macOS hardware encoder (Apple Silicon / Intel)", false},
+	{EncoderX264, "Software (x264)", "CPU-based, true CBR, widest compatibility. Required for SRT destinations.", true},
+	{EncoderVideoToolbox, "Apple VideoToolbox", "macOS hardware encoder. Soft CBR — not used for SRT (Cloudflare rejects sub-target bitrates).", false},
 	{EncoderNVENC, "NVIDIA NVENC", "NVIDIA GPU hardware encoder", false},
 	{EncoderVAAPI, "VA-API", "Linux Intel/AMD GPU hardware encoder", false},
 	{EncoderQSV, "Intel QuickSync", "Intel GPU hardware encoder", false},
@@ -251,8 +251,20 @@ func (c Config) primaryRunnable() bool {
 	return strings.TrimSpace(c.StreamName) != ""
 }
 
-// EffectiveEncoder returns the encoder to use, defaulting to libx264.
+// EffectiveEncoder returns the encoder to use.
+//
+// For SRT destinations we always use libx264 regardless of what the
+// operator picked, because Apple's h264_videotoolbox does soft CBR
+// (it's a quality target — encoder produces what content needs, even
+// with -constant_bit_rate=1) and SRT receivers like Cloudflare Stream
+// reject sub-target streams as "not broadcasting". libx264 with
+// nal-hrd=cbr produces true strict CBR via bitstream stuffing. This
+// silent override is a usability trade-off: the alternative is a
+// hardware-accelerated stream Cloudflare won't accept.
 func (c Config) EffectiveEncoder() Encoder {
+	if c.OutputMode == OutputSRT {
+		return EncoderX264
+	}
 	if c.Encoder == "" {
 		return EncoderX264
 	}
