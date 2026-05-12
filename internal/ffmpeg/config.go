@@ -380,47 +380,45 @@ func (c Config) Args() ([]string, error) {
 	gop := fmt.Sprintf("%d", c.Preset.GOP())
 	w, h := c.Preset.Width, c.Preset.Height
 
-	// Single -filter_complex graph for video and audio. We branch
-	// audio with asplit so the encoder consumes a clean stream and
-	// the astats/ametadata stderr-print path runs on its own copy.
-	// Mixing astats into the encode path would synchronously block
-	// the filter graph on stderr writes — producing exactly the
-	// "MediaSource readyState: closed" failure browsers/players
-	// throw when AAC frames arrive with non-uniform PTS deltas.
+	// Single -filter_complex graph that:
+	//   1. Runs deinterlace+scale+pad once on the source video and
+	//      splits to [v] (primary encode) and [v_preview] (RTP).
+	//      Without the split, the preview leg would re-scale the
+	//      *raw* source independently — a 4K capture gets scaled
+	//      twice. split keeps it to one pass.
+	//   2. Runs aresample once on the source audio and splits to
+	//      [a_enc] (primary), [a_preview] (Opus RTP), and a side
+	//      [a_stats] branch that drives the audio meter via
+	//      stderr-printed astats metadata. Mixing astats into the
+	//      encode path would synchronously block the filter graph
+	//      on stderr writes — producing AAC frames with gappy PTS
+	//      that strict demuxers/players reject.
 	//
-	// SDI/DeckLink can be interlaced, so the software path deint with
-	// yadif (no-op on progressive). VideoToolbox handles progressive
-	// natively; scale_vt would need hwaccel frames AVFoundation can't
-	// produce, so the CPU scaler runs cheaply alongside the GPU
-	// encoder.
-	var videoChain string
-	if encoder == EncoderVideoToolbox {
-		videoChain = fmt.Sprintf(
-			"[%s]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black[v]",
-			inputs.videoMap, w, h, w, h,
-		)
-	} else {
-		videoChain = fmt.Sprintf(
-			"[%s]yadif=deint=interlaced,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black[v]",
-			inputs.videoMap, w, h, w, h,
-		)
-	}
-
-	// Audio resampler:
+	// Resampler options:
 	//   async=1            broadcast-standard soft sync — pad/trim
 	//                      only on stream start, never warps PTS
-	//                      deltas mid-stream (a continuous warping
-	//                      resampler produces AAC frames whose
-	//                      PTS deltas drift off 1024/48000 s and
-	//                      strict demuxers/players reject them).
+	//                      deltas mid-stream.
 	//   min_hard_comp=0.1  fall back to hard pad/trim only after
 	//                      100 ms of accumulated drift.
-	//   osr=48000          pin output rate so the encoder always
-	//                      sees 48 kHz regardless of source rate.
-	// astats + ametadata feeds the audio confidence pill via stderr,
-	// but it runs on a side branch and never touches the encoder.
+	//   osr=48000          pin output rate so encoders always see
+	//                      48 kHz regardless of source rate.
+	//
+	// SDI/DeckLink can be interlaced so the software path deints with
+	// yadif (no-op on progressive). VideoToolbox handles progressive
+	// natively; scale_vt would need hwaccel frames AVFoundation can't
+	// produce, so the CPU scaler runs cheaply alongside the GPU encoder.
+	deint := "yadif=deint=interlaced,"
+	if encoder == EncoderVideoToolbox {
+		deint = ""
+	}
+	videoChain := fmt.Sprintf(
+		"[%s]%sscale=%d:%d:force_original_aspect_ratio=decrease,"+
+			"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,split=2[v][v_pre_src];"+
+			"[v_pre_src]scale=640:360:force_original_aspect_ratio=decrease,fps=15[v_preview]",
+		inputs.videoMap, deint, w, h, w, h,
+	)
 	audioChain := fmt.Sprintf(
-		"[%s]aresample=async=1:min_hard_comp=0.100000:osr=48000,asplit=2[a_enc][a_stats];"+
+		"[%s]aresample=async=1:min_hard_comp=0.100000:osr=48000,asplit=3[a_enc][a_preview][a_stats];"+
 			"[a_stats]astats=metadata=1:reset=1:length=1,"+
 			"ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr,anullsink",
 		inputs.audioMap,
@@ -436,6 +434,20 @@ func (c Config) Args() ([]string, error) {
 	//   - 2-second keyframe interval (GOP = FPS * 2)
 	//   - Rec.709 color primaries / transfer / matrix for SDR
 	//   - AAC stereo at 48 kHz, encoder selected per platform
+	// Color signaling goes BEFORE -c:v so hardware encoders
+	// (VideoToolbox, NVENC, VAAPI, QSV) bake the VUI hints into
+	// their SPS during init. Hardware encoders that read color
+	// state at init-time would otherwise emit unspecified VUI,
+	// which lets downstream transcoders (notably YouTube's ABR
+	// pipeline) tonemap inconsistently. color_range tv signals
+	// limited-range explicitly — without it video_full_range_flag
+	// defaults to ambiguous and some players guess wrong.
+	args = append(args,
+		"-color_primaries", "bt709",
+		"-color_trc", "bt709",
+		"-colorspace", "bt709",
+		"-color_range", "tv",
+	)
 	args = append(args, c.encoderArgs(encoder, gop)...)
 	args = append(args,
 		"-b:v", c.Preset.VideoBitrate(),
@@ -444,9 +456,6 @@ func (c Config) Args() ([]string, error) {
 		"-g", gop,
 		"-r", fmt.Sprintf("%d", c.Preset.FPS),
 		"-pix_fmt", "yuv420p",
-		"-color_primaries", "bt709",
-		"-color_trc", "bt709",
-		"-colorspace", "bt709",
 	)
 	args = append(args, c.audioEncoderArgs()...)
 	args = append(args,
@@ -478,14 +487,9 @@ func (c Config) Args() ([]string, error) {
 	}
 
 	// Secondary output: low-res H.264 RTP for live browser preview.
-	// Uses the same encoder family as the primary stream to avoid a
-	// redundant CPU-based re-encode when hardware encoding is active.
-	previewScale := "scale=640:360:force_original_aspect_ratio=decrease"
-	args = append(args,
-		"-map", inputs.videoMap, "-an",
-		"-vf", previewScale,
-		"-r", "15",
-	)
+	// Maps [v_preview] (already scaled to 640×360 and decimated to
+	// 15 fps in the filter graph) so we don't re-process the source.
+	args = append(args, "-map", "[v_preview]")
 	args = append(args, c.previewEncoderArgs(encoder)...)
 	args = append(args,
 		"-g", "30", "-keyint_min", "15",
@@ -497,8 +501,10 @@ func (c Config) Args() ([]string, error) {
 	)
 
 	// Tertiary output: Opus RTP for live browser audio meter.
+	// Maps [a_preview] (the resampled 48 kHz copy from the audio
+	// asplit) so playback timing matches the primary encode.
 	args = append(args,
-		"-map", inputs.audioMap, "-vn",
+		"-map", "[a_preview]",
 		"-c:a", "libopus", "-ar", "48000", "-ac", "2", "-b:a", "64k",
 		"-flush_packets", "1", "-muxdelay", "0", "-muxpreload", "0",
 		"-payload_type", "111",
@@ -525,6 +531,11 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 		// come in at 1-2 Mbps even when -b:v says 10 Mbps). Live ingest
 		// receivers expect a constant rate at or near the target.
 		// Requires macOS 13+ / current VideoToolbox.
+		//
+		// -force_key_frames pins IDR boundaries to exact 2-second
+		// intervals. VideoToolbox respects this more reliably than
+		// -g alone, which is important because YouTube's transcoder
+		// keys segment boundaries off our keyframe cadence.
 		return []string{
 			"-c:v", "h264_videotoolbox",
 			"-profile:v", "high",
@@ -532,6 +543,7 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 			"-allow_sw", "1",
 			"-realtime", "1",
 			"-constant_bit_rate", "1",
+			"-force_key_frames", "expr:gte(t,n_forced*2)",
 		}
 
 	case EncoderNVENC:
@@ -594,15 +606,16 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 		//                segment predictably.
 		// No -tune zerolatency: it disables B-frames, which YouTube
 		// explicitly recommends keeping (2 B-frames).
+		// (-refs is left at the veryfast preset's default of 1.
+		// keyint/min-keyint live inside -x264-params; setting them
+		// twice via the flag and the param string is redundant.)
 		return []string{
 			"-c:v", "libx264",
 			"-preset", "veryfast",
 			"-profile:v", "high",
 			"-level:v", "4.1",
-			"-keyint_min", gop,
 			"-sc_threshold", "0",
 			"-bf", "2",
-			"-refs", "1",
 			"-x264-params", "filler=1:open-gop=0:scenecut=0:keyint=" + gop + ":min-keyint=" + gop,
 		}
 	}
