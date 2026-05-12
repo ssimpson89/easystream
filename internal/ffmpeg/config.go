@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -194,8 +193,19 @@ func (c Config) Validate() error {
 // primaryRunnable reports whether the primary destination has enough
 // config to actually run. Used by Args() to decide whether to append
 // the primary output muxer, and by Validate() to permit HLS-only runs.
+//
+// RTMP requires both URL and stream key (key is a path segment).
+// SRT requires only the URL — the user pastes the complete URL
+// (including any streamid=... query param required by the receiver).
 func (c Config) primaryRunnable() bool {
-	return strings.TrimSpace(c.IngestURL) != "" && strings.TrimSpace(c.StreamName) != ""
+	url := strings.TrimSpace(c.IngestURL)
+	if url == "" {
+		return false
+	}
+	if c.OutputMode == OutputSRT {
+		return true
+	}
+	return strings.TrimSpace(c.StreamName) != ""
 }
 
 // EffectiveEncoder returns the encoder to use, defaulting to libx264.
@@ -208,7 +218,14 @@ func (c Config) EffectiveEncoder() Encoder {
 
 func (c Config) OutputURL() string {
 	if c.OutputMode == OutputSRT {
-		return c.srtOutputURL()
+		// SRT URL formats vary widely across receivers (Cloudflare
+		// uses streamid=<id>:<password>, MediaMTX uses
+		// streamid=publish:<name>, others use the raw key). The user
+		// pastes the complete URL — we pass it through verbatim
+		// without manipulating streamid or other params. Trying to
+		// be smart here causes URL-encoding of colons (Cloudflare
+		// rejects %3A) and other corruption.
+		return c.IngestURL
 	}
 	// RTMP: append stream key as a path segment.
 	base := strings.TrimRight(c.IngestURL, "/")
@@ -217,37 +234,6 @@ func (c Config) OutputURL() string {
 		return base
 	}
 	return base + "/" + name
-}
-
-// srtOutputURL renders an SRT URL with sensible defaults injected via
-// query parameters. The user-supplied URL is authoritative for any
-// param the user already set; we only add what's missing.
-//
-//   - streamid:   StreamName wins if set (replaces any URL value);
-//     otherwise URL value is preserved.
-//   - mode:       defaults to "caller" (we push, receiver listens).
-//   - pkt_size:   1316 bytes (7×188 TS packets — fits one SRT payload).
-//   - latency:    200 ms (libsrt's documented sweet spot for internet).
-func (c Config) srtOutputURL() string {
-	u, err := url.Parse(c.IngestURL)
-	if err != nil {
-		return c.IngestURL
-	}
-	q := u.Query()
-	if sn := strings.TrimSpace(c.StreamName); sn != "" {
-		q.Set("streamid", sn)
-	}
-	if q.Get("mode") == "" {
-		q.Set("mode", "caller")
-	}
-	if q.Get("pkt_size") == "" {
-		q.Set("pkt_size", "1316")
-	}
-	if q.Get("latency") == "" {
-		q.Set("latency", "200")
-	}
-	u.RawQuery = q.Encode()
-	return u.String()
 }
 
 func (c Config) Args() ([]string, error) {

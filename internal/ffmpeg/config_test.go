@@ -152,7 +152,7 @@ func TestArgsSRTOutput(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.OutputMode = OutputSRT
 	cfg.IngestURL = "srt://example.com:9999"
-	cfg.StreamName = "abc"
+	cfg.StreamName = ""
 
 	args, err := cfg.Args()
 	if err != nil {
@@ -163,10 +163,7 @@ func TestArgsSRTOutput(t *testing.T) {
 		"-f mpegts",
 		"+resend_headers+initial_discontinuity",
 		"-flush_packets 1",
-		"streamid=abc",
-		"mode=caller",
-		"latency=200",
-		"pkt_size=1316",
+		"srt://example.com:9999",
 	} {
 		if !strings.Contains(joined, expected) {
 			t.Errorf("expected %q in args: %s", expected, joined)
@@ -177,22 +174,38 @@ func TestArgsSRTOutput(t *testing.T) {
 	}
 }
 
-func TestArgsSRTPreservesUserQueryParams(t *testing.T) {
+// TestArgsSRTPassesURLVerbatim confirms we don't mutate the SRT URL.
+// SRT URL formats vary too much across receivers (Cloudflare's
+// "streamid=id:password" gets URL-encoded to "streamid=id%3Apassword"
+// if we touch it, which Cloudflare rejects). User pastes the full URL.
+func TestArgsSRTPassesURLVerbatim(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.OutputMode = OutputSRT
-	cfg.IngestURL = "srt://example.com:9999?latency=500&passphrase=secret"
-	cfg.StreamName = "abc"
+	cfg.IngestURL = "srt://live.cloudflare.com:778?streamid=abc-input:secret&latency=4000"
+	cfg.StreamName = "ignored-for-srt"
 
 	args, err := cfg.Args()
 	if err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "latency=500") {
-		t.Errorf("user-set latency=500 was overridden: %s", joined)
+	if !strings.Contains(joined, "srt://live.cloudflare.com:778?streamid=abc-input:secret&latency=4000") {
+		t.Errorf("expected SRT URL passed verbatim, got: %s", joined)
 	}
-	if !strings.Contains(joined, "passphrase=secret") {
-		t.Errorf("user-set passphrase=secret was dropped: %s", joined)
+	if strings.Contains(joined, "%3A") {
+		t.Errorf("URL must not URL-encode the colon in Cloudflare-style streamid: %s", joined)
+	}
+}
+
+// TestSRTRequiresOnlyURL verifies that SRT validates with just a URL
+// (no stream key), since the streamid goes inside the URL.
+func TestSRTRequiresOnlyURL(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.OutputMode = OutputSRT
+	cfg.IngestURL = "srt://example.com:9999?streamid=foo"
+	cfg.StreamName = ""
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("SRT with URL-only should validate, got: %v", err)
 	}
 }
 

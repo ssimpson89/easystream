@@ -598,7 +598,14 @@ func (s *Supervisor) setRestarting(lastExit string, delay time.Duration) {
 	defer s.mu.Unlock()
 	s.status.State = StateRestarting
 	s.status.LastExit = lastExit
-	s.status.LastError = fmt.Sprintf("restarting FFmpeg in %s", delay.Round(time.Second))
+	// Preserve the classified reason from recordLogs (e.g. "Destination
+	// rejected the connection. Verify your stream key and ingest URL.")
+	// so the operator sees WHY we're restarting, not the useless
+	// "restarting in 1s" countdown. The state itself (Restarting) is
+	// enough signal that a retry is in progress.
+	if s.status.LastError == "" {
+		s.status.LastError = fmt.Sprintf("restarting FFmpeg in %s", delay.Round(time.Second))
+	}
 	s.status.UpdatedAt = time.Now().UTC()
 }
 
