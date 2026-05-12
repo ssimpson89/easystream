@@ -85,6 +85,13 @@ document.addEventListener("alpine:init", () => {
     _dirtyAudio:     false,
     _dirtyVideo:     false,
 
+    // Tracks the previous videoSourceValue so onVideoSourceChange
+    // can detect a kind transition (e.g. webcam → network) and
+    // reset kind-specific defaults. Synced both on user-driven
+    // changes (in onVideoSourceChange) and on SSE-driven updates
+    // (in applyState) so the baseline never drifts.
+    _lastVideoSourceValue: "",
+
     schedForm: { id: "", name: "", days: [], time: "09:00", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted", enabled: true },
     ovrForm:   { id: "", name: "", wallClock: "", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted" },
 
@@ -293,6 +300,12 @@ document.addEventListener("alpine:init", () => {
             cur.kind === next.kind && cur.backend === next.backend && cur.videoDevice === next.videoDevice;
           if (!sameTriple) {
             this.videoSourceValue = encoded;
+            // Keep _lastVideoSourceValue in sync with programmatic
+            // changes too — otherwise onVideoSourceChange's kind-
+            // transition detection would compare against a stale
+            // "" baseline and falsely fire the network-default
+            // reset on the next user-initiated change.
+            this._lastVideoSourceValue = encoded;
             this.$nextTick(() => this.syncSelectElements());
           }
         }
@@ -788,8 +801,20 @@ document.addEventListener("alpine:init", () => {
     },
 
     onVideoSourceChange() {
+      const prevKind = S.decodeSourceValue(this._lastVideoSourceValue)?.kind || "";
+      const nextKind = S.decodeSourceValue(this.videoSourceValue)?.kind || "";
+      this._lastVideoSourceValue = this.videoSourceValue;
       this._dirtyVideo = true;
       if (this.isSDISource) this.audioSourceValue = "";
+      // Reset network-only flags when switching INTO network from a
+      // different source kind. NoAudio defaults to false: most network
+      // sources (RTSP cameras, SRT pulls, HLS streams) carry audio, so
+      // assume the source has audio until the operator says otherwise.
+      // Without this reset, a stale checked state from a previous
+      // session could carry over via the dirty flag.
+      if (nextKind === "network" && prevKind !== "network") {
+        this.networkNoAudio = false;
+      }
       // Picking "Network stream" without a URL would POST invalid
       // config (backend requires Input.URL) and show a save-failed
       // toast. Defer save until the operator types a URL.

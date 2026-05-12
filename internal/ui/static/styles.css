@@ -655,7 +655,17 @@ dd { margin: 4px 0 0; font-size: 20px; font-weight: 700; font-variant-numeric: t
 .yt-button:hover:not(:disabled) { background: #cc0000; }
 
 /* =========== FORMS =========== */
-label {
+/* The uppercase "eyebrow" label style applies to form-row labels —
+ * those wrapping a single <input>/<select>/<textarea>. Inline-control
+ * variants (.checkbox-row, .switch-row) opt out so a label wrapping
+ * a checkbox doesn't pick up the all-caps treatment.
+ *
+ * Wrapped in :where() so the exclusion contributes zero specificity:
+ * the bare `label` rule still matches at 0-1-0, identical to before,
+ * and other label-class variants (.adaptive-toggle, etc.) with a
+ * single-class selector cleanly override without our :not() bumping
+ * specificity above theirs. */
+label:where(:not(.checkbox-row)) {
   display: block;
   margin-top: 14px;
   color: var(--muted);
@@ -663,6 +673,40 @@ label {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* Inline checkbox row: <label class="checkbox-row">
+ *                       <input type="checkbox">
+ *                       <span>Sentence-case label<br>
+ *                         <span class="row-hint">tiny description</span>
+ *                       </span>
+ *                     </label> */
+.checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 6px 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.checkbox-row input[type="checkbox"] {
+  width: auto;
+  min-height: 0;
+  margin: 2px 0 0;          /* optical-align to first text line */
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.checkbox-row .row-hint {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  margin-top: 2px;
 }
 input, select, textarea {
   width: 100%;
