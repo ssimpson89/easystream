@@ -22,27 +22,31 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in your browser.
 - **Go 1.22+**
 - **FFmpeg** installed and available on `PATH` (`brew install ffmpeg` on macOS, `apt install ffmpeg` on Linux)
 
+#### FFmpeg path resolution
+
+EasyStream auto-detects `ffmpeg` in this order (first hit wins):
+
+1. **`EASYSTREAM_FFMPEG` env var** — explicit path override. Use this for non-standard installs (Snap, Flatpak, NixOS `/nix/store/...`, manually compiled in `/opt/ffmpeg/bin/ffmpeg`, custom static build, etc.). Set it in `.env` or your service unit.
+2. **Homebrew `ffmpeg-full`** keg-only path on macOS (`/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg` on Apple Silicon, `/usr/local/opt/ffmpeg-full/bin/ffmpeg` on Intel).
+3. **`ffmpeg` on `PATH`** — covers `dnf install ffmpeg`, `apt install ffmpeg`, and anything in `/usr/bin`, `/usr/local/bin`, etc.
+4. Standard macOS install dirs (Homebrew default, MacPorts) as a fallback when the daemon was launched from Finder/launchd with a minimal PATH.
+
+EasyStream prints the resolved path to the daemon log at startup (`ffmpeg binary: /path/to/ffmpeg`).
+
 #### Optional: FFmpeg with SRT support
 
-To stream via SRT (Cloudflare Stream, MediaMTX, custom SRT receivers), FFmpeg must be built with `libsrt`. **Homebrew's default `ffmpeg` formula on macOS does NOT include libsrt** — neither does the `homebrew-ffmpeg/ffmpeg` tap as of FFmpeg 8.x. EasyStream detects this at startup, logs a warning, and disables the SRT option in the destination picker.
+To stream via SRT (Cloudflare Stream, MediaMTX, custom SRT receivers), `ffmpeg` must be built with `libsrt`. EasyStream detects this at startup, logs a warning, and disables the SRT option in the destination picker when it's missing.
 
-**macOS — install `ffmpeg-full`** (the easy option):
-
-```bash
-brew install ffmpeg-full
-```
-
-`ffmpeg-full` is a Homebrew-core formula that bundles every codec and protocol FFmpeg supports, including libsrt. It's keg-only (doesn't symlink into `/opt/homebrew/bin`) but EasyStream finds it automatically — `findFFmpeg()` checks `/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg` before falling back to the default install.
-
-You can keep the default `ffmpeg` installed alongside it; EasyStream prefers `ffmpeg-full` when present.
-
-**Linux — distribution packages**: most distros ship `ffmpeg` with libsrt enabled. Verify with:
+Quick check:
 
 ```bash
 ffmpeg -protocols 2>&1 | grep '^ *srt$'
 ```
 
-If that prints `srt` you're good. If not, install `libsrt-dev` (or your distro's equivalent) and either rebuild ffmpeg with `--enable-libsrt` or grab a static build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases).
+If that prints `srt` you're good. If not:
+
+- **Linux** (most distros) — `dnf install ffmpeg-libs` / `apt install ffmpeg` typically ships libsrt enabled. Some minimal distros do not — install `libsrt`/`libsrt-dev` and rebuild, or grab a static build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) and point `EASYSTREAM_FFMPEG` at it.
+- **macOS** — Homebrew's default `ffmpeg` formula does **not** include libsrt. Install [`ffmpeg-full`](https://formulae.brew.sh/formula/ffmpeg-full) (`brew install ffmpeg-full`); EasyStream auto-detects it.
 
 EasyStream picks up the new ffmpeg automatically on next restart.
 
@@ -92,6 +96,7 @@ go run ./cmd/easystream
 |---|---|---|
 | `EASYSTREAM_ADDR` | `127.0.0.1:8080` | Listen address for the web UI |
 | `EASYSTREAM_DATA_DIR` | `~/.easystream` | Directory for tokens, schedules, HLS segments |
+| `EASYSTREAM_FFMPEG` | *(auto-detect)* | Absolute path to the `ffmpeg` binary. Useful for non-standard installs (snap, flatpak, `/nix/store`, `/opt/...`, manually compiled). When unset, EasyStream auto-detects (see below). |
 | `YOUTUBE_CLIENT_ID` | *(none)* | Google OAuth client ID (enables YouTube features) |
 | `YOUTUBE_CLIENT_SECRET` | *(none)* | Google OAuth client secret |
 

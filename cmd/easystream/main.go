@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,23 +29,32 @@ import (
 	"github.com/ssimpson89/easystream/internal/youtube"
 )
 
-// findFFmpeg locates the ffmpeg binary across common install locations.
-// macOS apps launched from Finder/launchd inherit a minimal PATH
-// (/usr/bin:/bin:/usr/sbin:/sbin) — Homebrew (/opt/homebrew/bin on
-// Apple Silicon, /usr/local/bin on Intel) and MacPorts (/opt/local/bin)
-// aren't on it. Without this, every FFmpeg probe (device list,
-// encoder detect, framerate) silently returns empty and the daemon
-// fails to start with a confusing error.
+// findFFmpeg locates the ffmpeg binary EasyStream should run.
 //
-// Prefers `ffmpeg-full` (Homebrew keg-only formula that bundles all
-// codecs + libsrt) over the default `ffmpeg` formula, since the
-// stripped-down default is missing protocols people actually need
-// (SRT, RIST, etc.). EasyStream auto-picks ffmpeg-full when present.
+// Resolution order (first hit wins):
+//  1. EASYSTREAM_FFMPEG env var — explicit operator override. The
+//     escape hatch for non-standard installs: snap, flatpak,
+//     /nix/store, manually compiled binaries in /opt or ~/bin, etc.
+//  2. Homebrew's keg-only `ffmpeg-full` formula (macOS). Bundles
+//     every codec and protocol including libsrt; recommended for
+//     macOS where the default formula omits libsrt.
+//  3. exec.LookPath("ffmpeg") — finds whatever's on PATH. Covers
+//     `dnf install ffmpeg`, `apt install ffmpeg`, distro-shipped
+//     binaries in /usr/bin, /usr/local/bin, etc.
+//  4. A short list of well-known macOS install paths, because apps
+//     launched from Finder/launchd inherit a minimal PATH
+//     (/usr/bin:/bin:/usr/sbin:/sbin) that excludes Homebrew /
+//     MacPorts directories. Linux installs reach via PATH so they
+//     don't need entries here.
+//  5. Bare "ffmpeg" — the supervisor will then surface a clear
+//     "not found" error on first invocation.
 func findFFmpeg() string {
-	// Keg-only ffmpeg-full first — most feature-complete on Homebrew.
+	if env := strings.TrimSpace(os.Getenv("EASYSTREAM_FFMPEG")); env != "" {
+		return env
+	}
 	for _, candidate := range []string{
 		"/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg", // Apple Silicon
-		"/usr/local/opt/ffmpeg-full/bin/ffmpeg",    // Intel
+		"/usr/local/opt/ffmpeg-full/bin/ffmpeg",    // Intel Mac
 	} {
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate
@@ -54,16 +64,15 @@ func findFFmpeg() string {
 		return p
 	}
 	for _, candidate := range []string{
-		"/opt/homebrew/bin/ffmpeg",
-		"/usr/local/bin/ffmpeg",
-		"/opt/local/bin/ffmpeg",
-		"/usr/bin/ffmpeg",
+		"/opt/homebrew/bin/ffmpeg", // Apple Silicon Homebrew
+		"/usr/local/bin/ffmpeg",    // Intel Homebrew or manual /usr/local
+		"/opt/local/bin/ffmpeg",    // MacPorts
 	} {
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate
 		}
 	}
-	return "ffmpeg" // last resort; supervisor will surface the error
+	return "ffmpeg"
 }
 
 func main() {
