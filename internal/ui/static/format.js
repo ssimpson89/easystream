@@ -43,6 +43,34 @@ window.EasyStreamFormat = (() => {
     return null;
   }
 
+  // redactUrl scrubs userinfo and known secret query params from a
+  // URL string before rendering it in the UI. Mirrors the server's
+  // RedactURLCredentials so what the operator sees on the dashboard
+  // never includes a camera password or SRT passphrase.
+  function redactUrl(url) {
+    if (!url) return url;
+    try {
+      const u = new URL(url);
+      if (u.username || u.password) {
+        u.username = "•••";
+        u.password = "•••";
+      }
+      const secretKeys = ["passphrase", "password", "token", "key", "secret"];
+      let changed = false;
+      for (const k of [...u.searchParams.keys()]) {
+        if (secretKeys.includes(k.toLowerCase())) {
+          u.searchParams.set(k, "•••");
+          changed = true;
+        }
+      }
+      if (u.username || changed) return u.toString();
+      return url;
+    } catch (_) {
+      // Not a parseable URL — return as-is rather than mangle it.
+      return url;
+    }
+  }
+
   function presetTitle(p) {
     if (!p) return "-";
     const fps = p.fps === 60 ? "60" : "";
@@ -72,5 +100,5 @@ window.EasyStreamFormat = (() => {
     return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   }
 
-  return { fmtTime, formatEventWhen, formatDateTime, formatDays, shortTZ, platformFromURL, presetTitle, relativeUntil, elapsedSince };
+  return { fmtTime, formatEventWhen, formatDateTime, formatDays, shortTZ, platformFromURL, redactUrl, presetTitle, relativeUntil, elapsedSince };
 })();

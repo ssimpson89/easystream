@@ -14,6 +14,7 @@
 package preview
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -350,11 +351,35 @@ func (s *Server) startSessionFFmpeg(sess *session, config ffmpeg.Config) error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, binary, args...)
+	// Capture stderr so we can redact URL credentials before logging.
+	// Without this, FFmpeg's connect-error messages echo the full
+	// RTSP/SRT URL (including userinfo / passphrase) to the parent's
+	// stderr unredacted.
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		sess.cmdMu.Unlock()
+		return fmt.Errorf("ffmpeg stderr pipe: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		cancel()
 		sess.cmdMu.Unlock()
 		return fmt.Errorf("ffmpeg start: %w", err)
 	}
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		scanner.Buffer(make([]byte, 0, 4096), 64*1024)
+		for scanner.Scan() {
+			s.logger.Printf("preview ffmpeg: %s", ffmpeg.RedactURLsInLog(scanner.Text()))
+		}
+		// Surface scanner errors (e.g. token-too-long on a line
+		// >64 KB) instead of silently dropping the rest of the
+		// stderr stream. Without this, a single long FFmpeg log
+		// line would stop the reader and hide subsequent errors.
+		if err := scanner.Err(); err != nil {
+			s.logger.Printf("preview ffmpeg: stderr reader error: %v", err)
+		}
+	}()
 	sess.cmd = cmd
 	sess.ffmpegCtx = ctx
 	sess.cmdCancel = cancel
@@ -517,6 +542,15 @@ func previewInputs(config ffmpeg.Config) previewInputBuild {
 			},
 			videoMap: "0:v", audioMap: "1:a",
 		}
+	case ffmpeg.InputNetwork:
+		// Preview ingests the same URL as the main pipeline (separate
+		// ffmpeg process, separate RTSP/SRT connection to the source).
+		// Delegate to ffmpeg.NetworkInputArgs so the per-input flags
+		// and per-scheme tuning stay byte-identical to the main
+		// pipeline (no risk of drift if one path adds a flag and the
+		// other doesn't).
+		netArgs, audioMap := ffmpeg.NetworkInputArgs(config.Input.URL, config.Input.NoAudio)
+		return previewInputBuild{args: netArgs, videoMap: "0:v", audioMap: audioMap}
 	default:
 		backend := config.Input.Backend
 		if backend == "" {

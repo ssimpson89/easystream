@@ -159,6 +159,36 @@ func redactRawURL(u string) string {
 	return u[:schemeIdx+3] + RedactedCredentialSentinel + ":" + RedactedCredentialSentinel + rest[atIdx:]
 }
 
+// urlInLogRegex matches URL-shaped substrings inside a free-form
+// log line. Matches the schemes we accept for ingest/egress
+// (RTMP/SRT/RTSP/HTTP/UDP/RTP), stopping at whitespace or the
+// trailing punctuation FFmpeg uses around URLs in error messages.
+var urlInLogRegex = regexp.MustCompile(`(?i)(rtmp|rtmps|rtsp|rtsps|srt|http|https|udp|rtp)://[^\s'"]+`)
+
+// RedactURLsInLog scans a free-form log line for URLs and runs each
+// one through RedactURLCredentials. FFmpeg routinely echoes the full
+// ingest/destination URL (with userinfo or query-string secrets) in
+// error messages and connect logs. Without this, those secrets land
+// in /status.lastLogLine, the logger output, and any SSE consumer.
+func RedactURLsInLog(line string) string {
+	return urlInLogRegex.ReplaceAllStringFunc(line, func(match string) string {
+		// The regex may grab a trailing ',', ')', or '.' that's
+		// punctuation from the surrounding log message, not part of
+		// the URL. Strip those before redacting and reattach after.
+		trailing := ""
+		for len(match) > 0 {
+			last := match[len(match)-1]
+			if last == ',' || last == '.' || last == ')' || last == ']' || last == ';' || last == ':' {
+				trailing = string(last) + trailing
+				match = match[:len(match)-1]
+				continue
+			}
+			break
+		}
+		return RedactURLCredentials(match) + trailing
+	})
+}
+
 // OutputMode selects the *primary* destination FFmpeg sends to.
 // HLS is no longer one of the mutually-exclusive primaries — it is an
 // independent toggle (Config.EnableHLS) that runs alongside any primary
@@ -472,10 +502,16 @@ func (c Config) hlsOutputArgs() []string {
 // primaryTeeSlave returns the tee-muxer slave spec for the primary
 // destination. Slave options inside [...] are colon-separated; the
 // URL follows after ']' and may contain any character except '|'.
+//
+// muxdelay and muxpreload are deliberately NOT included here even
+// though the non-tee SRT path sets them: they're global format-
+// context options that the tee slave option parser rejects with
+// "Unknown option 'muxdelay'". The tee path still gets low-latency
+// behaviour from -flush_packets and the encoder's own VBV settings.
 func (c Config) primaryTeeSlave() (string, error) {
 	switch c.OutputMode {
 	case OutputSRT:
-		return "[f=mpegts:flush_packets=1:muxdelay=0:muxpreload=0]" + c.OutputURL(), nil
+		return "[f=mpegts:flush_packets=1]" + c.OutputURL(), nil
 	case OutputRTMP, "":
 		opts := []string{"f=flv"}
 		if c.Network.TCPKeepalive {
@@ -880,54 +916,68 @@ type inputBuild struct {
 
 const silentAudio = "anullsrc=channel_layout=stereo:sample_rate=48000"
 
-// buildNetworkInput constructs FFmpeg input args for a URL-based
-// source (RTSP camera, SRT pull, UDP multicast, HTTP/HLS).
+// NetworkInputArgs builds FFmpeg input args for a URL-based source
+// (RTSP camera, SRT pull, UDP multicast, HTTP/HLS). Used by both
+// the main supervisor's buildInputs and the preview process so the
+// two pipelines stay in sync — a per-scheme tweak on one path
+// won't silently regress the other.
 //
-// Each scheme gets transport tuning that matches what production
-// rigs use:
-//   - rtsp / rtsps: TCP transport so we don't lose packets the way
-//     UDP RTSP does on lossy LANs; reduced socket-buffer timeouts.
-//   - srt: rely on URL params (latency, passphrase, streamid, etc.)
-//   - udp / rtp: prefer larger fifo so packet bursts don't drop.
-//   - http / https: behave like a normal pull; rely on TCP.
+// Per-input -fflags REPLACES the global value (no leading `+`) so
+// the global `nobuffer` (which suits capture devices but starves
+// network demuxers of the buffering needed for packet reassembly)
+// is dropped for the network input. Per-scheme additions:
 //
-// Audio: we map 0:a for the network source by default; most live
-// network sources (IP cameras, SRT pulls, broadcast HLS) carry an
-// audio track. If the operator marks NoAudio (or the source is
-// known to be video-only), we add a silent stereo lavfi input as a
-// second source and the audio map points there instead.
-func (c Config) buildNetworkInput() inputBuild {
-	url := strings.TrimSpace(c.Input.URL)
+//   - rtsp / rtsps: -rtsp_transport tcp so we don't lose packets
+//     to UDP-RTSP problems on lossy LANs.
+//   - srt: nothing — libsrt reads everything from URL params.
+//   - udp / rtp: bigger fifo + overrun_nonfatal for bursty MPEG-TS.
+//   - http / https: -reconnect family so HLS pulls survive blips.
+//
+// Returns (args, audioMap). audioMap is "0:a" by default — most
+// live network sources (IP cameras, SRT pulls, broadcast HLS)
+// carry audio. When noAudio is true, args also appends a silent
+// lavfi second input and audioMap becomes "1:a".
+func NetworkInputArgs(url string, noAudio bool) (args []string, audioMap string) {
+	url = strings.TrimSpace(url)
 	scheme := ""
 	if i := strings.Index(url, "://"); i > 0 {
 		scheme = strings.ToLower(url[:i])
 	}
 
-	var args []string
+	args = []string{
+		"-fflags", "discardcorrupt+genpts",
+		"-analyzeduration", "1000000",
+		"-probesize", "1000000",
+	}
 	switch scheme {
 	case "rtsp", "rtsps":
-		// TCP avoids the UDP-RTSP packet-loss / NAT-traversal pain
-		// that's typical on church LANs with PoE switches.
 		args = append(args, "-rtsp_transport", "tcp")
-	case "srt":
-		// libsrt reads everything else from the URL.
 	case "udp", "rtp":
-		// MPEG-TS over UDP tends to be bursty; bigger fifo prevents
-		// drops on the source side.
 		args = append(args, "-fifo_size", "1000000", "-overrun_nonfatal", "1")
+	case "http", "https":
+		args = append(args,
+			"-reconnect", "1",
+			"-reconnect_streamed", "1",
+			"-reconnect_delay_max", "5",
+			"-multiple_requests", "1",
+		)
+	case "srt":
+		// libsrt URL params carry latency, passphrase, streamid, etc.
 	}
 	args = append(args, "-i", url)
+	audioMap = "0:a"
+	if noAudio {
+		args = append(args, "-f", "lavfi", "-i", silentAudio)
+		audioMap = "1:a"
+	}
+	return args, audioMap
+}
 
-	build := inputBuild{
-		args:     args,
-		videoMap: "0:v",
-		audioMap: "0:a",
-	}
-	if c.Input.NoAudio {
-		build.args = append(build.args, "-f", "lavfi", "-i", silentAudio)
-		build.audioMap = "1:a"
-	}
-	return build
+// buildNetworkInput wraps NetworkInputArgs in an inputBuild for the
+// main supervisor pipeline.
+func (c Config) buildNetworkInput() inputBuild {
+	args, audioMap := NetworkInputArgs(c.Input.URL, c.Input.NoAudio)
+	return inputBuild{args: args, videoMap: "0:v", audioMap: audioMap}
 }
 
 // buildInputs constructs FFmpeg input flags. When the capture source has no
