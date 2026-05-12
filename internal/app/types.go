@@ -3,9 +3,9 @@ package app
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"time"
 
+	"github.com/ssimpson89/easystream/internal/atomicfile"
 	"github.com/ssimpson89/easystream/internal/ffmpeg"
 )
 
@@ -21,18 +21,15 @@ type streamHealthSnapshot struct {
 	ConcurrentViewers *int      `json:"concurrentViewers,omitempty"` // nil = unavailable
 }
 
-// persistedConfig is a subset of ffmpeg.Config we save across restarts,
-// plus a few UI-only fields (active destination tab) so the UI restores
-// exactly as the user left it. HLSDir and Binary are recomputed at
-// startup; Network is fixed.
+// persistedConfig is the subset of ffmpeg.Config we save across restarts.
+// HLSDir and Binary are recomputed at startup; Network is fixed.
 type persistedConfig struct {
-	PresetID        string            `json:"presetId"`
-	Encoder         ffmpeg.Encoder    `json:"encoder,omitempty"`
-	OutputMode      ffmpeg.OutputMode `json:"outputMode"`
-	IngestURL       string            `json:"ingestUrl"`
-	StreamName      string            `json:"streamName"`
-	Input           ffmpeg.Input      `json:"input"`
-	DestinationMode string            `json:"destinationMode,omitempty"` // "scheduled" | "now" | "manual"
+	PresetID   string            `json:"presetId"`
+	Encoder    ffmpeg.Encoder    `json:"encoder,omitempty"`
+	OutputMode ffmpeg.OutputMode `json:"outputMode"`
+	IngestURL  string            `json:"ingestUrl"`
+	StreamName string            `json:"streamName"`
+	Input      ffmpeg.Input      `json:"input"`
 }
 
 func loadPersistedConfig(path string) (persistedConfig, error) {
@@ -54,12 +51,9 @@ func savePersistedConfig(path string, cfg ffmpeg.Config) error {
 		StreamName: cfg.StreamName,
 		Input:      cfg.Input,
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	return atomicfile.Write(path, data, 0600)
 }

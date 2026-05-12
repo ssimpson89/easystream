@@ -18,11 +18,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	config := s.config
 	health := s.streamHealth
 	broadcastID := s.activeBroadcastID
-	destMode := s.destinationMode
 	s.mu.Unlock()
 
 	streamStatus := s.supervisor.Status()
-	confidence := computeConfidence(streamStatus, health, broadcastID, destMode)
+	confidence := computeConfidence(streamStatus, health, broadcastID)
 
 	result := map[string]any{
 		"stream":            streamStatus,

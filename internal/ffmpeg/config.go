@@ -113,17 +113,16 @@ func DetectEncoders(binary string) []EncoderInfo {
 }
 
 type Config struct {
-	Binary       string         `json:"binary"`
-	Input        Input          `json:"input"`
-	Preset       quality.Preset `json:"preset"`
-	Encoder      Encoder        `json:"encoder,omitempty"`
-	OutputMode   OutputMode     `json:"outputMode"`
-	IngestURL    string         `json:"ingestUrl"`
-	StreamName   string         `json:"streamName"`
-	HLSDir       string         `json:"hlsDir,omitempty"`
-	Network      Network        `json:"network"`
-	LogLevel     string         `json:"logLevel"`
-	ProcessTitle string         `json:"processTitle"`
+	Binary     string         `json:"binary"`
+	Input      Input          `json:"input"`
+	Preset     quality.Preset `json:"preset"`
+	Encoder    Encoder        `json:"encoder,omitempty"`
+	OutputMode OutputMode     `json:"outputMode"`
+	IngestURL  string         `json:"ingestUrl"`
+	StreamName string         `json:"streamName"`
+	HLSDir     string         `json:"hlsDir,omitempty"`
+	Network    Network        `json:"network"`
+	LogLevel   string         `json:"logLevel"`
 }
 
 type Network struct {

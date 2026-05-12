@@ -3,11 +3,12 @@ package ffmpeg
 import (
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/ssimpson89/easystream/internal/atomicfile"
 )
 
 // PidFile records the FFmpeg child PID on disk so we can detect EasyStream
@@ -23,10 +24,7 @@ func (p *PidFile) Write(pid int) error {
 	if p == nil || p.Path == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(p.Path), 0700); err != nil {
-		return err
-	}
-	return os.WriteFile(p.Path, []byte(strconv.Itoa(pid)), 0600)
+	return atomicfile.Write(p.Path, []byte(strconv.Itoa(pid)), 0600)
 }
 
 // Clear removes the PID file. Safe when no file exists.

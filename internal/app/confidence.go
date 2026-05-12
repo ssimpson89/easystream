@@ -18,7 +18,7 @@ type confidenceIndicator struct {
 // computeConfidence turns raw supervisor + destination signals into
 // operator-facing traffic-light indicators. Answers "is the church
 // actually live?" — separate from the engineering metrics in the UI.
-func computeConfidence(stream ffmpeg.Status, health streamHealthSnapshot, broadcastID, destMode string) []confidenceIndicator {
+func computeConfidence(stream ffmpeg.Status, health streamHealthSnapshot, broadcastID string) []confidenceIndicator {
 	out := []confidenceIndicator{}
 
 	// 1. Encoder is sending.

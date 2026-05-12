@@ -38,7 +38,6 @@ type Status struct {
 	LastLogLine     string    `json:"lastLogLine,omitempty"`
 	LastProgress    Progress  `json:"lastProgress"`
 	ActivePresetID  string    `json:"activePresetId"`
-	Command         []string  `json:"command,omitempty"`
 	AudioRMSdB      float64   `json:"audioRmsDb"`      // finite dB value; lower = quieter, -120 = silence floor
 	AudioRMSAt      time.Time `json:"audioRmsAt"`      // when AudioRMSdB was last updated
 	AudioDetectedAt time.Time `json:"audioDetectedAt"` // when audio above silence floor was last seen
@@ -128,9 +127,10 @@ func (s *Supervisor) Start(config Config) error {
 	if err := config.Validate(); err != nil {
 		return err
 	}
-
-	args, err := config.Args()
-	if err != nil {
+	// Build args once up front to surface configuration errors synchronously
+	// to the caller, instead of finding them after the supervisor goroutine
+	// has already moved into StateStarting.
+	if _, err := config.Args(); err != nil {
 		return err
 	}
 
@@ -150,7 +150,6 @@ func (s *Supervisor) Start(config Config) error {
 		StartedAt:      time.Now().UTC(),
 		UpdatedAt:      time.Now().UTC(),
 		ActivePresetID: config.Preset.ID,
-		Command:        append([]string{config.Binary}, args...),
 	}
 
 	go s.run(ctx)
@@ -366,7 +365,13 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	s.status.AudioRMSAt = time.Time{}
 	s.status.AudioDetectedAt = time.Time{}
 	s.status.UpdatedAt = time.Now().UTC()
+	preset := s.status.ActivePresetID
+	outputMode := s.ffmpeg.OutputMode
+	if outputMode == "" {
+		outputMode = OutputRTMP
+	}
 	s.mu.Unlock()
+	s.logger.Printf("stream-start: preset=%s output=%s pid=%d", preset, outputMode, cmd.Process.Pid)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -395,6 +400,8 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 			if s.pidFile != nil {
 				s.pidFile.Clear()
 			}
+			s.logger.Printf("stream-end: ffmpeg exited after %s (%s)",
+				time.Since(processStarted).Round(time.Second), exitMessage(err))
 			return err
 
 		case reason := <-restartCh:
@@ -452,6 +459,9 @@ func (s *Supervisor) recordProgress(progress Progress) {
 
 func (s *Supervisor) recordLogs(r io.Reader) {
 	scanner := bufio.NewScanner(r)
+	s.mu.Lock()
+	streamKey := s.ffmpeg.StreamName
+	s.mu.Unlock()
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -480,18 +490,34 @@ func (s *Supervisor) recordLogs(r io.Reader) {
 			continue
 		}
 
-		hint := classifyFFmpegError(line)
+		// FFmpeg echoes the full RTMP URL (including the stream key) when
+		// the destination rejects the connection. Redact before storing or
+		// logging so the key never leaks into log files or /status.
+		redacted := redactStreamKey(line, streamKey)
+		hint := classifyFFmpegError(redacted)
 		s.mu.Lock()
-		s.status.LastLogLine = line
+		s.status.LastLogLine = redacted
 		if hint != "" {
 			s.status.LastError = hint
 		}
 		s.status.UpdatedAt = time.Now().UTC()
 		s.mu.Unlock()
 		if s.logger != nil {
-			s.logger.Printf("ffmpeg: %s", line)
+			s.logger.Printf("ffmpeg: %s", redacted)
 		}
 	}
+}
+
+// redactStreamKey replaces occurrences of the stream key in a log line
+// with "<redacted>" so the key never appears in logs or the /status API.
+func redactStreamKey(line, key string) string {
+	if key == "" || len(key) < 8 {
+		return line
+	}
+	if !strings.Contains(line, key) {
+		return line
+	}
+	return strings.ReplaceAll(line, key, "<redacted>")
 }
 
 // parseAudioRMS extracts the RMS_level value from an FFmpeg ametadata log line.

@@ -21,7 +21,6 @@ const (
 	TypeSDI         DeviceType = "sdi"          // Blackmagic DeckLink
 	TypeMicrophone  DeviceType = "microphone"   // Built-in or USB microphones
 	TypeAudioInput  DeviceType = "audio-input"  // Generic audio (line-in, NDI, virtual)
-	TypeOther       DeviceType = "other"
 )
 
 // Device represents a detected capture device.

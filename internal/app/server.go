@@ -51,11 +51,19 @@ type Server struct {
 
 	mu                sync.Mutex
 	config            ffmpeg.Config
-	destinationMode   string // UI hint: which destination tab is active
 	activeBroadcastID string // YouTube broadcast bound to the current stream
 	activeStreamID    string // YouTube stream resource bound to the current broadcast
 	streamHealth      streamHealthSnapshot
 	destinationBad    int
+
+	// transitionCancel cancels the in-flight YouTube broadcast transition
+	// goroutine when the user stops or starts a different broadcast.
+	transitionMu     sync.Mutex
+	transitionCancel context.CancelFunc
+
+	// healthPollerStop signals the background health poller to exit on
+	// Shutdown. Without this, polling continues past server close.
+	healthPollerStop chan struct{}
 }
 
 // markLive persists the operator's intent to be live. Called from every
@@ -115,11 +123,9 @@ func NewServer(cfg ServerConfig) *Server {
 		defaultCfg.HLSDir = cfg.HLSServer.Dir()
 	}
 
-	// Load persisted stream config (stream key, preset, input, destination
-	// tab) from disk so it survives restarts. Falls back to defaults if
-	// missing/corrupt.
+	// Load persisted stream config (stream key, preset, input) from disk so
+	// it survives restarts. Falls back to defaults if missing/corrupt.
 	configPath := ""
-	destinationMode := "scheduled" // default tab
 	if cfg.DataDir != "" {
 		configPath = filepath.Join(cfg.DataDir, "stream-config.json")
 		if persisted, err := loadPersistedConfig(configPath); err == nil {
@@ -142,9 +148,6 @@ func NewServer(cfg ServerConfig) *Server {
 			}
 			if persisted.Encoder != "" {
 				defaultCfg.Encoder = persisted.Encoder
-			}
-			if persisted.DestinationMode != "" {
-				destinationMode = persisted.DestinationMode
 			}
 			// Resolve AVFoundation device names to current indexes. Device
 			// indexes shift between reboots or when USB devices are
@@ -183,20 +186,20 @@ func NewServer(cfg ServerConfig) *Server {
 	adaptive := ffmpeg.NewAdaptiveController(supervisor, ffmpeg.DefaultAdaptiveConfig(), cfg.Logger)
 
 	server := &Server{
-		addr:            cfg.Addr,
-		supervisor:      supervisor,
-		adaptive:        adaptive,
-		preview:         prev,
-		hlsServer:       cfg.HLSServer,
-		devScanner:      devScanner,
-		ytAuth:          cfg.YTAuth,
-		ytClient:        ytClient,
-		schedStore:      cfg.ScheduleStore,
-		logger:          cfg.Logger,
-		configPath:      configPath,
-		intentPath:      intentPath,
-		config:          defaultCfg,
-		destinationMode: destinationMode,
+		addr:             cfg.Addr,
+		supervisor:       supervisor,
+		adaptive:         adaptive,
+		preview:          prev,
+		hlsServer:        cfg.HLSServer,
+		devScanner:       devScanner,
+		ytAuth:           cfg.YTAuth,
+		ytClient:         ytClient,
+		schedStore:       cfg.ScheduleStore,
+		logger:           cfg.Logger,
+		configPath:       configPath,
+		intentPath:       intentPath,
+		config:           defaultCfg,
+		healthPollerStop: make(chan struct{}),
 	}
 	supervisor.SetOnRestart(adaptive.OnRestart)
 	adaptive.Start()
@@ -206,14 +209,14 @@ func NewServer(cfg ServerConfig) *Server {
 
 	// Create scheduler if we have both YouTube and schedule store.
 	if cfg.ScheduleStore != nil {
-		var ytCtrl schedule.YouTubeController
+		var bcastCtrl schedule.BroadcastController
 		if ytClient != nil && cfg.YTAuth != nil {
-			ytCtrl = &ytControllerAdapter{client: ytClient, auth: cfg.YTAuth}
+			bcastCtrl = &broadcastControllerAdapter{server: server}
 		}
 		server.scheduler = schedule.NewScheduler(
 			cfg.ScheduleStore,
 			&streamControllerAdapter{server: server},
-			ytCtrl,
+			bcastCtrl,
 			cfg.Logger,
 		)
 		server.scheduler.Start()
@@ -222,7 +225,7 @@ func NewServer(cfg ServerConfig) *Server {
 	// Start the health poller. When a YouTube broadcast is bound to the
 	// active stream, we poll YouTube every 15s for streamStatus/healthStatus
 	// so the UI can show "Receiving" / "noData" / "bad" indicators.
-	go server.runHealthPoller()
+	go server.runHealthPoller(server.healthPollerStop)
 
 	// If the previous session was live (crashed mid-stream and got restarted
 	// by launchd/systemd), resume the broadcast automatically. The PID
@@ -309,13 +312,21 @@ func (s *Server) ListenAndServe() error {
 }
 
 func (s *Server) Close() {
+	// Cancel the testing→live transition first so it can't fire after
+	// supervisor.Stop disowns the broadcast.
+	s.cancelTransitionGoroutine()
+
+	// Stop the health poller before the supervisor so it doesn't observe
+	// an idle FFmpeg state mid-tear-down and incorrectly mark "destination
+	// unhealthy."
+	s.stopHealthPollerOnce()
+
 	if s.scheduler != nil {
 		s.scheduler.Stop()
 	}
 	if s.adaptive != nil {
 		s.adaptive.Stop()
 	}
-
 	if s.supervisor != nil {
 		s.supervisor.Stop()
 	}
@@ -324,10 +335,30 @@ func (s *Server) Close() {
 	}
 }
 
+// stopHealthPollerOnce is safe to call multiple times; closing an already-
+// closed channel would panic.
+func (s *Server) stopHealthPollerOnce() {
+	s.mu.Lock()
+	ch := s.healthPollerStop
+	s.healthPollerStop = nil
+	s.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
 // Shutdown gracefully drains the HTTP server then runs Close() to stop
 // supervised FFmpeg children. EasyStream keeps one clear owner for FFmpeg;
 // crash recovery starts a fresh process from persisted intent rather than
 // adopting a blind process with no telemetry.
+//
+// Intent is preserved across Shutdown so a systemd restart can resume the
+// broadcast. If the operator is shutting down permanently (e.g. host
+// reboot), the active broadcast remains "live" on YouTube until the
+// next startup completes resume — which is exactly when systemd
+// restarts EasyStream anyway. For a true clean shutdown the operator
+// uses the Stop button in the UI, which calls handleStop and properly
+// transitions the broadcast to complete.
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.httpServer.Shutdown(ctx)
 	s.Close()
@@ -404,13 +435,16 @@ func (s *Server) resumeIfNeeded() {
 	s.logger.Printf("resume: restarted stream from previous session (mode=%s broadcast=%q, started %s ago)",
 		mode, intent.BroadcastID, time.Since(intent.StartedAt).Round(time.Second))
 
-	// If this was a Go Live Now broadcast, re-trigger the testing → live
-	// transition. The original transition goroutine died with the old
-	// server process; without re-triggering, the broadcast stays stuck in
-	// "testing" or "ready" and YouTube's player spins indefinitely.
-	if intent.Mode == "go-live-now" && intent.BroadcastID != "" && s.ytClient != nil && s.ytAuth != nil && s.ytAuth.IsAuthenticated() {
+	// Re-trigger the testing → live transition. The original transition
+	// goroutine died with the old server process; without re-triggering,
+	// the broadcast stays stuck in "testing" or "ready" and YouTube's
+	// player spins indefinitely. Applies to both go-live-now and scheduled
+	// modes — same recovery is needed either way.
+	if (intent.Mode == "go-live-now" || intent.Mode == "scheduled") &&
+		intent.BroadcastID != "" && s.ytClient != nil &&
+		s.ytAuth != nil && s.ytAuth.IsAuthenticated() {
 		s.logger.Printf("resume: re-triggering YouTube broadcast transition for %s", intent.BroadcastID)
-		s.startTransitionGoroutine(intent.BroadcastID)
+		s.startTransitionGoroutine(intent.BroadcastID, intent.StreamID)
 	}
 }
 

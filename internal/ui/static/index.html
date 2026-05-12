@@ -61,7 +61,11 @@
               <p class="eyebrow">Next event</p>
               <h2 x-text="nextEvent?.name"></h2>
               <p class="next-event-when" x-text="nextEvent && formatEventWhen(new Date(nextEvent.startTime))"></p>
-              <p class="hint" x-text="nextEvent?.broadcastId ? 'Broadcast ready · will start at the scheduled time' : 'Broadcast will be created and started at the scheduled time'"></p>
+              <p class="hint" x-show="!nextEvent?.broadcastId">Broadcast will be created shortly before the scheduled time</p>
+              <p class="hint" x-show="nextEvent?.broadcastId">
+                Broadcast ready ·
+                <a :href="`https://youtube.com/watch?v=${nextEvent.broadcastId}`" target="_blank" rel="noopener">Share this link</a>
+              </p>
             </div>
             <button class="button go-button"
                     x-show="canStartScheduledNow"

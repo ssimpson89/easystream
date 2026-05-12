@@ -52,6 +52,11 @@ func main() {
 		redirectURI,
 		filepath.Join(dataDir, "tokens.json"),
 	)
+	if ytAuth != nil {
+		// Surface token-refresh persistence failures in the daemon log
+		// instead of dropping them silently to disk-full/permission errors.
+		ytAuth.SetLogger(logger)
+	}
 	// Surface real auth state at startup, not just "credentials present."
 	// A typo'd client ID, expired token, or revoked OAuth grant should
 	// show up here — not when the volunteer clicks Go Live Sunday morning.
@@ -68,10 +73,16 @@ func main() {
 		}
 	}
 
-	// Schedule store.
-	schedStore, err := schedule.NewStore(filepath.Join(dataDir, "schedules.json"))
+	// Schedule store. A corrupt file is moved aside to schedules.json.corrupt-<unix>
+	// and we start with an empty store — better than refusing to launch
+	// and missing the next service entirely. The recovery warning is
+	// surfaced as a log line so the operator can investigate.
+	schedStore, recovery, err := schedule.NewStore(filepath.Join(dataDir, "schedules.json"))
 	if err != nil {
 		logger.Fatalf("failed to initialize schedule store: %v", err)
+	}
+	if recovery != nil {
+		logger.Printf("schedule store: %v", recovery)
 	}
 
 	// HLS output server.

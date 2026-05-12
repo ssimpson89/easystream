@@ -1,23 +1,30 @@
 package schedule
 
 import (
+	"context"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 type fakeStreamController struct {
+	mu          sync.Mutex
 	started     bool
 	presetID    string
 	ingestURL   string
 	streamKey   string
 	broadcastID string
 	streamID    string
+	startCalls  int
 }
 
 func (f *fakeStreamController) StartWithIngest(presetID, ingestURL, streamKey, broadcastID, streamID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.started = true
+	f.startCalls++
 	f.presetID = presetID
 	f.ingestURL = ingestURL
 	f.streamKey = streamKey
@@ -26,35 +33,71 @@ func (f *fakeStreamController) StartWithIngest(presetID, ingestURL, streamKey, b
 	return nil
 }
 
-func (f *fakeStreamController) StopStream() { f.started = false }
-
-func (f *fakeStreamController) IsStreaming() bool { return f.started }
-
-type fakeYouTubeController struct {
-	created int
-	bound   int
+func (f *fakeStreamController) StopStream() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.started = false
 }
 
-func (f *fakeYouTubeController) IsAuthenticated() bool { return true }
+func (f *fakeStreamController) IsStreaming() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.started
+}
 
-func (f *fakeYouTubeController) CreateBroadcast(title, description string, scheduledStart time.Time, privacy string) (string, error) {
-	f.created++
+type fakeBroadcastController struct {
+	mu                   sync.Mutex
+	createBroadcastCalls int
+	createStreamCalls    int
+	transitionCalls      int
+	cancelCalls          int
+	completeCalls        int
+}
+
+func (f *fakeBroadcastController) IsAuthenticated() bool { return true }
+
+func (f *fakeBroadcastController) CreateBroadcast(ctx context.Context, title, description string, scheduledStart time.Time, privacy string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createBroadcastCalls++
 	return "broadcast-1", nil
 }
 
-func (f *fakeYouTubeController) EnsureStream(presetID string) (string, string, string, error) {
+func (f *fakeBroadcastController) CreateBoundStream(ctx context.Context, broadcastID, presetID string) (string, string, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createStreamCalls++
 	return "stream-1", "rtmp://example/live", "key-1", nil
 }
 
-func (f *fakeYouTubeController) BindBroadcast(broadcastID, streamID string) error {
-	f.bound++
-	return nil
+func (f *fakeBroadcastController) StartTransitionToLive(broadcastID, streamID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.transitionCalls++
 }
 
-func (f *fakeYouTubeController) TransitionBroadcast(broadcastID, status string) error { return nil }
+func (f *fakeBroadcastController) CancelTransition() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelCalls++
+}
 
-func TestSchedulerStartsDueEventWithoutThirtyMinutePreparation(t *testing.T) {
-	store, err := NewStore(t.TempDir() + "/schedules.json")
+func (f *fakeBroadcastController) CompleteBroadcast(broadcastID, streamID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.completeCalls++
+}
+
+// newTestScheduler builds a Scheduler with zero prep lead and zero preroll
+// so tests can fire the lifecycle in a single tick.
+func newTestScheduler(t *testing.T, store *Store, stream StreamController, broadcast BroadcastController) *Scheduler {
+	t.Helper()
+	return NewSchedulerWithLeads(store, stream, broadcast,
+		log.New(testWriter{t}, "", 0), 0, 0)
+}
+
+func TestSchedulerStartsDueEvent(t *testing.T) {
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,12 +114,12 @@ func TestSchedulerStartsDueEventWithoutThirtyMinutePreparation(t *testing.T) {
 	}
 
 	stream := &fakeStreamController{}
-	yt := &fakeYouTubeController{}
-	s := NewScheduler(store, stream, yt, log.New(testWriter{t}, "", 0))
-	s.tick()
+	yt := &fakeBroadcastController{}
+	s := newTestScheduler(t, store, stream, yt)
+	s.tick(context.Background())
 
-	if !stream.started {
-		t.Fatal("expected due event to start without prior 30-minute broadcast preparation")
+	if !stream.IsStreaming() {
+		t.Fatal("expected due event to start")
 	}
 	if stream.broadcastID != "broadcast-1" || stream.streamID != "stream-1" {
 		t.Fatalf("unexpected IDs: broadcast=%q stream=%q", stream.broadcastID, stream.streamID)
@@ -84,19 +127,22 @@ func TestSchedulerStartsDueEventWithoutThirtyMinutePreparation(t *testing.T) {
 	if stream.ingestURL != "rtmp://example/live" || stream.streamKey != "key-1" {
 		t.Fatalf("unexpected ingest: url=%q key=%q", stream.ingestURL, stream.streamKey)
 	}
-	if yt.created != 1 || yt.bound != 1 {
-		t.Fatalf("expected one create and bind, got create=%d bind=%d", yt.created, yt.bound)
+	yt.mu.Lock()
+	defer yt.mu.Unlock()
+	if yt.createBroadcastCalls != 1 || yt.createStreamCalls != 1 || yt.transitionCalls != 1 {
+		t.Fatalf("unexpected call counts: create=%d stream=%d transition=%d",
+			yt.createBroadcastCalls, yt.createStreamCalls, yt.transitionCalls)
 	}
 }
 
 func TestSchedulerDoesNotPrepareFutureEventEarly(t *testing.T) {
-	store, err := NewStore(t.TempDir() + "/schedules.json")
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = store.CreateOverride(Override{
 		Name:        "Soon",
-		StartTime:   time.Now().UTC().Add(10 * time.Minute),
+		StartTime:   time.Now().UTC().Add(1 * time.Hour),
 		DurationMin: 30,
 		PresetID:    "recommended",
 		Title:       "Soon",
@@ -107,20 +153,64 @@ func TestSchedulerDoesNotPrepareFutureEventEarly(t *testing.T) {
 	}
 
 	stream := &fakeStreamController{}
-	yt := &fakeYouTubeController{}
+	yt := &fakeBroadcastController{}
+	// Use real default prep lead so 1 hour out really is "before prep".
 	s := NewScheduler(store, stream, yt, log.New(testWriter{t}, "", 0))
-	s.tick()
+	s.tick(context.Background())
 
-	if stream.started {
+	if stream.IsStreaming() {
 		t.Fatal("did not expect future event to start before scheduled time")
 	}
-	if yt.created != 0 || yt.bound != 0 {
-		t.Fatalf("did not expect future event to be prepared early, got create=%d bind=%d", yt.created, yt.bound)
+	yt.mu.Lock()
+	defer yt.mu.Unlock()
+	if yt.createBroadcastCalls != 0 {
+		t.Fatalf("did not expect future event to be prepared early, got %d creates", yt.createBroadcastCalls)
+	}
+}
+
+// TestSchedulerPrepCreatesBroadcastAhead verifies that an event inside
+// the prep window but before its start time gets the broadcast created
+// without starting FFmpeg.
+func TestSchedulerPrepCreatesBroadcastAhead(t *testing.T) {
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Event starts in 30 seconds, with a 1-minute prep lead.
+	_, err = store.CreateOverride(Override{
+		Name:        "Soon",
+		StartTime:   time.Now().UTC().Add(30 * time.Second),
+		DurationMin: 30,
+		PresetID:    "recommended",
+		Title:       "Soon",
+		Privacy:     "unlisted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &fakeStreamController{}
+	yt := &fakeBroadcastController{}
+	// prepLead=1m so the event is in prep window; preroll=0 so it does
+	// NOT yet start FFmpeg (still 30s before start).
+	s := NewSchedulerWithLeads(store, stream, yt,
+		log.New(testWriter{t}, "", 0), time.Minute, 0)
+	s.tick(context.Background())
+
+	if stream.IsStreaming() {
+		t.Fatal("expected FFmpeg NOT to start yet — still before StartTime")
+	}
+	yt.mu.Lock()
+	defer yt.mu.Unlock()
+	if yt.createBroadcastCalls != 1 {
+		t.Fatalf("expected broadcast to be pre-created, got %d", yt.createBroadcastCalls)
+	}
+	if yt.transitionCalls != 0 {
+		t.Fatalf("transition should not start until preroll: got %d", yt.transitionCalls)
 	}
 }
 
 func TestSchedulerStartsRecurringEventThatJustBecameDue(t *testing.T) {
-	store, err := NewStore(t.TempDir() + "/schedules.json")
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,20 +232,22 @@ func TestSchedulerStartsRecurringEventThatJustBecameDue(t *testing.T) {
 	}
 
 	stream := &fakeStreamController{}
-	yt := &fakeYouTubeController{}
-	s := NewScheduler(store, stream, yt, log.New(testWriter{t}, "", 0))
-	s.tick()
+	yt := &fakeBroadcastController{}
+	s := newTestScheduler(t, store, stream, yt)
+	s.tick(context.Background())
 
-	if !stream.started {
+	if !stream.IsStreaming() {
 		t.Fatal("expected recurring event in its active window to start")
 	}
-	if yt.created != 1 || yt.bound != 1 {
-		t.Fatalf("expected one create and bind, got create=%d bind=%d", yt.created, yt.bound)
+	yt.mu.Lock()
+	defer yt.mu.Unlock()
+	if yt.createBroadcastCalls != 1 {
+		t.Fatalf("expected one broadcast create, got %d", yt.createBroadcastCalls)
 	}
 }
 
 func TestPausedScheduleDoesNotCreateUpcomingEvent(t *testing.T) {
-	store, err := NewStore(t.TempDir() + "/schedules.json")
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +274,7 @@ func TestPausedScheduleDoesNotCreateUpcomingEvent(t *testing.T) {
 }
 
 func TestManualStopSuppressesCurrentRecurringOccurrence(t *testing.T) {
-	store, err := NewStore(t.TempDir() + "/schedules.json")
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,22 +296,104 @@ func TestManualStopSuppressesCurrentRecurringOccurrence(t *testing.T) {
 	}
 
 	stream := &fakeStreamController{}
-	yt := &fakeYouTubeController{}
-	s := NewScheduler(store, stream, yt, log.New(testWriter{t}, "", 0))
-	s.tick()
-	if !stream.started {
+	yt := &fakeBroadcastController{}
+	s := newTestScheduler(t, store, stream, yt)
+	s.tick(context.Background())
+	if !stream.IsStreaming() {
 		t.Fatal("expected first tick to start active occurrence")
 	}
 	s.StopActive()
-	if stream.started {
+	if stream.IsStreaming() {
 		t.Fatal("expected StopActive to stop stream")
 	}
-	s.tick()
-	if stream.started {
+	s.tick(context.Background())
+	if stream.IsStreaming() {
 		t.Fatal("did not expect stopped occurrence to restart inside same event window")
 	}
-	if yt.created != 1 {
-		t.Fatalf("expected exactly one broadcast creation, got %d", yt.created)
+	yt.mu.Lock()
+	defer yt.mu.Unlock()
+	if yt.createBroadcastCalls != 1 {
+		t.Fatalf("expected exactly one broadcast creation, got %d", yt.createBroadcastCalls)
+	}
+	if yt.cancelCalls < 1 {
+		t.Fatalf("expected at least one cancel call, got %d", yt.cancelCalls)
+	}
+	if yt.completeCalls != 1 {
+		t.Fatalf("expected exactly one complete call, got %d", yt.completeCalls)
+	}
+}
+
+// failingBroadcastController simulates a YouTube API outage on
+// CreateBroadcast so we can verify the backoff doesn't create one
+// orphan broadcast per tick.
+type failingBroadcastController struct {
+	mu             sync.Mutex
+	attempts       int
+	transitionMu   sync.Mutex
+	cancelCalls    int
+	completeCalls  int
+}
+
+func (f *failingBroadcastController) IsAuthenticated() bool { return true }
+func (f *failingBroadcastController) CreateBroadcast(ctx context.Context, title, description string, scheduledStart time.Time, privacy string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attempts++
+	return "", contextErr{}
+}
+func (f *failingBroadcastController) CreateBoundStream(ctx context.Context, broadcastID, presetID string) (string, string, string, error) {
+	return "", "", "", contextErr{}
+}
+func (f *failingBroadcastController) StartTransitionToLive(broadcastID, streamID string) {}
+func (f *failingBroadcastController) CancelTransition() {
+	f.transitionMu.Lock()
+	f.cancelCalls++
+	f.transitionMu.Unlock()
+}
+func (f *failingBroadcastController) CompleteBroadcast(broadcastID, streamID string) {
+	f.transitionMu.Lock()
+	f.completeCalls++
+	f.transitionMu.Unlock()
+}
+
+type contextErr struct{}
+
+func (contextErr) Error() string { return "youtube api down" }
+
+func TestSchedulerBacksOffOnPrepFailure(t *testing.T) {
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.CreateOverride(Override{
+		Name:        "Soon",
+		StartTime:   time.Now().UTC().Add(-1 * time.Minute),
+		DurationMin: 30,
+		PresetID:    "recommended",
+		Title:       "Soon",
+		Privacy:     "unlisted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &fakeStreamController{}
+	yt := &failingBroadcastController{}
+	s := newTestScheduler(t, store, stream, yt)
+
+	// Call tick many times — backoff should keep create attempts down.
+	for i := 0; i < 50; i++ {
+		s.tick(context.Background())
+	}
+	yt.mu.Lock()
+	attempts := yt.attempts
+	yt.mu.Unlock()
+	// With 5s minimum backoff and zero real time elapsed, we expect at
+	// most a small handful of attempts — definitely not 50.
+	if attempts > 5 {
+		t.Fatalf("expected backoff to limit attempts, got %d", attempts)
+	}
+	if attempts < 1 {
+		t.Fatalf("expected at least one attempt, got %d", attempts)
 	}
 }
 

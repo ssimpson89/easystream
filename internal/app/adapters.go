@@ -1,11 +1,11 @@
 package app
 
 import (
+	"context"
 	"time"
 
 	"github.com/ssimpson89/easystream/internal/ffmpeg"
 	"github.com/ssimpson89/easystream/internal/quality"
-	"github.com/ssimpson89/easystream/internal/youtube"
 )
 
 // streamControllerAdapter implements schedule.StreamController on top of
@@ -44,6 +44,9 @@ func (a *streamControllerAdapter) StartWithIngest(presetID, ingestURL, streamKey
 	}
 	a.server.resetDestinationBadCount()
 	a.server.markLive("scheduled", broadcastID, streamID)
+	if a.server.adaptive != nil {
+		a.server.adaptive.OnStreamStart(config.Preset.ID)
+	}
 	return nil
 }
 
@@ -52,8 +55,12 @@ func (a *streamControllerAdapter) StopStream() {
 	if a.server.preview != nil {
 		a.server.preview.Unblock()
 	}
+	if a.server.adaptive != nil {
+		a.server.adaptive.OnStreamStop()
+	}
 	a.server.markIdle()
-	// Caller (scheduler) already calls TransitionBroadcast itself; just clear local state.
+	// CompleteBroadcast (called by the scheduler) handles the YouTube
+	// side of the lifecycle; just clear local state here.
 	a.server.mu.Lock()
 	a.server.activeBroadcastID = ""
 	a.server.activeStreamID = ""
@@ -67,44 +74,63 @@ func (a *streamControllerAdapter) IsStreaming() bool {
 	return status.State == ffmpeg.StateRunning || status.State == ffmpeg.StateDegraded || status.State == ffmpeg.StateStarting
 }
 
-// ytControllerAdapter implements schedule.YouTubeController on top of the
-// YouTube API client + Auth.
-type ytControllerAdapter struct {
-	client *youtube.Client
-	auth   *youtube.Auth
+// broadcastControllerAdapter implements schedule.BroadcastController on
+// top of the Server's YouTube client + Auth + transition state. The
+// scheduler delegates all YouTube lifecycle work here so it never has to
+// touch HTTP or OAuth directly.
+type broadcastControllerAdapter struct {
+	server *Server
 }
 
-func (a *ytControllerAdapter) IsAuthenticated() bool {
-	return a.auth.IsAuthenticated()
+func (a *broadcastControllerAdapter) IsAuthenticated() bool {
+	return a.server.ytAuth != nil && a.server.ytAuth.IsAuthenticated()
 }
 
-func (a *ytControllerAdapter) CreateBroadcast(title, description string, scheduledStart time.Time, privacy string) (string, error) {
-	b, err := a.client.CreateBroadcast(title, description, scheduledStart, privacy)
+func (a *broadcastControllerAdapter) CreateBroadcast(ctx context.Context, title, description string, scheduledStart time.Time, privacy string) (string, error) {
+	b, err := a.server.ytClient.CreateBroadcast(title, description, scheduledStart, privacy)
 	if err != nil {
 		return "", err
 	}
 	return b.ID, nil
 }
 
-func (a *ytControllerAdapter) EnsureStream(presetID string) (streamID, ingestURL, streamKey string, err error) {
+func (a *broadcastControllerAdapter) CreateBoundStream(ctx context.Context, broadcastID, presetID string) (string, string, string, error) {
 	preset, ok := quality.ByID(presetID)
 	if !ok {
 		preset = quality.Default()
 	}
-	// Create a fresh, non-reusable stream for each broadcast to avoid
-	// binding multiple active broadcasts to the same ingest endpoint.
 	title := "EasyStream - " + preset.Name + " - " + time.Now().UTC().Format("20060102-150405")
-	stream, err := a.client.CreateStreamForBroadcast(title, preset.Resolution(), preset.FPS)
+	stream, err := a.server.ytClient.CreateStreamForBroadcast(title, preset.Resolution(), preset.FPS)
 	if err != nil {
+		return "", "", "", err
+	}
+	if err := a.server.ytClient.BindBroadcast(broadcastID, stream.ID); err != nil {
+		// Best-effort cleanup of the orphan stream so we don't leak it
+		// on a transient bind failure.
+		_ = a.server.ytClient.DeleteStream(stream.ID)
 		return "", "", "", err
 	}
 	return stream.ID, stream.IngestURL, stream.StreamKey, nil
 }
 
-func (a *ytControllerAdapter) BindBroadcast(broadcastID, streamID string) error {
-	return a.client.BindBroadcast(broadcastID, streamID)
+func (a *broadcastControllerAdapter) StartTransitionToLive(broadcastID, streamID string) {
+	a.server.startTransitionGoroutine(broadcastID, streamID)
 }
 
-func (a *ytControllerAdapter) TransitionBroadcast(broadcastID, status string) error {
-	return a.client.TransitionBroadcast(broadcastID, status)
+func (a *broadcastControllerAdapter) CancelTransition() {
+	a.server.cancelTransitionGoroutine()
+}
+
+func (a *broadcastControllerAdapter) CompleteBroadcast(broadcastID, streamID string) {
+	if broadcastID == "" {
+		return
+	}
+	if err := a.server.ytClient.TransitionBroadcast(broadcastID, "complete"); err != nil {
+		a.server.logger.Printf("complete broadcast %s: %v", broadcastID, err)
+	}
+	if streamID != "" {
+		if err := a.server.ytClient.DeleteStream(streamID); err != nil {
+			a.server.logger.Printf("delete stream %s: %v", streamID, err)
+		}
+	}
 }

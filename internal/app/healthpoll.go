@@ -14,12 +14,18 @@ const (
 
 // runHealthPoller polls YouTube for the bound stream's health every 15s
 // while we have an active broadcast. Updates s.streamHealth so the UI
-// confidence indicators reflect what YouTube actually sees.
-func (s *Server) runHealthPoller() {
+// confidence indicators reflect what YouTube actually sees. Exits when
+// stop is closed (Server.Close path).
+func (s *Server) runHealthPoller(stop <-chan struct{}) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.safePollStreamHealth()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			s.safePollStreamHealth()
+		}
 	}
 }
 

@@ -3,8 +3,9 @@ package app
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"time"
+
+	"github.com/ssimpson89/easystream/internal/atomicfile"
 )
 
 // streamIntent records the operator's intent to be live, persisted across
@@ -45,14 +46,11 @@ func loadStreamIntent(path string) (streamIntent, error) {
 }
 
 func saveStreamIntent(path string, i streamIntent) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(i, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	return atomicfile.Write(path, data, 0600)
 }
 
 func clearStreamIntent(path string) {
