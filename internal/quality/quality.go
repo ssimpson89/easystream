@@ -33,8 +33,14 @@ func (p Preset) AudioBitrate() string {
 	return fmt.Sprintf("%dk", p.AudioKbps)
 }
 
+// BufferSize is the VBV buffer (-bufsize). Industry practice for true
+// CBR live streaming is bufsize == maxrate (1-second VBV) so the
+// encoder maintains a constant rate without burst headroom that masks
+// network congestion. A larger buffer lets the encoder save up bits
+// during easy scenes and burst on hard ones — fine for VOD, bad for
+// live where receivers expect a steady stream.
 func (p Preset) BufferSize() string {
-	return fmt.Sprintf("%dk", p.VideoKbps*2)
+	return fmt.Sprintf("%dk", p.VideoKbps)
 }
 
 // Presets are aligned with YouTube's recommended H.264 bitrate settings.

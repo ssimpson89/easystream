@@ -349,14 +349,32 @@ func (c Config) Args() ([]string, error) {
 		"-color_primaries", "bt709",
 		"-color_trc", "bt709",
 		"-colorspace", "bt709",
-		// Audio filter: compute per-second RMS level and print to stderr so
-		// the supervisor can detect silent audio (stuck mic, wrong source).
-		// astats with metadata=1:reset=1:length=1 emits a stat every 1s.
-		// ametadata file output bypasses -loglevel warning suppression while
-		// keeping stdout reserved for FFmpeg's machine-readable progress stream.
-		"-af", "astats=metadata=1:reset=1:length=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr",
+		// Audio filter chain:
+		//   1. aresample=async=1000:first_pts=0 — explicit resampler
+		//      handles mic→encoder rate mismatch (AVFoundation captures
+		//      MacBook mics at 44.1k, we force 48k). Without an explicit
+		//      filter FFmpeg's implicit resampler can desync over time,
+		//      producing periodic audio dropouts (~1 cutout/second on
+		//      affected systems). async=1000 corrects PTS drift up to
+		//      1s smoothly; first_pts=0 zero-aligns the audio start.
+		//   2. astats=metadata=1:reset=1:length=1 — emits per-second
+		//      RMS stats consumed by the supervisor for silent-audio
+		//      detection (stuck mic, wrong source).
+		//   3. ametadata=print — writes the stats to /dev/stderr; this
+		//      bypasses -loglevel warning suppression while keeping
+		//      stdout reserved for FFmpeg's progress stream.
+		"-af", "aresample=async=1000:first_pts=0,astats=metadata=1:reset=1:length=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr",
 		"-c:a", "aac",
 		"-b:a", c.Preset.AudioBitrate(),
+		// 48 kHz over YouTube's recommended 44.1 kHz for stereo:
+		//   - matches every other live destination's preferred rate
+		//     (Cloudflare Stream, Twitch, MediaMTX, SRT receivers)
+		//   - matches the broadcast/SDI standard, so HDMI/SDI feeds
+		//     pass through without resampling
+		//   - YouTube accepts 48 kHz fine — their 44.1 stereo line is
+		//     a recommendation, not a requirement
+		//   - aresample (above) handles 44.1→48 for consumer macOS
+		//     mics smoothly via async=1000 PTS correction
 		"-ar", "48000",
 		"-ac", "2",
 	)
@@ -463,14 +481,23 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 		}
 
 	case EncoderNVENC:
-		// NVIDIA NVENC. Uses -preset p4 (balanced speed/quality) and
-		// CBR rate control. -rc cbr requires -b:v to be set (done by caller).
+		// NVIDIA NVENC. Industry-standard live CBR settings:
+		//   -rc cbr           true constant bitrate (with -b:v from caller)
+		//   -no-scenecut 1    no auto-inserted IDR on scene change — keep
+		//                     keyframes on the configured GOP boundaries
+		//                     so receivers can segment cleanly
+		//   -forced-idr 1     every keyframe is an IDR (closed GOP)
+		//   -strict_gop 1     no GOP-boundary slippage; receivers can
+		//                     count frames to predict the next keyframe
 		return []string{
 			"-c:v", "h264_nvenc",
 			"-preset", "p4",
 			"-profile:v", "high",
 			"-level:v", "4.1",
 			"-rc", "cbr",
+			"-no-scenecut", "1",
+			"-forced-idr", "1",
+			"-strict_gop", "1",
 			"-bf", "2",
 			"-g", gop,
 			"-keyint_min", gop,
@@ -506,6 +533,16 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 		// No -tune zerolatency: it disables B-frames, which YouTube
 		// explicitly recommends keeping (2 B-frames). Latency doesn't
 		// matter for broadcast streaming.
+		//
+		// x264-params:
+		//   nal-hrd=cbr   signal CBR in the bitstream HRD parameters
+		//                 (Cloudflare and other strict receivers check
+		//                 this and may reject streams without it)
+		//   open-gop=0    closed GOP — every keyframe is IDR, no
+		//                 frames reference across keyframe boundaries
+		//   scenecut=0    no scene-change keyframes; keyframes only at
+		//                 the configured GOP boundary, so receivers
+		//                 segment predictably
 		return []string{
 			"-c:v", "libx264",
 			"-preset", "veryfast",
@@ -515,10 +552,7 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 			"-sc_threshold", "0",
 			"-bf", "2",
 			"-refs", "1",
-			// Closed GOP: every keyframe is IDR and no frame references
-			// across keyframe boundaries. Required by Cloudflare Stream;
-			// preferred by YouTube/Twitch/etc.
-			"-x264-params", "open-gop=0",
+			"-x264-params", "nal-hrd=cbr:open-gop=0:scenecut=0:keyint=" + gop + ":min-keyint=" + gop,
 		}
 	}
 }

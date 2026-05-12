@@ -23,16 +23,19 @@ func TestArgsIncludeBandwidthAndRecoveryOptions(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, expected := range []string{
 		"-b:v 10000k",       // YT-recommended 1080p30
-		"-maxrate 10000k",   // CBR
-		"-bufsize 20000k",   // 2x bitrate
+		"-maxrate 10000k",   // CBR target
+		"-bufsize 10000k",   // 1s VBV (bufsize == maxrate) — true CBR
 		"-g 60",             // 2-second keyframe interval
 		"-bf 2",             // YT: 2 B-frames
 		"-refs 1",           // YT: 1 reference frame
 		"-profile:v high",   // YT requires High profile for CABAC
 		"-colorspace bt709", // YT: Rec.709 SDR
-		"open-gop=0",        // Cloudflare requires closed GOP
+		"nal-hrd=cbr",       // CBR signalling in bitstream HRD
+		"open-gop=0",        // Closed GOP (Cloudflare hard requirement)
+		"scenecut=0",        // No scene-change keyframes; predictable segmenting
 		"-tcp_keepalive 1",
 		"-rw_timeout 12000000",
+		"aresample=async=1000:first_pts=0", // explicit resampler — fixes mic 44.1→48 drift
 		"ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr",
 		"rtmps://a.rtmps.youtube.com/live2/abc-def-ghi",
 	} {
