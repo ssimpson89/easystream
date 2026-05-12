@@ -517,6 +517,41 @@ func previewInputs(config ffmpeg.Config) previewInputBuild {
 			},
 			videoMap: "0:v", audioMap: "1:a",
 		}
+	case ffmpeg.InputNetwork:
+		// Preview ingests the same URL as the main pipeline (separate
+		// ffmpeg process, separate RTSP/SRT connection to the source).
+		// Same per-input tuning as buildNetworkInput so a mid-GOP
+		// start doesn't produce a wall of mmco decoder errors and an
+		// empty WebRTC stream.
+		url := strings.TrimSpace(config.Input.URL)
+		scheme := ""
+		if i := strings.Index(url, "://"); i > 0 {
+			scheme = strings.ToLower(url[:i])
+		}
+		netArgs := []string{
+			"-fflags", "+discardcorrupt+genpts",
+			"-analyzeduration", "1000000",
+			"-probesize", "1000000",
+		}
+		switch scheme {
+		case "rtsp", "rtsps":
+			netArgs = append(netArgs, "-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp")
+		case "udp", "rtp":
+			netArgs = append(netArgs, "-fifo_size", "1000000", "-overrun_nonfatal", "1")
+		case "http", "https":
+			netArgs = append(netArgs,
+				"-reconnect", "1",
+				"-reconnect_streamed", "1",
+				"-reconnect_delay_max", "5",
+				"-multiple_requests", "1",
+			)
+		}
+		netArgs = append(netArgs, "-i", url)
+		if config.Input.NoAudio {
+			netArgs = append(netArgs, "-f", "lavfi", "-i", previewSilentAudio)
+			return previewInputBuild{args: netArgs, videoMap: "0:v", audioMap: "1:a"}
+		}
+		return previewInputBuild{args: netArgs, videoMap: "0:v", audioMap: "0:a"}
 	default:
 		backend := config.Input.Backend
 		if backend == "" {
