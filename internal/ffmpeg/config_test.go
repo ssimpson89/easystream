@@ -240,14 +240,20 @@ func srtListenerCfg(port int, passphrase string) Config {
 
 func TestSRTListenerURLConstruction(t *testing.T) {
 	got := SRTListenerURL(9000, "")
-	want := "srt://0.0.0.0:9000?mode=listener&latency=300000"
-	if got != want {
-		t.Errorf("SRTListenerURL(9000,\"\") = %q, want %q", got, want)
+	for _, want := range []string{
+		"srt://0.0.0.0:9000",
+		"mode=listener",
+		"transtype=live",
+		"latency=300000",
+		"tlpktdrop=1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("SRTListenerURL(9000,\"\") missing %q in %q", want, got)
+		}
 	}
 
 	got = SRTListenerURL(0, "") // 0 → default 9999
-	want = "srt://0.0.0.0:9999?mode=listener&latency=300000"
-	if got != want {
+	if !strings.Contains(got, "srt://0.0.0.0:9999") {
 		t.Errorf("SRTListenerURL(0,\"\") fell-through default port: got %q", got)
 	}
 
@@ -270,12 +276,55 @@ func TestArgsSRTListenerInput(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, expected := range []string{
 		"-fflags discardcorrupt+genpts",
-		"-i srt://0.0.0.0:9000?mode=listener&latency=300000",
+		"-i srt://0.0.0.0:9000?mode=listener",
+		"transtype=live",
+		"tlpktdrop=1",
 		"-map [v]",
 		"-map [a_enc]",
 	} {
 		if !strings.Contains(joined, expected) {
 			t.Errorf("expected %q in SRT listener args: %s", expected, joined)
+		}
+	}
+}
+
+func TestSRTListenerValidateRejectsEasyStreamPorts(t *testing.T) {
+	for _, port := range []int{8080, 8888, 52001, 52002} {
+		cfg := srtListenerCfg(port, "")
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("expected validation to reject reserved port %d", port)
+		}
+	}
+}
+
+func TestSRTListenerValidateBoundaryPorts(t *testing.T) {
+	for _, port := range []int{1024, 65535} {
+		cfg := srtListenerCfg(port, "")
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("port %d should be valid, got %v", port, err)
+		}
+	}
+	for _, port := range []int{1023, 65536} {
+		cfg := srtListenerCfg(port, "")
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("port %d should be invalid", port)
+		}
+	}
+}
+
+func TestSRTListenerValidateBoundaryPassphrase(t *testing.T) {
+	tenChars := "1234567890"
+	seventyNine := strings.Repeat("a", 79)
+	for _, pp := range []string{tenChars, seventyNine} {
+		cfg := srtListenerCfg(9999, pp)
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("passphrase len %d should be valid, got %v", len(pp), err)
+		}
+	}
+	for _, pp := range []string{"123456789", strings.Repeat("a", 80)} {
+		cfg := srtListenerCfg(9999, pp)
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("passphrase len %d should be invalid", len(pp))
 		}
 	}
 }

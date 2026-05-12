@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ssimpson89/easystream/internal/ffmpeg"
@@ -18,25 +19,92 @@ import (
 // configure an SRT listener so they know what URL to hand an
 // upstream encoder (srt://<one-of-these-ips>:<port>).
 //
-// Filters out loopback (127.x.x.x) and IPv6 link-local addresses
-// since neither is useful for "give this address to another
-// machine on the LAN."
+// Filters aggressively so the operator doesn't see a wall of VPN
+// tunnels, Docker bridges, and link-local junk:
+//   - loopback (127.x.x.x)
+//   - link-local v4 (169.254.x.x — DHCP-failed addresses)
+//   - down or pointpoint interfaces (VPN tunnels)
+//   - common virtual interface name prefixes
+//   - IPv6 entirely (operators expect "192.168.x.x")
+//
+// Cached for cacheLocalIPsFor; net.InterfaceAddrs is cheap but the
+// snapshot is published on every SSE state event, and we'd rather
+// not pay even a syscall per push.
+var (
+	localIPsMu       sync.RWMutex
+	localIPsCache    []string
+	localIPsCachedAt time.Time
+)
+
+const cacheLocalIPsFor = 10 * time.Second
+
+// excludedInterfacePrefixes are interface name prefixes that produce
+// addresses we don't want operators to see: VPN tunnels, Docker
+// bridges, Apple wireless-direct, virtual machines.
+var excludedInterfacePrefixes = []string{
+	"utun", "ipsec", "ppp", "tun", "tap",
+	"awdl", "llw", "anpi", "ap",
+	"bridge", "docker", "vboxnet", "vmnet",
+}
+
+func interfaceExcluded(name string) bool {
+	for _, p := range excludedInterfacePrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func localNetworkIPs() []string {
-	addrs, err := net.InterfaceAddrs()
+	localIPsMu.RLock()
+	if time.Since(localIPsCachedAt) < cacheLocalIPsFor && localIPsCache != nil {
+		out := append([]string{}, localIPsCache...)
+		localIPsMu.RUnlock()
+		return out
+	}
+	localIPsMu.RUnlock()
+
+	out := computeLocalNetworkIPs()
+	localIPsMu.Lock()
+	localIPsCache = out
+	localIPsCachedAt = time.Now()
+	localIPsMu.Unlock()
+	return append([]string{}, out...)
+}
+
+func computeLocalNetworkIPs() []string {
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
 	var out []string
-	for _, a := range addrs {
-		ipNet, ok := a.(*net.IPNet)
-		if !ok || ipNet.IP.IsLoopback() {
+	for _, iface := range ifaces {
+		// Must be up + running, not a point-to-point link (VPN).
+		if iface.Flags&net.FlagUp == 0 {
 			continue
 		}
-		ip4 := ipNet.IP.To4()
-		if ip4 == nil {
-			continue // skip IPv6 for now — operators expect "192.168.x.x"
+		if iface.Flags&net.FlagPointToPoint != 0 {
+			continue
 		}
-		out = append(out, ip4.String())
+		if interfaceExcluded(iface.Name) {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok || ipNet.IP.IsLoopback() || ipNet.IP.IsLinkLocalUnicast() {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil {
+				continue // skip IPv6 for now
+			}
+			out = append(out, ip4.String())
+		}
 	}
 	return out
 }

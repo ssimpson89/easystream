@@ -713,6 +713,9 @@ label:where(:not(.checkbox-row)) {
  * to your upstream encoder" hint. Wider than inline <code>, with a
  * left border so it reads as a callout. */
 .publish-url {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin: 8px 0 12px;
   padding: 10px 12px;
   border-left: 3px solid var(--accent);
@@ -720,11 +723,29 @@ label:where(:not(.checkbox-row)) {
   border-radius: 4px;
   overflow-x: auto;
 }
+.publish-url.warn {
+  border-left-color: var(--warn);
+  color: var(--muted);
+  font-size: 13px;
+}
 .publish-url code {
+  flex: 1 1 auto;
   font-size: 13px;
   color: var(--text);
   word-break: break-all;
 }
+.publish-url .btn-link {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  min-height: 0;
+}
+.publish-url .btn-link:hover { background: var(--panel); }
 input, select, textarea {
   width: 100%;
   min-height: 40px;

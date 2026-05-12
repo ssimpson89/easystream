@@ -305,7 +305,15 @@
               <p class="hint">
                 Point your upstream encoder (OBS, vMix, hardware) at this URL:
               </p>
-              <p class="publish-url"><code x-text="srtListenerPublishURL"></code></p>
+              <div class="publish-url" x-show="hasSRTPublishURL">
+                <code x-text="srtListenerPublishURL"></code>
+                <button type="button" class="btn-link" @click="copySRTPublishURL()">Copy</button>
+              </div>
+              <p class="publish-url warn" x-show="!hasSRTPublishURL">
+                No reachable IP address was detected on this machine. Use the
+                machine's LAN IP — find it via System Settings &rarr; Network or
+                <code>ifconfig</code>.
+              </p>
               <p class="hint" x-show="(localIPs || []).length > 1">
                 Multiple interfaces detected. If the encoder is on a different
                 LAN segment, swap the IP for one it can reach:

@@ -95,6 +95,22 @@ type Input struct {
 // the Haivision examples and most upstream encoder docs.
 const defaultSRTListenPort = 9999
 
+// reservedListenerPort reports whether the operator-picked SRT
+// listener port collides with a port EasyStream itself holds.
+// The supervisor would error with "address already in use" at
+// start; surfacing it in Validate gives a clearer message.
+func reservedListenerPort(port int) (bool, string) {
+	switch port {
+	case 8080:
+		return true, "EasyStream's web UI"
+	case 8888:
+		return true, "the local HLS playlist server"
+	case 52001, 52002:
+		return true, "the preview RTP pipeline"
+	}
+	return false, ""
+}
+
 // srtListenerLatencyUS is the receive-buffer latency (microseconds)
 // for SRT listener mode. libsrt defaults to 120 ms which is too
 // tight for the public internet; 300 ms gives upstream encoders
@@ -104,18 +120,25 @@ const srtListenerLatencyUS = 300000
 // SRTListenerURL builds the FFmpeg-side ingest URL for an SRT
 // listener configuration. Returns the form
 //
-//	srt://0.0.0.0:<port>?mode=listener&latency=300000[&passphrase=<x>]
+//	srt://0.0.0.0:<port>?mode=listener&transtype=live&latency=300000&tlpktdrop=1[&passphrase=<x>]
 //
-// libsrt rejects URLs with an empty host (the "srt://:port" form),
-// so we use 0.0.0.0 to bind on every interface. Operators hand
-// upstream encoders the *external* form (srt://<our-ip>:<port>...)
-// — that variant is built UI-side from the local network IPs we
-// expose in the API status snapshot.
+// Options:
+//   - 0.0.0.0 host because libsrt rejects "srt://:port" (empty host)
+//     with "Operation not supported: Bad parameters".
+//   - transtype=live is libsrt's default, but explicit avoids subtle
+//     surprises on older builds or encrypted variants.
+//   - tlpktdrop=1 lets the receiver drop late retransmits instead of
+//     blocking the receive queue indefinitely — important at the
+//     300 ms latency target.
+//
+// Operators hand upstream encoders the *external* form
+// (srt://<our-ip>:<port>...). That variant is built UI-side from
+// the local network IPs we expose in the API status snapshot.
 func SRTListenerURL(port int, passphrase string) string {
 	if port == 0 {
 		port = defaultSRTListenPort
 	}
-	q := fmt.Sprintf("mode=listener&latency=%d", srtListenerLatencyUS)
+	q := fmt.Sprintf("mode=listener&transtype=live&latency=%d&tlpktdrop=1", srtListenerLatencyUS)
 	if passphrase != "" {
 		q += "&passphrase=" + neturl.QueryEscape(passphrase)
 	}
@@ -433,14 +456,18 @@ func (c Config) Validate() error {
 		}
 	case InputSRTListener:
 		// Port must be in the user range (>1023 avoids requiring
-		// privileged binds) and not collide with the EasyStream
-		// web UI port — operators occasionally guess 8080.
+		// privileged binds) and not collide with EasyStream's own
+		// ports — operators occasionally guess 8080 (web UI) or the
+		// preview RTP ports.
 		port := c.Input.SRTListenPort
 		if port == 0 {
 			port = defaultSRTListenPort
 		}
 		if port < 1024 || port > 65535 {
 			return fmt.Errorf("SRT listener port must be 1024–65535, got %d", port)
+		}
+		if reserved, why := reservedListenerPort(port); reserved {
+			return fmt.Errorf("SRT listener port %d collides with %s; pick a different port", port, why)
 		}
 		// libsrt requires 10–79 char passphrases when set.
 		if pp := c.Input.SRTListenPassphrase; pp != "" {

@@ -307,8 +307,18 @@ func (s *Supervisor) progressStalledSince(started time.Time) (bool, string) {
 	s.mu.Lock()
 	status := s.status
 	after := s.cfg.ProgressStallAfter
+	inputKind := s.ffmpeg.Input.Kind
 	s.mu.Unlock()
 	now := time.Now()
+	// SRT listener mode blocks on srt_accept() until an upstream
+	// encoder connects — which can take far longer than 20 s if the
+	// operator configures EasyStream first and then walks to the
+	// upstream rig. Don't treat "no progress yet, no peer connected"
+	// as a stall. Once the first frame arrives the timestamp is set
+	// and the normal stall detection takes over.
+	if inputKind == InputSRTListener && status.LastProgress.UpdatedAt.IsZero() {
+		return false, ""
+	}
 	if !status.progressStalled(after, now) {
 		return false, ""
 	}
