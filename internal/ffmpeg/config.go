@@ -813,7 +813,13 @@ func (c Config) argsWithInputs(inputs inputBuild) ([]string, error) {
 		"-bufsize", c.Preset.BufferSize(),
 		"-g", gop,
 		"-fps_mode", "cfr",
-		"-r", fmt.Sprintf("%d", c.Preset.FPS),
+		// FPSExpr emits the exact rate — "30"/"60" for integer rates,
+		// "24000/1001" for NTSC-cinema 23.976. Using the rational
+		// form on cinema presets keeps cadence exact over service-
+		// length streams (24.000 would drift ~3.6 s per hour and
+		// force the muxer to drop frames). Pairs with -fps_mode cfr
+		// above to lock both the rate and CFR semantics.
+		"-r", c.Preset.FPSExpr(),
 		"-pix_fmt", "yuv420p",
 	)
 	args = append(args, c.audioEncoderArgs()...)
@@ -882,6 +888,12 @@ func (c Config) argsWithInputs(inputs inputBuild) ([]string, error) {
 // Each hardware encoder needs different flags because they don't share x264's
 // CLI options (no -preset veryfast, no -x264-params, etc.).
 func (c Config) encoderArgs(encoder Encoder, gop string) []string {
+	// H.264 level comes from the preset (4.1 for ≤1080p30, 4.2 for
+	// 1080p60, 5.0 for 1440p, etc.). x264/VideoToolbox/NVENC accept
+	// the dotted form ("4.1"); VAAPI/QSV use the dot-less integer
+	// form ("41"). Strip the dot once here.
+	level := c.Preset.Level()
+	levelNoDot := strings.ReplaceAll(level, ".", "")
 	switch encoder {
 	case EncoderVideoToolbox:
 		// Apple VideoToolbox (macOS). Uses hardware H.264 on Apple Silicon
@@ -902,7 +914,7 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 		return []string{
 			"-c:v", "h264_videotoolbox",
 			"-profile:v", "high",
-			"-level:v", "4.1",
+			"-level:v", level,
 			"-allow_sw", "1",
 			"-realtime", "1",
 			"-constant_bit_rate", "1",
@@ -922,7 +934,7 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 			"-c:v", "h264_nvenc",
 			"-preset", "p4",
 			"-profile:v", "high",
-			"-level:v", "4.1",
+			"-level:v", level,
 			"-rc", "cbr",
 			"-no-scenecut", "1",
 			"-forced-idr", "1",
@@ -940,7 +952,7 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 			"-vaapi_device", pickVAAPIRenderNode(),
 			"-c:v", "h264_vaapi",
 			"-profile:v", "high",
-			"-level", "41",
+			"-level", levelNoDot,
 			"-bf", "2",
 			"-g", gop,
 			"-keyint_min", gop,
@@ -952,7 +964,7 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 			"-c:v", "h264_qsv",
 			"-preset", "veryfast",
 			"-profile:v", "high",
-			"-level", "41",
+			"-level", levelNoDot,
 			"-bf", "2",
 			"-g", gop,
 			"-keyint_min", gop,
@@ -980,7 +992,7 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 			"-c:v", "libx264",
 			"-preset", "veryfast",
 			"-profile:v", "high",
-			"-level:v", "4.1",
+			"-level:v", level,
 			"-sc_threshold", "0",
 			"-bf", "2",
 			"-x264-params", "nal-hrd=cbr:filler=1:open-gop=0:scenecut=0:keyint=" + gop + ":min-keyint=" + gop,
@@ -1162,7 +1174,7 @@ func (c Config) buildInputs() (inputBuild, error) {
 			args: []string{
 				"-re",
 				"-f", "lavfi",
-				"-i", fmt.Sprintf("testsrc2=size=%s:rate=%d", c.Preset.Resolution(), c.Preset.FPS),
+				"-i", fmt.Sprintf("testsrc2=size=%s:rate=%d", c.Preset.Resolution(), c.Preset.FPS()),
 				"-f", "lavfi",
 				"-i", "sine=frequency=1000:sample_rate=48000",
 			},
@@ -1218,7 +1230,10 @@ func (c Config) buildInputs() (inputBuild, error) {
 				audio = resolved
 			}
 		}
-		fps := ProbeAVFoundationFramerate(c.Binary, device, c.Preset.FPS)
+		// FPSFloat (not FPS()) so 23.976 finds its exact device mode
+		// instead of tying with 24.000 — picking the rounded integer
+		// would defeat the whole point of the cinema preset.
+		fps := ProbeAVFoundationFramerate(c.Binary, device, c.Preset.FPSFloat())
 		if audio != "" {
 			return inputBuild{
 				args:     []string{"-f", "avfoundation", "-framerate", fps, "-i", device + ":" + audio},
@@ -1320,9 +1335,17 @@ func defaultString(value, fallback string) string {
 }
 
 // ProbeAVFoundationFramerate queries the given AVFoundation video device index
-// for its supported framerates, and returns the one closest to targetFPS. If
-// the probe fails or cannot parse the output, it defaults to "30".
-func ProbeAVFoundationFramerate(binary, deviceIndex string, targetFPS int) string {
+// for its supported framerates, and returns the one closest to targetFPS.
+//
+// targetFPS is a float64 so cinema presets (FPSNum/FPSDen = 24000/1001 =
+// 23.976023…) can find their exact device mode. If we rounded to an int
+// here, a camera advertising both 23.976 and 24.000 modes would tie at
+// diff≈0.024 vs 0.000 — picking 24.000 by accident and reintroducing
+// the cadence drift the cinema preset is specifically designed to avoid.
+// Callers should compute float64(FPSNum)/float64(FPSDen) and pass that.
+//
+// If the probe fails or cannot parse the output, it defaults to "30".
+func ProbeAVFoundationFramerate(binary, deviceIndex string, targetFPS float64) string {
 	if binary == "" {
 		binary = "ffmpeg"
 	}
@@ -1340,7 +1363,7 @@ var avfoundationModeRE = regexp.MustCompile(`@\[([0-9.]+)`)
 // avfoundationDeviceRE matches AVFoundation device listing lines like "[0] FaceTime HD Camera".
 var avfoundationDeviceRE = regexp.MustCompile(`\[(\d+)\]\s+(.+)`)
 
-func chooseAVFoundationFramerate(output string, targetFPS int) (string, bool) {
+func chooseAVFoundationFramerate(output string, targetFPS float64) (string, bool) {
 	if targetFPS <= 0 {
 		targetFPS = 30
 	}
@@ -1352,7 +1375,7 @@ func chooseAVFoundationFramerate(output string, targetFPS int) (string, bool) {
 			continue
 		}
 		if f, err := strconv.ParseFloat(matches[1], 64); err == nil {
-			diff := math.Abs(f - float64(targetFPS))
+			diff := math.Abs(f - targetFPS)
 			if diff < bestDiff {
 				bestDiff = diff
 				bestFPS = strconv.FormatFloat(f, 'f', -1, 64)

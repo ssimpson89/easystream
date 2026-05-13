@@ -573,7 +573,12 @@ func previewInputs(config ffmpeg.Config) previewInputBuild {
 		case "avfoundation":
 			device = ffmpeg.ResolveAVFoundationDeviceIndex(config.Binary, device, config.Input.VideoDeviceName, "video")
 			audioDevice := ffmpeg.ResolveAVFoundationDeviceIndex(config.Binary, config.Input.AudioDevice, config.Input.AudioDeviceName, "audio")
-			fps := ffmpeg.ProbeAVFoundationFramerate(config.Binary, device, config.Preset.FPS)
+			// FPSFloat so 23.976 (cinema cadence) picks the exact mode
+			// rather than tying with 24.000 on cameras that advertise
+			// both. Preview must match the main pipeline's cadence so
+			// the operator's "what I see is what I'll send" promise
+			// holds for cinema sources.
+			fps := ffmpeg.ProbeAVFoundationFramerate(config.Binary, device, config.Preset.FPSFloat())
 			if config.Input.AudioDevice != "" {
 				device = device + ":" + audioDevice
 				return previewInputBuild{

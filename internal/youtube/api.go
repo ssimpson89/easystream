@@ -473,6 +473,13 @@ func parseStream(data []byte) (*Stream, error) {
 
 func resolutionCategory(res string) string {
 	switch {
+	case strings.HasPrefix(res, "2560"):
+		// 1440p (QHD). Used by the cinema-1440p24 preset. Without
+		// this branch, the YouTube stream resource would be created
+		// with resolution="variable" and the broadcast metadata
+		// would mis-classify the stream — broadcast quality dashboard
+		// shows "variable" instead of "1440p".
+		return "1440p"
 	case strings.HasPrefix(res, "1920"):
 		return "1080p"
 	case strings.HasPrefix(res, "1280"):

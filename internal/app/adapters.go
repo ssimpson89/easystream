@@ -119,7 +119,7 @@ func (a *broadcastControllerAdapter) CreateBoundStream(ctx context.Context, broa
 		preset = quality.Default()
 	}
 	title := "EasyStream - " + preset.Name + " - " + time.Now().UTC().Format("20060102-150405")
-	stream, err := a.server.ytClient.CreateStreamForBroadcast(ctx, title, preset.Resolution(), preset.FPS)
+	stream, err := a.server.ytClient.CreateStreamForBroadcast(ctx, title, preset.Resolution(), preset.FPS())
 	if err != nil {
 		return "", "", "", err
 	}
