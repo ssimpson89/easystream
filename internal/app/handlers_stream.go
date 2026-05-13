@@ -143,6 +143,14 @@ func (s *Server) statusSnapshot() map[string]any {
 		// vMix/OBS one of these as srt://<ip>:<port>).
 		"localIPs": localNetworkIPs(),
 	}
+	// SRT receiver status (always-on SRT listener; bound when the
+	// saved source kind is srt-listener). The UI keys the pre-flight
+	// Video pill off this independently of the main supervisor —
+	// before going live, the receiver is what proves the encoder is
+	// connected and frames are flowing.
+	if s.srtReceiver != nil {
+		result["ingest"] = s.srtReceiver.Status()
+	}
 	if s.adaptive != nil {
 		result["adaptive"] = s.adaptive.State()
 	}
@@ -276,6 +284,12 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			s.logger.Printf("failed to persist stream config: %v", err)
 		}
 	}
+	// Reconcile the SRT receiver to the new config. Idempotent: same
+	// Port + Passphrase is a no-op; a change restarts ffmpeg; switch
+	// away from SRT-listener kind stops it. Done outside the s.mu
+	// critical section because Apply may block briefly tearing down
+	// the previous ffmpeg.
+	s.reconcileSRTReceiver(config)
 	// Push to every open UI so a source/preset change in tab A propagates
 	// to tab B immediately. The preview reconnects client-side once the
 	// status event lands.

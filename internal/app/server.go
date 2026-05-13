@@ -14,6 +14,7 @@ import (
 	"github.com/ssimpson89/easystream/internal/devices"
 	"github.com/ssimpson89/easystream/internal/ffmpeg"
 	"github.com/ssimpson89/easystream/internal/hls"
+	"github.com/ssimpson89/easystream/internal/ingest"
 	"github.com/ssimpson89/easystream/internal/preview"
 	"github.com/ssimpson89/easystream/internal/quality"
 	"github.com/ssimpson89/easystream/internal/schedule"
@@ -41,10 +42,11 @@ type ServerConfig struct {
 type Server struct {
 	addr       string
 	httpServer *http.Server
-	supervisor *ffmpeg.Supervisor
-	adaptive   *ffmpeg.AdaptiveController
-	preview    *preview.Server
-	hlsServer  *hls.Server
+	supervisor  *ffmpeg.Supervisor
+	adaptive    *ffmpeg.AdaptiveController
+	preview     *preview.Server
+	srtReceiver *ingest.Receiver // always-on SRT listener; nil when not configured
+	hlsServer   *hls.Server
 	devScanner *devices.Scanner
 	ytAuth     *youtube.Auth
 	ytClient   *youtube.Client
@@ -78,6 +80,31 @@ type Server struct {
 	// destination options that this FFmpeg build doesn't support
 	// (notably SRT, which Homebrew's default formula omits).
 	ffmpegCaps ffmpeg.Capabilities
+}
+
+// reconcileSRTReceiver translates a config snapshot into a DesiredConfig
+// for the SRT receiver and applies it. Called from NewServer (boot) and
+// from handleConfigUpdate (after every save). The receiver's Apply is
+// idempotent: same DesiredConfig is a no-op, a changed Port/Passphrase
+// restarts ffmpeg, and Kind != InputSRTListener stops it.
+//
+// The receiver is independent of the main go-live lifecycle on purpose:
+// the upstream encoder needs to be able to connect (and the preview to
+// show it) BEFORE the operator presses Go Live. See internal/ingest.
+func (s *Server) reconcileSRTReceiver(config ffmpeg.Config) {
+	if s.srtReceiver == nil {
+		return
+	}
+	if config.Input.Kind != ffmpeg.InputSRTListener {
+		s.srtReceiver.Apply(ingest.DesiredConfig{})
+		return
+	}
+	s.srtReceiver.Apply(ingest.DesiredConfig{
+		Binary:     config.Binary,
+		Port:       config.Input.SRTListenPort,
+		Passphrase: config.Input.SRTListenPassphrase,
+		RelayPort:  ffmpeg.SRTRelayPort,
+	})
 }
 
 // markLive persists the operator's intent to be live. Called from every
@@ -126,6 +153,7 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	supervisor := ffmpeg.NewSupervisor(cfg.Logger, supCfg)
 	prev := preview.NewServer(cfg.Logger)
+	srtRecv := ingest.NewReceiver(cfg.Logger)
 
 	var ytClient *youtube.Client
 	if cfg.YTAuth != nil {
@@ -260,6 +288,7 @@ func NewServer(cfg ServerConfig) *Server {
 		supervisor:       supervisor,
 		adaptive:         adaptive,
 		preview:          prev,
+		srtReceiver:      srtRecv,
 		hlsServer:        cfg.HLSServer,
 		devScanner:       devScanner,
 		ytAuth:           cfg.YTAuth,
@@ -287,6 +316,18 @@ func NewServer(cfg ServerConfig) *Server {
 	// The hub coalesces rapid transitions into a single wire frame.
 	supervisor.SetOnStateChange(server.publishState)
 	adaptive.Start()
+
+	// SRT receiver pushes an SSE update whenever its state flips
+	// (starting → running, peer connected / disconnected, failed) so
+	// the pre-flight Video pill reflects encoder activity in real
+	// time without the operator having to refresh.
+	srtRecv.SetOnChange(server.publishState)
+
+	// Reconcile the receiver to the persisted config. If the saved
+	// source is SRT-listener, the receiver starts listening now so
+	// an upstream encoder can connect before the operator opens the
+	// UI. If it's any other kind, this is a no-op.
+	server.reconcileSRTReceiver(defaultCfg)
 
 	// Initialize preview with the default config so it knows the input source.
 	prev.UpdateConfig(defaultCfg)
@@ -417,6 +458,9 @@ func (s *Server) Close() {
 	}
 	if s.supervisor != nil {
 		s.supervisor.Stop()
+	}
+	if s.srtReceiver != nil {
+		s.srtReceiver.Stop()
 	}
 	if s.preview != nil {
 		s.preview.Block() // tears down preview's child ffmpeg

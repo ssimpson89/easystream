@@ -292,8 +292,9 @@
             <div class="sub-form" x-show="isSRTListenerSource">
               <p class="hint">
                 This computer waits for OBS, vMix, or a hardware encoder to
-                send video to it. Paste the URL below into your encoder's
-                stream settings, then start streaming here.
+                send video to it. The listener is open as soon as you save
+                this source — you'll see the encoder's feed in the preview
+                before you press Go Live.
               </p>
               <label>Port number
                 <input type="number" min="1024" max="65535"
@@ -352,9 +353,10 @@
                 is open in your firewall.
               </p>
               <p class="hint">
-                If the stream stays yellow after you press Start, double-check
-                that the encoder is started and that its URL matches the one
-                above exactly.
+                If the Video status stays yellow ("waiting for your encoder")
+                after you start streaming in OBS, double-check that the URL
+                pasted into OBS matches the one above exactly, and that the
+                passphrase (if any) matches.
               </p>
               <label class="checkbox-row">
                 <input type="checkbox" x-model="networkNoAudio" @change="onNetworkNoAudioToggle()">
