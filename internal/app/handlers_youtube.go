@@ -145,7 +145,7 @@ func (s *Server) handleGoLiveNow(w http.ResponseWriter, r *http.Request) {
 	// Reusing YouTube's named stream can leave multiple active broadcasts
 	// bound to the same ingest, causing the wrong watch page.
 	streamTitle := "EasyStream - " + body.Title + " - " + broadcast.ID
-	stream, err := s.ytClient.CreateStreamForBroadcast(r.Context(), streamTitle, config.Preset.Resolution(), config.Preset.FPS)
+	stream, err := s.ytClient.CreateStreamForBroadcast(r.Context(), streamTitle, config.Preset.Resolution(), config.Preset.FPS())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "create stream: "+err.Error())
 		return

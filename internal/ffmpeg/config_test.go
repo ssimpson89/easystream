@@ -676,3 +676,60 @@ func TestArgsSDIInputDeclaresBT709ColorMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestArgsCinemaPresetEmits23976AndCorrectLevel(t *testing.T) {
+	// Cinema 1080p24 must emit the exact NTSC-cinema rate as a
+	// fraction on -r so cadence doesn't drift, and Level 4.0 in the
+	// SPS (24 fps fits comfortably in 4.0's macroblock-rate cap;
+	// the previous hardcoded 4.1 was a per-preset spec leak).
+	preset, ok := quality.ByID("cinema-1080p24")
+	if !ok {
+		t.Fatal("cinema-1080p24 preset must exist")
+	}
+	cfg := DefaultConfig()
+	cfg.Preset = preset
+	cfg.StreamName = "abc"
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, expected := range []string{
+		"-r 24000/1001",  // exact NTSC-cinema rate (not 24)
+		"-g 48",          // 2-second GOP at 23.976
+		"-level:v 4.0",   // per-preset, not the legacy hardcoded 4.1
+		"-b:v 8000k",     // YT 1080p24 mid-range
+		"-maxrate 8000k", // CBR target
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Errorf("cinema preset args must contain %q, got %s", expected, joined)
+		}
+	}
+	// And the integer-rate -r form must NOT appear — that would be the
+	// rounded 24.000 the cinema preset is specifically there to avoid.
+	if strings.Contains(joined, "-r 24 ") {
+		t.Errorf("cinema preset must use 24000/1001 not the rounded 24: %s", joined)
+	}
+}
+
+func TestArgsHigh1080p60EmitsLevel42(t *testing.T) {
+	// 1080p60 exceeds Level 4.1's macroblock-rate cap (245.76 k MB/s).
+	// The preset declares 4.2; the encoder must honor it.
+	preset, ok := quality.ByID("high")
+	if !ok {
+		t.Fatal("high preset must exist")
+	}
+	cfg := DefaultConfig()
+	cfg.Preset = preset
+	cfg.StreamName = "abc"
+
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-level:v 4.2") {
+		t.Errorf("1080p60 preset must emit -level:v 4.2, got %s", joined)
+	}
+}

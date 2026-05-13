@@ -573,7 +573,7 @@ func previewInputs(config ffmpeg.Config) previewInputBuild {
 		case "avfoundation":
 			device = ffmpeg.ResolveAVFoundationDeviceIndex(config.Binary, device, config.Input.VideoDeviceName, "video")
 			audioDevice := ffmpeg.ResolveAVFoundationDeviceIndex(config.Binary, config.Input.AudioDevice, config.Input.AudioDeviceName, "audio")
-			fps := ffmpeg.ProbeAVFoundationFramerate(config.Binary, device, config.Preset.FPS)
+			fps := ffmpeg.ProbeAVFoundationFramerate(config.Binary, device, config.Preset.FPS())
 			if config.Input.AudioDevice != "" {
 				device = device + ":" + audioDevice
 				return previewInputBuild{
