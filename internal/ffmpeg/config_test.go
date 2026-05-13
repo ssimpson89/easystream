@@ -226,6 +226,133 @@ func TestNetworkInputValidateRequiresURL(t *testing.T) {
 	}
 }
 
+func srtListenerCfg(port int, passphrase string) Config {
+	cfg := DefaultConfig()
+	cfg.Input = Input{
+		Kind:                InputSRTListener,
+		SRTListenPort:       port,
+		SRTListenPassphrase: passphrase,
+	}
+	cfg.IngestURL = "rtmp://localhost"
+	cfg.StreamName = "test"
+	return cfg
+}
+
+func TestSRTListenerURLConstruction(t *testing.T) {
+	got := SRTListenerURL(9000, "")
+	for _, want := range []string{
+		"srt://0.0.0.0:9000",
+		"mode=listener",
+		"transtype=live",
+		"latency=300000",
+		"tlpktdrop=1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("SRTListenerURL(9000,\"\") missing %q in %q", want, got)
+		}
+	}
+
+	got = SRTListenerURL(0, "") // 0 → default 9999
+	if !strings.Contains(got, "srt://0.0.0.0:9999") {
+		t.Errorf("SRTListenerURL(0,\"\") fell-through default port: got %q", got)
+	}
+
+	got = SRTListenerURL(9999, "MySecretPwd")
+	if !strings.Contains(got, "passphrase=MySecretPwd") {
+		t.Errorf("expected passphrase in listener URL: %q", got)
+	}
+	// libsrt rejects srt://:port (empty host) — must use 0.0.0.0.
+	if strings.Contains(got, "srt://:") {
+		t.Errorf("listener URL must not have empty host: %q", got)
+	}
+}
+
+func TestArgsSRTListenerInput(t *testing.T) {
+	cfg := srtListenerCfg(9000, "")
+	args, err := cfg.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, expected := range []string{
+		"-fflags discardcorrupt+genpts",
+		"-i srt://0.0.0.0:9000?mode=listener",
+		"transtype=live",
+		"tlpktdrop=1",
+		"-map [v]",
+		"-map [a_enc]",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Errorf("expected %q in SRT listener args: %s", expected, joined)
+		}
+	}
+}
+
+func TestSRTListenerValidateRejectsEasyStreamPorts(t *testing.T) {
+	// Only ports EasyStream binds at fixed values are reserved. The
+	// HTTP listen address is operator-configurable, so a collision
+	// with the (default) :8080 surfaces at receiver bind time rather
+	// than here.
+	for _, port := range []int{52001, 52002} {
+		cfg := srtListenerCfg(port, "")
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("expected validation to reject reserved port %d", port)
+		}
+	}
+	// And conversely: 8080 is no longer reserved (it's a configurable
+	// default, not an internal port). The validator must accept it.
+	cfg := srtListenerCfg(8080, "")
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("8080 should validate (configurable HTTP default), got %v", err)
+	}
+}
+
+func TestSRTListenerValidateBoundaryPorts(t *testing.T) {
+	for _, port := range []int{1024, 65535} {
+		cfg := srtListenerCfg(port, "")
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("port %d should be valid, got %v", port, err)
+		}
+	}
+	for _, port := range []int{1023, 65536} {
+		cfg := srtListenerCfg(port, "")
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("port %d should be invalid", port)
+		}
+	}
+}
+
+func TestSRTListenerValidateBoundaryPassphrase(t *testing.T) {
+	tenChars := "1234567890"
+	seventyNine := strings.Repeat("a", 79)
+	for _, pp := range []string{tenChars, seventyNine} {
+		cfg := srtListenerCfg(9999, pp)
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("passphrase len %d should be valid, got %v", len(pp), err)
+		}
+	}
+	for _, pp := range []string{"123456789", strings.Repeat("a", 80)} {
+		cfg := srtListenerCfg(9999, pp)
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("passphrase len %d should be invalid", len(pp))
+		}
+	}
+}
+
+func TestSRTListenerValidateRejectsPrivilegedPort(t *testing.T) {
+	cfg := srtListenerCfg(80, "")
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation to reject port < 1024")
+	}
+}
+
+func TestSRTListenerValidateRejectsShortPassphrase(t *testing.T) {
+	cfg := srtListenerCfg(9999, "short")
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation to reject < 10-char passphrase")
+	}
+}
+
 func TestHDRSourceAddsTonemapChain(t *testing.T) {
 	cfg := networkInputCfg("rtsp://hdr-camera.local/feed")
 	cfg.Input.SourceIsHDR = true

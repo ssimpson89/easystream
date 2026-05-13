@@ -286,7 +286,86 @@
               </label>
             </div>
 
-            <label x-show="!isSDISource && !isNetworkSource">
+            <!-- SRT listener: EasyStream binds a port and waits for
+                 the upstream encoder to push to it. Operator hands
+                 the upstream encoder the publish URL we render below. -->
+            <div class="sub-form" x-show="isSRTListenerSource">
+              <p class="hint">
+                This computer waits for OBS, vMix, or a hardware encoder to
+                send video to it. Paste the URL below into your encoder's
+                stream settings, then start streaming here.
+              </p>
+              <label>Port number
+                <input type="number" min="1024" max="65535"
+                       x-model.number="srtListenPort"
+                       @input="onSRTListenPortChange()" @blur="onSRTListenPortBlur()"
+                       placeholder="9999">
+                <span class="row-hint">
+                  Any unused number from 1024–65535. The default
+                  (<code>9999</code>) is fine for most setups.
+                </span>
+              </label>
+              <label>Passphrase (optional)
+                <input type="password" autocomplete="off"
+                       maxlength="79"
+                       x-model="srtListenPassphrase"
+                       @input="onSRTListenPassphraseChange()" @blur="onSRTListenPassphraseBlur()"
+                       :placeholder="hasSavedSRTPassphrase
+                         ? 'Already set — leave blank to keep'
+                         : 'Leave blank, or set 10–79 characters'">
+                <span class="row-hint" x-show="!srtPassphraseLengthError">
+                  Encrypts the stream. Must match the value entered in the
+                  encoder. Leave blank for no encryption.
+                </span>
+                <span class="row-hint warn" x-show="srtPassphraseLengthError"
+                      x-text="srtPassphraseLengthError"></span>
+              </label>
+              <p class="hint">
+                In your encoder (OBS, vMix, etc.), paste this as the stream URL:
+              </p>
+              <div class="publish-url" x-show="hasSRTPublishURL">
+                <code x-text="srtListenerPublishURL"></code>
+                <button type="button" class="button button-sm" @click="copySRTPublishURL()">Copy</button>
+              </div>
+              <p class="row-hint warn" x-show="hasSRTPublishURL && srtListenPassphrase">
+                Treat this URL like a password — anyone with it can publish to
+                your stream. Share it privately.
+              </p>
+              <p class="publish-url warn" x-show="!hasSRTPublishURL">
+                This computer's network address could not be detected. Open
+                System Settings &rarr; Network, copy your IP address, then
+                use <code>srt://THAT-IP:<span x-text="srtListenPort || 9999"></span></code>
+                in your encoder.
+              </p>
+              <p class="hint" x-show="(localIPs || []).length > 1">
+                More than one network address detected. If your encoder can't
+                connect, click another to try it:
+                <template x-for="ip in localIPs" :key="ip">
+                  <button type="button" class="ip-chip"
+                          :class="{ active: ip === activeSRTHostIP }"
+                          @click="selectSRTHostIP(ip)"
+                          x-text="ip"></button>
+                </template>
+              </p>
+              <p class="hint">
+                Make sure UDP port <code x-text="srtListenPort || 9999"></code>
+                is open in your firewall.
+              </p>
+              <p class="hint">
+                If the stream stays yellow after you press Start, double-check
+                that the encoder is started and that its URL matches the one
+                above exactly.
+              </p>
+              <label class="checkbox-row">
+                <input type="checkbox" x-model="networkNoAudio" @change="onNetworkNoAudioToggle()">
+                <span>
+                  Source has no audio
+                  <span class="row-hint">EasyStream will substitute a silent track.</span>
+                </span>
+              </label>
+            </div>
+
+            <label x-show="!isSDISource && !isNetworkSource && !isSRTListenerSource">
               Audio source
               <select x-ref="audioSourceSelect" x-model="audioSourceValue" @change="onAudioSourceChange()">
                 <template x-for="d in audioSourceOptions()" :key="d.key">

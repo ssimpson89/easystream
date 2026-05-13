@@ -3,14 +3,111 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ssimpson89/easystream/internal/ffmpeg"
 	"github.com/ssimpson89/easystream/internal/quality"
 	"github.com/ssimpson89/easystream/internal/version"
 )
+
+// localNetworkIPs returns the machine's non-loopback IPv4 addresses
+// in display order. The UI shows these to the operator when they
+// configure an SRT listener so they know what URL to hand an
+// upstream encoder (srt://<one-of-these-ips>:<port>).
+//
+// Filters aggressively so the operator doesn't see a wall of VPN
+// tunnels, Docker bridges, and link-local junk:
+//   - loopback (127.x.x.x)
+//   - link-local v4 (169.254.x.x — DHCP-failed addresses)
+//   - down or pointpoint interfaces (VPN tunnels)
+//   - common virtual interface name prefixes
+//   - IPv6 entirely (operators expect "192.168.x.x")
+//
+// Cached for cacheLocalIPsFor; net.InterfaceAddrs is cheap but the
+// snapshot is published on every SSE state event, and we'd rather
+// not pay even a syscall per push.
+var (
+	localIPsMu       sync.RWMutex
+	localIPsCache    []string
+	localIPsCachedAt time.Time
+)
+
+const cacheLocalIPsFor = 10 * time.Second
+
+// excludedInterfacePrefixes are interface name prefixes that produce
+// addresses we don't want operators to see: VPN tunnels, Docker
+// bridges, Apple wireless-direct, virtual machines.
+var excludedInterfacePrefixes = []string{
+	"utun", "ipsec", "ppp", "tun", "tap",
+	"awdl", "llw", "anpi", "ap",
+	"bridge", "docker", "vboxnet", "vmnet",
+}
+
+func interfaceExcluded(name string) bool {
+	for _, p := range excludedInterfacePrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func localNetworkIPs() []string {
+	localIPsMu.RLock()
+	if time.Since(localIPsCachedAt) < cacheLocalIPsFor && localIPsCache != nil {
+		out := append([]string{}, localIPsCache...)
+		localIPsMu.RUnlock()
+		return out
+	}
+	localIPsMu.RUnlock()
+
+	out := computeLocalNetworkIPs()
+	localIPsMu.Lock()
+	localIPsCache = out
+	localIPsCachedAt = time.Now()
+	localIPsMu.Unlock()
+	return append([]string{}, out...)
+}
+
+func computeLocalNetworkIPs() []string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, iface := range ifaces {
+		// Must be up + running, not a point-to-point link (VPN).
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagPointToPoint != 0 {
+			continue
+		}
+		if interfaceExcluded(iface.Name) {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok || ipNet.IP.IsLoopback() || ipNet.IP.IsLinkLocalUnicast() {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil {
+				continue // skip IPv6 for now
+			}
+			out = append(out, ip4.String())
+		}
+	}
+	return out
+}
 
 // --- Status ---
 
@@ -41,6 +138,10 @@ func (s *Server) statusSnapshot() map[string]any {
 		"health":            health,
 		"confidence":        confidence,
 		"activeBroadcastId": broadcastID,
+		// Local network IPs so the UI can construct the upstream
+		// publish URL for SRT-listener mode (operator hands their
+		// vMix/OBS one of these as srt://<ip>:<port>).
+		"localIPs": localNetworkIPs(),
 	}
 	if s.adaptive != nil {
 		result["adaptive"] = s.adaptive.State()
@@ -151,6 +252,15 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			in.URL != "" &&
 			strings.Contains(in.URL, ffmpeg.RedactedCredentialSentinel) {
 			in.URL = s.config.Input.URL
+		}
+		// Same round-trip preservation for the SRT listener passphrase.
+		// configResponse renders an existing passphrase as the
+		// sentinel; if the operator saves the form without touching
+		// that field, we must keep the stored value rather than
+		// overwriting it with the literal sentinel.
+		if in.Kind == ffmpeg.InputSRTListener &&
+			in.SRTListenPassphrase == ffmpeg.RedactedCredentialSentinel {
+			in.SRTListenPassphrase = s.config.Input.SRTListenPassphrase
 		}
 		s.config.Input = in
 	}
@@ -324,6 +434,16 @@ func (s *Server) configResponse(config ffmpeg.Config) map[string]any {
 	input := config.Input
 	if input.URL != "" {
 		input.URL = ffmpeg.RedactURLCredentials(input.URL)
+	}
+	// SRTListenPassphrase is symmetric with URL credentials: write-only
+	// over the wire. Returning it in /api/config and SSE state would
+	// expose the SRT encryption key to anyone with a tab open. Send
+	// the sentinel instead so the UI can still know "a passphrase is
+	// set" (e.g. to surface the credential-warning hint) without ever
+	// learning the value. configUpdate detects the sentinel on save
+	// and preserves the stored value.
+	if input.SRTListenPassphrase != "" {
+		input.SRTListenPassphrase = ffmpeg.RedactedCredentialSentinel
 	}
 	result := map[string]any{
 		"ffmpegBinary": config.Binary,

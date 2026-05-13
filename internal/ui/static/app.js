@@ -68,6 +68,24 @@ document.addEventListener("alpine:init", () => {
     networkUrl:       "",
     networkNoAudio:   false,
     sourceIsHDR:      false,
+    // SRT listener mode: EasyStream binds a local port and waits
+    // for an upstream encoder to push to it.
+    srtListenPort:       9999,
+    srtListenPassphrase: "",
+    // hasSavedSRTPassphrase reflects "the server has a passphrase
+    // stored" without the UI ever learning its value. Set from the
+    // sentinel the API returns in place of the real passphrase
+    // (RedactedCredentialSentinel). Used to drive the placeholder so
+    // the operator sees "set — leave blank to keep" instead of an
+    // empty field that would imply no encryption.
+    hasSavedSRTPassphrase: false,
+    localIPs:            [],
+    // Operator-chosen host IP for the rendered publish URL. Empty
+    // means "use whatever localIPs[0] resolves to", which is the
+    // common case. Stored only in this tab — not persisted, since
+    // it depends on where the encoder is, not on the EasyStream
+    // config itself.
+    srtSelectedHostIP:   "",
     selectedPreset:   "recommended",
     selectedEncoder:  "libx264",
     outputMode:       "rtmp",
@@ -84,6 +102,11 @@ document.addEventListener("alpine:init", () => {
     _dirtyStreamKey: false,
     _dirtyAudio:     false,
     _dirtyVideo:     false,
+    // Passphrase needs its own dirty flag — _dirtyVideo gets cleared
+    // by every save, but the server never echoes the passphrase back
+    // (write-only), so reusing _dirtyVideo would let the next SSE
+    // push overwrite a freshly-saved passphrase with "".
+    _dirtySRTPass:   false,
 
     // Tracks the previous videoSourceValue so onVideoSourceChange
     // can detect a kind transition (e.g. webcam → network) and
@@ -264,6 +287,7 @@ document.addEventListener("alpine:init", () => {
       this.health            = data.health     || {};
       this.capabilities      = data.capabilities || this.capabilities;
       this.activeBroadcastId = data.activeBroadcastId || "";
+      this.localIPs          = data.localIPs || [];
       this.syncFormFromConfig(data.config);
     },
 
@@ -313,13 +337,24 @@ document.addEventListener("alpine:init", () => {
       if (!this._dirtyAudio) {
         this.audioSourceValue = config.input?.audioDevice || "";
       }
-      // Network source: hydrate URL + NoAudio flag from server (unless
+      // Network + SRT-listener: hydrate fields from server (unless
       // operator is actively typing).
       if (!this._dirtyVideo) {
         this.networkUrl = config.input?.url || "";
         this.networkNoAudio = !!config.input?.noAudio;
         this.sourceIsHDR = !!config.input?.sourceIsHdr;
+        this.srtListenPort = config.input?.srtListenPort || 9999;
       }
+      // Passphrase is write-only on the wire. The server replies
+      // with the literal sentinel "REDACTED" when a passphrase is
+      // stored, and "" otherwise — never the actual value. We
+      // track only the "set or not" bit; the input field itself is
+      // never touched by hydration so a freshly-typed value stays
+      // visible (and stays in the rendered publish URL the operator
+      // is about to paste into OBS). Cleared explicitly on kind
+      // transition away from srt-listener, not here.
+      const serverPass = config.input?.srtListenPassphrase || "";
+      this.hasSavedSRTPassphrase = serverPass === "REDACTED";
     },
 
     // ============================================================
@@ -442,8 +477,68 @@ document.addEventListener("alpine:init", () => {
       return "Ready to stream.";
     },
     get currentPreset() { return this.presets.find((p) => p.id === this.selectedPreset); },
-    get isSDISource()     { return S.decodeSourceValue(this.videoSourceValue)?.kind === "sdi"; },
-    get isNetworkSource() { return S.decodeSourceValue(this.videoSourceValue)?.kind === "network"; },
+    get isSDISource()        { return S.decodeSourceValue(this.videoSourceValue)?.kind === "sdi"; },
+    get isNetworkSource()    { return S.decodeSourceValue(this.videoSourceValue)?.kind === "network"; },
+    get isSRTListenerSource() { return S.decodeSourceValue(this.videoSourceValue)?.kind === "srt-listener"; },
+    // activeSRTHostIP returns the IP that should appear in the
+    // rendered publish URL: the operator's explicit pick if it's
+    // still in the detected list, otherwise the first detected IP.
+    // If the chosen IP disappears (e.g. interface dropped between
+    // SSE pushes), fall through to the first available so the URL
+    // never references a stale value.
+    get activeSRTHostIP() {
+      const ips = this.localIPs || [];
+      if (this.srtSelectedHostIP && ips.includes(this.srtSelectedHostIP)) {
+        return this.srtSelectedHostIP;
+      }
+      return ips[0] || "";
+    },
+    // The URL operators hand the upstream encoder so it knows where
+    // to push. Uses activeSRTHostIP — the operator's pick when they
+    // clicked an alternate IP chip, otherwise the first detected
+    // address. If interface enumeration found nothing (rare: VPN-
+    // only host, sandbox), returns "" so the template can swap in
+    // a helpful "find your IP" message instead.
+    get srtListenerPublishURL() {
+      const ip = this.activeSRTHostIP;
+      if (!ip) return "";
+      const port = this.srtListenPort || 9999;
+      const pass = (this.srtListenPassphrase || "").trim();
+      return pass
+        ? `srt://${ip}:${port}?passphrase=${encodeURIComponent(pass)}`
+        : `srt://${ip}:${port}`;
+    },
+    get hasSRTPublishURL() {
+      return !!this.srtListenerPublishURL;
+    },
+    // Inline length validation so the operator sees the SRT spec rule
+    // (10-79 chars) as soon as they're in the invalid band, not after
+    // the backend save round-trips an error. Empty is valid (= no
+    // encryption). The input also carries maxlength=79 so typing past
+    // the upper bound is blocked at the keyboard level; the upper-
+    // bound branch below is a belt-and-suspenders catch for paste
+    // operations that route around maxlength on some browsers.
+    get srtPassphraseLengthError() {
+      const v = this.srtListenPassphrase || "";
+      if (v.length === 0) return "";
+      if (v.length < 10) {
+        return `Too short — SRT requires 10–79 characters (currently ${v.length}).`;
+      }
+      if (v.length > 79) {
+        return `Too long — SRT requires 10–79 characters (currently ${v.length}).`;
+      }
+      return "";
+    },
+    selectSRTHostIP(ip) {
+      this.srtSelectedHostIP = ip;
+    },
+    copySRTPublishURL() {
+      const u = this.srtListenerPublishURL;
+      if (!u) return;
+      window.EasyStreamClipboard(u).then((ok) => {
+        this.showToast(ok ? "Publish URL copied!" : "Copy failed — select the URL manually.");
+      });
+    },
     get destinationLabel() {
       if (this.activeBroadcastId) return "YouTube";
       if (this.outputMode === "hls") return "Local HLS";
@@ -505,6 +600,36 @@ document.addEventListener("alpine:init", () => {
           v = { icon: "video", label: "Video", status: "yellow",
                 detail: `${liveUrl} — not verified (start stream to check)` };
         }
+      } else if (this.isSRTListenerSource) {
+        // SRT listener mode flips the connection direction: we bind a
+        // port and wait for the upstream encoder to push to us. There
+        // is no remote URL to redact and no local device to check —
+        // status is purely a function of "did frames arrive yet?".
+        // Wording mirrors the network branch's "Connecting / connected
+        // / waiting" shape, but in terms the audience (volunteers
+        // running OBS/vMix) actually maps to: "Opening port", "waiting
+        // for the encoder", "receiving N fps".
+        const port = Number(this.config?.input?.srtListenPort) || this.srtListenPort || 9999;
+        const fpsRaw = this.stream?.lastProgress?.fps;
+        const fps = Number(fpsRaw) || 0;
+        if (this.stream?.state === "running") {
+          if (fps > 0) {
+            v = { icon: "video", label: "Video", status: "green",
+                  detail: `Receiving ${fps.toFixed(0)} fps on port ${port}` };
+          } else {
+            v = { icon: "video", label: "Video", status: "yellow",
+                  detail: `Listening on port ${port} — start your encoder to begin` };
+          }
+        } else if (this.stream?.state === "starting" || this.stream?.state === "restarting") {
+          v = { icon: "video", label: "Video", status: "yellow",
+                detail: `Opening port ${port}…` };
+        } else if (this.stream?.state === "failed") {
+          v = { icon: "video", label: "Video", status: "red",
+                detail: this.stream?.lastError || `Could not open port ${port}` };
+        } else {
+          v = { icon: "video", label: "Video", status: "yellow",
+                detail: `Port ${port} — start the stream to begin listening` };
+        }
       } else {
         const presence = this.devicePresence("video");
         if (presence.connected) {
@@ -522,10 +647,11 @@ document.addEventListener("alpine:init", () => {
       // configured mic vanished" via audioFallbackDevice. Surface
       // that first so the operator sees what's happening: silent
       // audio is live, and we'll reconnect when the mic returns.
-      // Skip for network sources where audio comes from the URL —
-      // the fallback would be a stale signal carried over from a
-      // previous local-device session.
-      const fallback = !this.isNetworkSource ? this.stream?.audioFallbackDevice : "";
+      // Skip for network/SRT-listener sources where audio comes from
+      // the upstream stream — the fallback would be a stale signal
+      // carried over from a previous local-device session.
+      const remoteAudio = this.isNetworkSource || this.isSRTListenerSource;
+      const fallback = !remoteAudio ? this.stream?.audioFallbackDevice : "";
       if (fallback) {
         aSource = {
           icon: "mic", label: "Audio", status: "yellow",
@@ -537,6 +663,10 @@ document.addEventListener("alpine:init", () => {
         aSource = this.networkNoAudio
           ? { icon: "mic", label: "Audio", status: "yellow", detail: "Silent — source has no audio" }
           : { icon: "mic", label: "Audio", status: "green", detail: "Embedded from network source" };
+      } else if (this.isSRTListenerSource) {
+        aSource = this.networkNoAudio
+          ? { icon: "mic", label: "Audio", status: "yellow", detail: "Silent — source has no audio" }
+          : { icon: "mic", label: "Audio", status: "green", detail: "Embedded from incoming SRT stream" };
       } else if (!this.audioSourceValue) {
         aSource = { icon: "mic", label: "Audio", status: "yellow", detail: "No audio source — silence will be sent" };
       } else {
@@ -768,6 +898,23 @@ document.addEventListener("alpine:init", () => {
         payload.input.url = (this.networkUrl || "").trim();
         payload.input.noAudio = !!this.networkNoAudio;
       }
+      // SRT listener: carry port + passphrase + NoAudio.
+      // Passphrase round-trip rules:
+      //   - operator typed something (dirty) → send that literal value,
+      //     including "" to deliberately clear an existing passphrase.
+      //   - operator didn't touch the field but server has one stored
+      //     → send the sentinel so the backend keeps the stored value.
+      //   - no stored passphrase and operator didn't type → omit the
+      //     field entirely.
+      if (decoded.kind === "srt-listener") {
+        payload.input.srtListenPort = Number(this.srtListenPort) || 9999;
+        if (this._dirtySRTPass) {
+          payload.input.srtListenPassphrase = this.srtListenPassphrase;
+        } else if (this.hasSavedSRTPassphrase) {
+          payload.input.srtListenPassphrase = "REDACTED";
+        }
+        payload.input.noAudio = !!this.networkNoAudio;
+      }
       // HDR flag applies to any non-test source.
       if (decoded.kind !== "test-video") {
         payload.input.sourceIsHdr = !!this.sourceIsHDR;
@@ -793,6 +940,7 @@ document.addEventListener("alpine:init", () => {
         this._dirtyStreamKey = false;
         this._dirtyAudio = false;
         this._dirtyVideo = false;
+        this._dirtySRTPass = false;
         return true;
       } catch (e) {
         this.showToast("Save failed: " + e.message);
@@ -815,6 +963,19 @@ document.addEventListener("alpine:init", () => {
       if (nextKind === "network" && prevKind !== "network") {
         this.networkNoAudio = false;
       }
+      // Same defensive reset for SRT-listener mode: most upstream
+      // encoders push audio, so default NoAudio off when picking
+      // this source kind for the first time.
+      if (nextKind === "srt-listener" && prevKind !== "srt-listener") {
+        this.networkNoAudio = false;
+      }
+      // Leaving SRT-listener: drop the in-memory passphrase so it
+      // doesn't linger in the form (or get re-posted) if the operator
+      // later flips back to srt-listener for a different upstream.
+      if (prevKind === "srt-listener" && nextKind !== "srt-listener") {
+        this.srtListenPassphrase = "";
+        this._dirtySRTPass = false;
+      }
       // Picking "Network stream" without a URL would POST invalid
       // config (backend requires Input.URL) and show a save-failed
       // toast. Defer save until the operator types a URL.
@@ -824,6 +985,33 @@ document.addEventListener("alpine:init", () => {
       }
       this.saveConfig().then(() => this.preview?.refresh());
     },
+    onSRTListenPortChange()       { this._dirtyVideo = true; },
+    onSRTListenPortBlur()         {
+      // x-model.number coerces empty/NaN inputs to NaN. The backend
+      // would then reject the save with a port-range error. Clamp
+      // to the default before posting so the operator gets a working
+      // listener instead of a red toast. Surface the clamp via a
+      // toast — silently rewriting an operator's input is worse than
+      // a redundant message they'll ignore.
+      const original = this.srtListenPort;
+      let p = Number(original);
+      const valid = Number.isFinite(p) && p >= 1024 && p <= 65535;
+      if (!valid) {
+        p = 9999;
+        this.srtListenPort = p;
+        this.showToast("Port must be 1024–65535 — reset to 9999.");
+      }
+      this.saveConfig().then(() => this.preview?.refresh());
+    },
+    onSRTListenPassphraseChange() { this._dirtySRTPass = true; },
+    onSRTListenPassphraseBlur()   {
+      // Don't save if length is in the invalid band — the inline
+      // warning is already telling the operator what's wrong, and
+      // posting would just produce a duplicate red toast from the
+      // backend. Empty is valid (no encryption).
+      if (this.srtPassphraseLengthError) return;
+      this.saveConfig();
+    },
     onNetworkUrlChange()    { this._dirtyVideo = true; },
     onNetworkUrlBlur()      {
       // Blank URL means nothing valid to save yet. Skip.
@@ -832,8 +1020,10 @@ document.addEventListener("alpine:init", () => {
     },
     onNetworkNoAudioToggle() {
       this._dirtyVideo = true;
-      // NoAudio is only meaningful once a URL exists.
-      if (!(this.networkUrl || "").trim()) return;
+      // For network sources NoAudio is only meaningful once a URL
+      // exists (otherwise the backend rejects the save). For SRT-
+      // listener sources there's no URL, so the gate doesn't apply.
+      if (this.isNetworkSource && !(this.networkUrl || "").trim()) return;
       this.saveConfig();
     },
     onHDRToggle() {
