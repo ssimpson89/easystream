@@ -73,8 +73,13 @@ window.EasyStreamFormat = (() => {
 
   function presetTitle(p) {
     if (!p) return "-";
-    const fps = p.fps === 60 ? "60" : "";
-    return `${p.name} · ${p.height}p${fps} · ${p.videoKbps / 1000} Mbps`;
+    // The preset's `name` field already carries resolution + framerate
+    // ("Recommended (1080p30)", "Cinema 1080p (24p)"), so we don't
+    // need to reconstruct that from p.height + p.fps — which the
+    // server-side rename of `fps` to `fpsNum`/`fpsDen` would have
+    // broken anyway. Drop the redundant suffix and let the title
+    // surface only what the bitrate adds on top of the name.
+    return `${p.name} · ${p.videoKbps / 1000} Mbps`;
   }
 
   // Relative-time formatter for "starts in 1h 15m" style countdowns.

@@ -70,6 +70,33 @@ Supported modes: 1280x720@[30.000000 30.000000]fps, 1920x1080@[60.000000 60.0000
 	}
 }
 
+func TestChooseAVFoundationFramerateDisambiguates23976From24000(t *testing.T) {
+	// Cinema cameras frequently advertise BOTH 23.976 and 24.000.
+	// If the probe target is rounded to int (24), both modes tie at
+	// |diff|=0.024 vs 0.000 and the picker takes 24.000 — which
+	// reintroduces the cadence drift the cinema preset is designed
+	// to avoid. With a float target of 23.976 the exact-match mode
+	// wins. This is the C1/C2 fix from Copilot's review.
+	output := `Supported modes: 1920x1080@[23.976024 23.976024]fps, 1920x1080@[24.000000 24.000000]fps`
+
+	fps, ok := chooseAVFoundationFramerate(output, 23.976)
+	if !ok {
+		t.Fatal("expected framerate to be parsed")
+	}
+	if !strings.HasPrefix(fps, "23.976") {
+		t.Fatalf("expected 23.976 mode chosen for cinema target, got %q", fps)
+	}
+
+	// And the inverse: a 24.000 target picks 24.000 cleanly.
+	fps, ok = chooseAVFoundationFramerate(output, 24.0)
+	if !ok {
+		t.Fatal("expected framerate to be parsed")
+	}
+	if !strings.HasPrefix(fps, "24") || strings.HasPrefix(fps, "23") {
+		t.Fatalf("expected 24.000 mode chosen for integer 24 target, got %q", fps)
+	}
+}
+
 func TestArgsIncludesPreviewAudioMeterOutput(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.StreamName = "abc"
@@ -710,6 +737,61 @@ func TestArgsCinemaPresetEmits23976AndCorrectLevel(t *testing.T) {
 	// rounded 24.000 the cinema preset is specifically there to avoid.
 	if strings.Contains(joined, "-r 24 ") {
 		t.Errorf("cinema preset must use 24000/1001 not the rounded 24: %s", joined)
+	}
+}
+
+func TestEncoderArgsPerEncoderHonorsPresetLevel(t *testing.T) {
+	// Lock the per-preset level through every encoder path. Previously
+	// each path hardcoded "4.1" (and VAAPI/QSV "41"); a regression
+	// dropping back to a hardcoded literal would silently miscompile
+	// SPS for any preset whose level isn't 4.1. Testing each encoder
+	// directly via encoderArgs avoids the per-platform device probes
+	// the full Args() path triggers (VAAPI render node, decklink
+	// listing, etc.) so this runs everywhere.
+	preset, _ := quality.ByID("high") // 1080p60 → Level 4.2
+	cfg := DefaultConfig()
+	cfg.Preset = preset
+	gop := "120"
+	cases := []struct {
+		encoder Encoder
+		// substr that must appear in the encoder's args (encoder-specific
+		// level form: VAAPI/QSV strip the dot)
+		want string
+	}{
+		{EncoderVideoToolbox, "-level:v 4.2"},
+		{EncoderNVENC, "-level:v 4.2"},
+		{EncoderVAAPI, "-level 42"},
+		{EncoderQSV, "-level 42"},
+		{EncoderX264, "-level:v 4.2"},
+	}
+	for _, tc := range cases {
+		args := cfg.encoderArgs(tc.encoder, gop)
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, tc.want) {
+			t.Errorf("%s: expected %q in encoderArgs, got %s", tc.encoder, tc.want, joined)
+		}
+	}
+
+	// And the same for a cinema preset (Level 4.0) — verifies the
+	// level genuinely flows from preset to argv, not just for 4.2.
+	cinema, _ := quality.ByID("cinema-1080p24")
+	cfg.Preset = cinema
+	cinemaCases := []struct {
+		encoder Encoder
+		want    string
+	}{
+		{EncoderVideoToolbox, "-level:v 4.0"},
+		{EncoderNVENC, "-level:v 4.0"},
+		{EncoderVAAPI, "-level 40"},
+		{EncoderQSV, "-level 40"},
+		{EncoderX264, "-level:v 4.0"},
+	}
+	for _, tc := range cinemaCases {
+		args := cfg.encoderArgs(tc.encoder, "48")
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, tc.want) {
+			t.Errorf("%s (cinema): expected %q in encoderArgs, got %s", tc.encoder, tc.want, joined)
+		}
 	}
 }
 

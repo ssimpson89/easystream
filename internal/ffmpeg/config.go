@@ -1230,7 +1230,10 @@ func (c Config) buildInputs() (inputBuild, error) {
 				audio = resolved
 			}
 		}
-		fps := ProbeAVFoundationFramerate(c.Binary, device, c.Preset.FPS())
+		// FPSFloat (not FPS()) so 23.976 finds its exact device mode
+		// instead of tying with 24.000 — picking the rounded integer
+		// would defeat the whole point of the cinema preset.
+		fps := ProbeAVFoundationFramerate(c.Binary, device, c.Preset.FPSFloat())
 		if audio != "" {
 			return inputBuild{
 				args:     []string{"-f", "avfoundation", "-framerate", fps, "-i", device + ":" + audio},
@@ -1332,9 +1335,17 @@ func defaultString(value, fallback string) string {
 }
 
 // ProbeAVFoundationFramerate queries the given AVFoundation video device index
-// for its supported framerates, and returns the one closest to targetFPS. If
-// the probe fails or cannot parse the output, it defaults to "30".
-func ProbeAVFoundationFramerate(binary, deviceIndex string, targetFPS int) string {
+// for its supported framerates, and returns the one closest to targetFPS.
+//
+// targetFPS is a float64 so cinema presets (FPSNum/FPSDen = 24000/1001 =
+// 23.976023…) can find their exact device mode. If we rounded to an int
+// here, a camera advertising both 23.976 and 24.000 modes would tie at
+// diff≈0.024 vs 0.000 — picking 24.000 by accident and reintroducing
+// the cadence drift the cinema preset is specifically designed to avoid.
+// Callers should compute float64(FPSNum)/float64(FPSDen) and pass that.
+//
+// If the probe fails or cannot parse the output, it defaults to "30".
+func ProbeAVFoundationFramerate(binary, deviceIndex string, targetFPS float64) string {
 	if binary == "" {
 		binary = "ffmpeg"
 	}
@@ -1352,7 +1363,7 @@ var avfoundationModeRE = regexp.MustCompile(`@\[([0-9.]+)`)
 // avfoundationDeviceRE matches AVFoundation device listing lines like "[0] FaceTime HD Camera".
 var avfoundationDeviceRE = regexp.MustCompile(`\[(\d+)\]\s+(.+)`)
 
-func chooseAVFoundationFramerate(output string, targetFPS int) (string, bool) {
+func chooseAVFoundationFramerate(output string, targetFPS float64) (string, bool) {
 	if targetFPS <= 0 {
 		targetFPS = 30
 	}
@@ -1364,7 +1375,7 @@ func chooseAVFoundationFramerate(output string, targetFPS int) (string, bool) {
 			continue
 		}
 		if f, err := strconv.ParseFloat(matches[1], 64); err == nil {
-			diff := math.Abs(f - float64(targetFPS))
+			diff := math.Abs(f - targetFPS)
 			if diff < bestDiff {
 				bestDiff = diff
 				bestFPS = strconv.FormatFloat(f, 'f', -1, 64)

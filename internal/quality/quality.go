@@ -23,10 +23,11 @@ type Preset struct {
 	FPSDen int `json:"fpsDen"`
 	// H264Level is the H.264 profile-level emitted in the SPS. The
 	// macroblock-rate cap is per-level: 1080p30 fits in 4.1 (245.76 k
-	// MB/s); 1080p60 requires 4.2 (522 k MB/s); 1440p needs 5.1.
-	// Encoders happily emit a smaller value but downstream hardware
+	// MB/s); 1080p60 requires 4.2 (522 k MB/s); 1440p24 fits in 5.0
+	// (589 k MB/s) and 1440p60 would need 5.1. Encoders happily emit
+	// a smaller value than the spec allows, but downstream hardware
 	// decoders reject non-conformant SPS, so we let each preset
-	// declare its own.
+	// declare its own and the encoder paths honor it.
 	H264Level string `json:"h264Level"`
 	VideoKbps int    `json:"videoKbps"`
 	AudioKbps int    `json:"audioKbps"`
@@ -56,6 +57,19 @@ func (p Preset) FPS() int {
 		return p.FPSNum
 	}
 	return int(math.Round(float64(p.FPSNum) / float64(p.FPSDen)))
+}
+
+// FPSFloat returns the frame rate as a float64. Use this when the
+// consumer compares against floating-point values (e.g. the
+// AVFoundation mode probe, which needs to distinguish 23.976 from
+// 24.000 — comparing rounded integers ties at zero distance and the
+// probe picks the wrong mode). FPSFloat handles FPSDen<=0 the same
+// way FPS() does, so legacy presets that only set FPSNum still work.
+func (p Preset) FPSFloat() float64 {
+	if p.FPSDen <= 0 {
+		return float64(p.FPSNum)
+	}
+	return float64(p.FPSNum) / float64(p.FPSDen)
 }
 
 // FPSExpr returns the frame rate as a string ffmpeg accepts on -r.
