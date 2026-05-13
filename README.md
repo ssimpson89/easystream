@@ -1,12 +1,14 @@
 # EasyStream
 
-EasyStream is a self-hosted streaming app for small churches and other small organisations that want to send a Sunday service (or any recurring event) to YouTube Live without paying for a streaming subscription. It runs on a Mac mini, a Linux box, or a Raspberry Pi tucked in the AV closet, supervises FFmpeg for you, and gives volunteers a browser-based dashboard at `http://<your-box>:8080`. If you already use OBS or vMix, think of EasyStream as the scheduler and YouTube glue that those tools don't ship with — connect your encoder over SRT, see the feed in the dashboard, then press Go Live. Never go live and hope.
+EasyStream is a self-hosted live-stream scheduler for small churches and other small organisations — set Sunday 10am once and your YouTube broadcast goes live, runs, and ends without anyone touching a button. It runs on a Mac mini, a Linux box, or a Raspberry Pi tucked in the AV closet, supervises FFmpeg for you, and gives volunteers a browser-based dashboard at `http://<your-box>:8080`. Never go live and hope.
+
+> If you're already running OBS or vMix and just want a scheduler that drives the YouTube broadcast for you, that's exactly what this is. Push to EasyStream over SRT and it handles the rest.
 
 ## Why use it
 
-- **Schedule your Sunday 10am stream once and forget it.** EasyStream creates the YouTube broadcast 30 minutes ahead of time, starts the encoder at the scheduled minute, and stops cleanly when the service ends.
-- **Preview every source before you go live.** A WebRTC preview in the dashboard shows the actual encoded frame — what your viewers will see — not just a "input connected" indicator.
-- **A scheduler for OBS.** Run OBS or vMix as your production switcher, push to EasyStream over SRT, and let EasyStream handle the YouTube broadcast lifecycle. OBS has no native scheduler; EasyStream provides one.
+- **Set it and forget it.** Recurring weekly schedules ("Sunday 10am") plus one-off event overrides for the holiday service. EasyStream creates the YouTube broadcast, starts the stream on time, and transitions it to complete when the service ends.
+- **A scheduler for OBS.** OBS has no native scheduler — pair it with EasyStream's SRT receiver and you get scheduling for free. Keep OBS for scene switching; EasyStream drives the YouTube lifecycle.
+- **Preview every source before you go live.** A WebRTC preview in the dashboard shows the actual encoded frame — what your viewers will see — not just an "input connected" indicator.
 - **Auto-resume if the power flickers.** EasyStream persists your intent to be live. If the Mac mini reboots mid-service, it picks the stream back up automatically — viewers see a brief reconnect, not a stream end.
 - **Adaptive bitrate when the internet wobbles.** If upload bandwidth drops, EasyStream steps down to a lower quality preset and steps back up when the network recovers, instead of dropping the stream.
 
@@ -35,7 +37,6 @@ You'll need Go 1.25+ and FFmpeg installed (`brew install ffmpeg` on macOS, `apt 
 - **Source kinds:** USB webcam, HDMI/SDI capture card, network pull (RTSP / SRT / UDP / HLS), or **SRT listener** — EasyStream binds a port and waits for OBS, vMix, or a hardware encoder to push to it. The listener stays up between streams, so the same OBS connection survives the move from "preview" to "live."
 - **Destinations:** YouTube Live (with broadcast scheduling, auto go-live, and stop), custom RTMP/RTMPS (Twitch, Cloudflare, any ingest URL), or SRT push.
 - **Local HLS monitoring:** runs alongside your primary destination and serves a low-latency HLS playlist on your LAN. Open it in VLC or Safari from a phone in the sanctuary to spot-check what's going out.
-- **Recurring schedules and one-off overrides:** "Every Sunday at 10am" plus a special event entry for Christmas Eve.
 - **Quality presets:** from 480p emergency to 1080p60, matched to your upload bandwidth.
 - **Hardware encoder selection:** Apple VideoToolbox, NVIDIA NVENC, Intel QuickSync, VA-API — auto-detected and offered in the UI when available.
 - **HDR to SDR tone-mapping:** if your camera is HDR-capable, tick the box and EasyStream tone-maps to Rec.709 before encoding, so colours don't clip on YouTube.
@@ -69,7 +70,9 @@ YouTube integration is optional — without it you can still stream to a custom 
 
 ### 3. Schedule a stream
 
-Open **Destination > Scheduled** and click **+ Add** under **Recurring schedules**. Pick the days and time (e.g. Sunday 10:00), the timezone, the broadcast title, and a duration. EasyStream will create the YouTube broadcast 30 minutes before the slot, start the encoder at the scheduled minute, transition the broadcast to live once frames are flowing, and stop on time.
+This is the main event — once a schedule is set, most operators never touch the dashboard again on Sunday morning.
+
+Open **Destination > Scheduled** and click **+ Add** under **Recurring schedules**. Pick the days and time (e.g. Sunday 10:00), the timezone, the broadcast title, and a duration. EasyStream handles the entire YouTube broadcast lifecycle: it creates the broadcast 30 minutes before the slot, starts the encoder at the scheduled minute, transitions the broadcast to live once frames are flowing, and transitions it to complete when the duration elapses. You don't open YouTube Studio.
 
 For one-off events (Christmas Eve, a funeral), add a **Special event** instead — same fields, but a single date.
 
@@ -79,7 +82,7 @@ For a scheduled service, you don't have to do anything — EasyStream goes live 
 
 ## Why EasyStream over the alternatives
 
-- **OBS** is a fantastic production switcher and free, but it has no native scheduler and no concept of "manage the YouTube broadcast lifecycle." EasyStream pairs well with OBS — keep OBS for scene switching and push to EasyStream over SRT.
+- **OBS** is a fantastic production switcher and free, but OBS has no native scheduler — pair it with EasyStream's SRT receiver and you get scheduling for free. Keep OBS for scene switching and push to EasyStream over SRT.
 - **vMix** is excellent and has scheduling, but it's Windows-only and expensive — overkill for a small church that just needs to stream one camera on Sunday morning.
 - **YouTube Studio's built-in scheduling** lets you create a broadcast ahead of time, but you still have to be at the computer to start the encoder and press Go Live. EasyStream automates both ends.
 - **Restream / Castr / other SaaS** charge a monthly subscription and require uploading your video to them first, adding a network hop. EasyStream runs on hardware you already own and pushes directly to YouTube.
