@@ -1,12 +1,14 @@
 # EasyStream
 
-EasyStream is a self-hosted live-stream scheduler for small churches and other small organisations — set Sunday 10am once and your YouTube broadcast goes live, runs, and ends without anyone touching a button. It runs on a Mac mini, a Linux box, or a Raspberry Pi tucked in the AV closet, supervises FFmpeg for you, and gives volunteers a browser-based dashboard at `http://<your-box>:8080`. Never go live and hope.
+EasyStream is a self-hosted live-stream scheduler for small churches and other small organisations — set Sunday 10am once and your YouTube broadcast goes live, runs, and ends without anyone touching a button. It runs on a Mac mini, a Linux box, or a Raspberry Pi tucked in the AV closet, supervises FFmpeg for you, and gives volunteers a browser-based dashboard. Never go live and hope.
+
+By default the dashboard listens on `127.0.0.1:8080` (only reachable from the same machine). To open it from another device on your LAN — and to use YouTube OAuth from a different browser — set `EASYSTREAM_ADDR` to a routable address (e.g. `0.0.0.0:8080` or `easystream.local:8080`). The same address is used as the YouTube OAuth redirect URI, so it has to match what you register in Google Cloud Console.
 
 > If you're already running OBS or vMix and just want a scheduler that drives the YouTube broadcast for you, that's exactly what this is. Push to EasyStream over SRT and it handles the rest.
 
 ## Why use it
 
-- **Set it and forget it.** Recurring weekly schedules ("Sunday 10am") plus one-off event overrides for the holiday service. EasyStream creates the YouTube broadcast, starts the stream on time, and transitions it to complete when the service ends.
+- **Set it and forget it.** Recurring weekly schedules ("Sunday 10am") plus one-off event overrides for the holiday service. EasyStream creates the YouTube broadcast 15 minutes ahead of time, starts the encoder a few seconds before the scheduled minute, transitions the broadcast to live once frames are flowing, and transitions it to complete when the service ends.
 - **A scheduler for OBS.** OBS has no native scheduler — pair it with EasyStream's SRT receiver and you get scheduling for free. Keep OBS for scene switching; EasyStream drives the YouTube lifecycle.
 - **Preview every source before you go live.** A WebRTC preview in the dashboard shows the actual encoded frame — what your viewers will see — not just an "input connected" indicator.
 - **Auto-resume if the power flickers.** EasyStream persists your intent to be live. If the Mac mini reboots mid-service, it picks the stream back up automatically — viewers see a brief reconnect, not a stream end.
@@ -72,13 +74,13 @@ YouTube integration is optional — without it you can still stream to a custom 
 
 This is the main event — once a schedule is set, most operators never touch the dashboard again on Sunday morning.
 
-Open **Destination > Scheduled** and click **+ Add** under **Recurring schedules**. Pick the days and time (e.g. Sunday 10:00), the timezone, the broadcast title, and a duration. EasyStream handles the entire YouTube broadcast lifecycle: it creates the broadcast 30 minutes before the slot, starts the encoder at the scheduled minute, transitions the broadcast to live once frames are flowing, and transitions it to complete when the duration elapses. You don't open YouTube Studio.
+Open **Destination > Scheduled** and click **+ Add** under **Recurring schedules**. Pick the days and time (e.g. Sunday 10:00), the timezone, the broadcast title, and a duration. EasyStream handles the entire YouTube broadcast lifecycle: it creates the broadcast 15 minutes before the slot, starts the encoder a few seconds before the scheduled minute (so YouTube already has frames when it transitions to live), transitions the broadcast to live, and transitions it to complete when the duration elapses. You don't open YouTube Studio.
 
 For one-off events (Christmas Eve, a funeral), add a **Special event** instead — same fields, but a single date.
 
 ### 4. Going live
 
-For a scheduled service, you don't have to do anything — EasyStream goes live on its own. If you want to start a stream manually, click **Go Live Now**. To end early, click **Stop**. The dashboard shows the bitrate, dropped frames, audio levels, and the YouTube broadcast status throughout, and the WebRTC preview shows the encoded output you're sending. If the network degrades and adaptive bitrate is on, you'll see a banner saying so.
+For a scheduled service, you don't have to do anything — EasyStream goes live on its own. If you want to start a stream manually, click **Stream to YouTube** (or **Custom destination**) on the dashboard, confirm the broadcast title in the modal, and click **Start streaming**. To end early, click **Stop**. The dashboard shows the bitrate, dropped frames, audio levels, and the YouTube broadcast status throughout, and the WebRTC preview shows the encoded output you're sending. If the network degrades and adaptive bitrate is on, you'll see a banner saying so.
 
 ## Why EasyStream over the alternatives
 
