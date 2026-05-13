@@ -32,10 +32,13 @@ func TestArgsIncludeBandwidthAndRecoveryOptions(t *testing.T) {
 		"-colorspace bt709", // YT: Rec.709 SDR
 		"-color_range tv",   // explicit limited-range VUI signaling
 		"filler=1",          // VBV filler NALs maintain hard-CBR
+		"nal-hrd=cbr",       // HRD declarations consistent with CBR for strict CDNs
 		"open-gop=0",        // Closed GOP
 		"scenecut=0",        // No scene-change keyframes; predictable segmenting
+		"-fps_mode cfr",     // explicit constant frame rate; -r alone is not enough
 		"-tcp_keepalive 1",
 		"-rw_timeout 12000000",
+		"in_range=auto:out_range=tv",                         // honor full-range webcams, write limited-range
 		"aresample=async=1:min_hard_comp=0.100000:osr=48000", // soft drift correction; no PTS-warping
 		"ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/dev/stderr",
 		"rtmps://a.rtmps.youtube.com/live2/abc-def-ghi",
@@ -479,8 +482,8 @@ func TestArgsHLSToggleAlongsideRTMP(t *testing.T) {
 	if !strings.Contains(joined, "[f=flv:tcp_keepalive=1") {
 		t.Errorf("expected tee primary slave spec: %s", joined)
 	}
-	if !strings.Contains(joined, "[f=hls:hls_time=6") {
-		t.Errorf("expected tee HLS slave spec: %s", joined)
+	if !strings.Contains(joined, "[f=hls:hls_time=2") {
+		t.Errorf("expected tee HLS slave spec with 2s segments: %s", joined)
 	}
 	// HLS must NOT use -c copy on raw input — that produces invalid
 	// HLS because inputs are uyvy422/PCM, not H.264/AAC. tee shares
@@ -623,5 +626,53 @@ func TestDefaultEncoderIsX264(t *testing.T) {
 	}
 	if !strings.Contains(joined, "-preset veryfast") {
 		t.Fatalf("expected veryfast preset for libx264, got %s", joined)
+	}
+}
+
+func TestDefaultConfigRWTimeoutMatchesAsymmetricUplinks(t *testing.T) {
+	// 30 s, not the old 15 s — consumer cable/DSL uplinks routinely
+	// see >15 s TCP retransmit storms during peak service traffic;
+	// the previous default tripped a reconnect on every burp.
+	cfg := DefaultConfig()
+	if got := cfg.Network.RWTimeout; got != 30*time.Second {
+		t.Errorf("expected default RWTimeout=30s, got %v", got)
+	}
+}
+
+func TestArgsSDIInputDeclaresBT709ColorMetadata(t *testing.T) {
+	// The decklink demuxer doesn't tag primaries/transfer/matrix.
+	// Without setparams, downstream -color_* tags would be lying
+	// about color we never declared in the filter chain. Lock in
+	// the setparams prefix on the SDI path.
+	preset, _ := quality.ByID("recommended")
+	cfg := DefaultConfig()
+	cfg.Preset = preset
+	cfg.StreamName = "test"
+	cfg.Input = Input{
+		Kind:            InputSDI,
+		Backend:         "decklink",
+		VideoDevice:     "DeckLink Mini Recorder HD",
+		VideoDeviceName: "DeckLink Mini Recorder HD",
+	}
+	// verifyDeckLinkDevicePresent will fail in CI (no decklink hw),
+	// so we expect Args() to error before we can string-match. The
+	// guard runs early; for the assertion we want, just dial the
+	// chain construction by checking the buildInputs result if it
+	// completes. If your CI has decklink, this exercises the real
+	// path; if not, the test exits gracefully without a false fail.
+	args, err := cfg.Args()
+	if err != nil {
+		t.Skipf("decklink not available in this environment: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	for _, expected := range []string{
+		"setparams=color_primaries=bt709",
+		"color_trc=bt709",
+		"colorspace=bt709",
+		"range=tv",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Errorf("expected SDI setparams to include %q: %s", expected, joined)
+		}
 	}
 }
