@@ -79,6 +79,14 @@ type Event struct {
 	StreamID        string    `json:"streamId,omitempty"`
 }
 
+// maxPrepLeadMinutes is the upper bound for PrepLeadMinutes in
+// minute units, derived from the canonical MaxPrepLead Duration so a
+// future change to that constant flows through the validators and
+// their error messages without a second edit.
+func maxPrepLeadMinutes() int {
+	return int(MaxPrepLead / time.Minute)
+}
+
 // storeData is the JSON file format.
 type storeData struct {
 	Schedules  []Schedule           `json:"schedules"`
@@ -184,8 +192,8 @@ func normalizeSchedule(sched Schedule) (Schedule, error) {
 	if sched.PrepLeadMinutes < 0 {
 		return Schedule{}, fmt.Errorf("prep lead must be 0 or more")
 	}
-	if sched.PrepLeadMinutes > 60 {
-		return Schedule{}, fmt.Errorf("prep lead cannot exceed 60 minutes")
+	if max := maxPrepLeadMinutes(); sched.PrepLeadMinutes > max {
+		return Schedule{}, fmt.Errorf("prep lead cannot exceed %d minutes", max)
 	}
 	if sched.Privacy == "" {
 		sched.Privacy = "unlisted"
@@ -301,8 +309,8 @@ func normalizeOverride(o Override) (Override, error) {
 	if o.PrepLeadMinutes < 0 {
 		return Override{}, fmt.Errorf("prep lead must be 0 or more")
 	}
-	if o.PrepLeadMinutes > 60 {
-		return Override{}, fmt.Errorf("prep lead cannot exceed 60 minutes")
+	if max := maxPrepLeadMinutes(); o.PrepLeadMinutes > max {
+		return Override{}, fmt.Errorf("prep lead cannot exceed %d minutes", max)
 	}
 	if o.Privacy == "" {
 		o.Privacy = "unlisted"

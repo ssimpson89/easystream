@@ -62,8 +62,10 @@ type StreamController interface {
 // schedule package stays free of HTTP/OAuth dependencies.
 type BroadcastController interface {
 	IsAuthenticated() bool
-	// CreateBroadcast creates the YouTube broadcast resource. Called at
-	// the prep boundary (StartTime - prepLead).
+	// CreateBroadcast creates the YouTube broadcast resource. Called
+	// at the prep boundary, which is StartTime - eventPrepLead(event)
+	// — zero by default (JIT), set per-event when an operator wants
+	// the watch URL available in advance.
 	CreateBroadcast(ctx context.Context, title, description string, scheduledStart time.Time, privacy string) (broadcastID string, err error)
 	// CreateBoundStream creates a non-reusable stream for this broadcast
 	// and binds it. Returns the ingest details.
@@ -284,10 +286,24 @@ func (s *Scheduler) tick(ctx context.Context) {
 	}
 }
 
-// eventPrepLead returns the per-event prep lead as a Duration. Bounded
-// to [0, MaxPrepLead] so a hand-edited schedules.json with an absurd
-// value can't make the scheduler create a broadcast hours in advance.
-// Zero means "create the broadcast at StartTime" (JIT — the default).
+// eventPrepLead returns the per-event prep lead as a Duration. Zero
+// means "create the broadcast at StartTime" (JIT — the default).
+//
+// Two-layer bounds:
+//
+//  1. normalizeSchedule / normalizeOverride reject out-of-range values
+//     at API time with a clear error, so the operator finds out
+//     immediately. That's the authoritative gate.
+//  2. This function clamps anything that slipped past the normalizer
+//     (a hand-edited schedules.json, a config produced by a future
+//     version with a wider bound, etc.) to [0, MaxPrepLead]. The
+//     scheduler should never create a broadcast hours in advance
+//     just because someone fat-fingered a JSON edit; this is the
+//     defense-in-depth backstop.
+//
+// In normal operation no path can reach this clamp because the
+// normalizer rejected the value upstream — leaving it in costs
+// nothing and saves a real foot-gun.
 func eventPrepLead(event Event) time.Duration {
 	if event.PrepLeadMinutes <= 0 {
 		return 0
