@@ -556,12 +556,16 @@ func previewInputs(config ffmpeg.Config) previewInputBuild {
 		// ffmpeg can't bind the same port (collision), so show a
 		// black placeholder until the main stream starts — then the
 		// main stream's [v_preview] RTP feed takes over via the
-		// shared 127.0.0.1:52001 UDP listener.
+		// shared 127.0.0.1:52001 UDP listener. Audio uses the same
+		// silent-track helper as every other placeholder branch; the
+		// previous `sine=...:beep_factor=0` was inconsistent and
+		// (without beep_factor's intended periodic-beep behavior)
+		// would emit a continuous 1 kHz tone into the preview.
 		return previewInputBuild{
 			args: []string{
 				"-re",
 				"-f", "lavfi", "-i", "color=size=640x360:rate=15:color=0x111418",
-				"-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:beep_factor=0",
+				"-f", "lavfi", "-i", previewSilentAudio,
 			},
 			videoMap: "0:v", audioMap: "1:a",
 		}

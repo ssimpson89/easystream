@@ -96,15 +96,19 @@ type Input struct {
 const defaultSRTListenPort = 9999
 
 // reservedListenerPort reports whether the operator-picked SRT
-// listener port collides with a port EasyStream itself holds.
-// The supervisor would error with "address already in use" at
-// start; surfacing it in Validate gives a clearer message.
+// listener port collides with a port EasyStream itself holds at a
+// hard-coded value. Catching these in Validate produces a clearer
+// error than letting ffmpeg fail with "address already in use".
+//
+// Only truly-fixed internal ports are listed here. The HTTP listen
+// address (default :8080) is operator-configurable via EASYSTREAM_ADDR
+// and the HLS server is mounted on that same listener — neither has a
+// known port to reserve at this layer. Conflicts with the configured
+// HTTP port surface as a clear bind error from the OS at receiver
+// start, which is acceptable for the rare case an operator picks the
+// same number.
 func reservedListenerPort(port int) (bool, string) {
 	switch port {
-	case 8080:
-		return true, "EasyStream's web UI"
-	case 8888:
-		return true, "the local HLS playlist server"
 	case 52001, 52002:
 		return true, "the preview RTP pipeline"
 	}

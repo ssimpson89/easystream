@@ -307,9 +307,12 @@
               </label>
               <label>Passphrase (optional)
                 <input type="password" autocomplete="off"
+                       maxlength="79"
                        x-model="srtListenPassphrase"
                        @input="onSRTListenPassphraseChange()" @blur="onSRTListenPassphraseBlur()"
-                       placeholder="Leave blank, or set 10–79 characters">
+                       :placeholder="hasSavedSRTPassphrase
+                         ? 'Already set — leave blank to keep'
+                         : 'Leave blank, or set 10–79 characters'">
                 <span class="row-hint" x-show="!srtPassphraseLengthError">
                   Encrypts the stream. Must match the value entered in the
                   encoder. Leave blank for no encryption.

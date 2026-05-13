@@ -72,6 +72,13 @@ document.addEventListener("alpine:init", () => {
     // for an upstream encoder to push to it.
     srtListenPort:       9999,
     srtListenPassphrase: "",
+    // hasSavedSRTPassphrase reflects "the server has a passphrase
+    // stored" without the UI ever learning its value. Set from the
+    // sentinel the API returns in place of the real passphrase
+    // (RedactedCredentialSentinel). Used to drive the placeholder so
+    // the operator sees "set — leave blank to keep" instead of an
+    // empty field that would imply no encryption.
+    hasSavedSRTPassphrase: false,
     localIPs:            [],
     // Operator-chosen host IP for the rendered publish URL. Empty
     // means "use whatever localIPs[0] resolves to", which is the
@@ -338,14 +345,16 @@ document.addEventListener("alpine:init", () => {
         this.sourceIsHDR = !!config.input?.sourceIsHdr;
         this.srtListenPort = config.input?.srtListenPort || 9999;
       }
-      // Passphrase is write-only on the wire — server never echoes it.
-      // Only hydrate from config if the operator hasn't touched it,
-      // AND the server actually sent a value. Otherwise we'd clobber
-      // a freshly-saved passphrase on the next SSE push (where the
-      // server reply contains srtListenPassphrase="").
-      if (!this._dirtySRTPass && config.input?.srtListenPassphrase) {
-        this.srtListenPassphrase = config.input.srtListenPassphrase;
-      }
+      // Passphrase is write-only on the wire. The server replies
+      // with the literal sentinel "REDACTED" when a passphrase is
+      // stored, and "" otherwise — never the actual value. We
+      // track only the "set or not" bit; the input field itself is
+      // never touched by hydration so a freshly-typed value stays
+      // visible (and stays in the rendered publish URL the operator
+      // is about to paste into OBS). Cleared explicitly on kind
+      // transition away from srt-listener, not here.
+      const serverPass = config.input?.srtListenPassphrase || "";
+      this.hasSavedSRTPassphrase = serverPass === "REDACTED";
     },
 
     // ============================================================
@@ -505,11 +514,20 @@ document.addEventListener("alpine:init", () => {
     // Inline length validation so the operator sees the SRT spec rule
     // (10-79 chars) as soon as they're in the invalid band, not after
     // the backend save round-trips an error. Empty is valid (= no
-    // encryption); >= 10 is valid (clamped to 79 in the input).
+    // encryption). The input also carries maxlength=79 so typing past
+    // the upper bound is blocked at the keyboard level; the upper-
+    // bound branch below is a belt-and-suspenders catch for paste
+    // operations that route around maxlength on some browsers.
     get srtPassphraseLengthError() {
       const v = this.srtListenPassphrase || "";
-      if (v.length === 0 || v.length >= 10) return "";
-      return `Too short — SRT requires 10–79 characters (currently ${v.length}).`;
+      if (v.length === 0) return "";
+      if (v.length < 10) {
+        return `Too short — SRT requires 10–79 characters (currently ${v.length}).`;
+      }
+      if (v.length > 79) {
+        return `Too long — SRT requires 10–79 characters (currently ${v.length}).`;
+      }
+      return "";
     },
     selectSRTHostIP(ip) {
       this.srtSelectedHostIP = ip;
@@ -881,10 +899,19 @@ document.addEventListener("alpine:init", () => {
         payload.input.noAudio = !!this.networkNoAudio;
       }
       // SRT listener: carry port + passphrase + NoAudio.
+      // Passphrase round-trip rules:
+      //   - operator typed something (dirty) → send that literal value,
+      //     including "" to deliberately clear an existing passphrase.
+      //   - operator didn't touch the field but server has one stored
+      //     → send the sentinel so the backend keeps the stored value.
+      //   - no stored passphrase and operator didn't type → omit the
+      //     field entirely.
       if (decoded.kind === "srt-listener") {
         payload.input.srtListenPort = Number(this.srtListenPort) || 9999;
-        if (this.srtListenPassphrase) {
+        if (this._dirtySRTPass) {
           payload.input.srtListenPassphrase = this.srtListenPassphrase;
+        } else if (this.hasSavedSRTPassphrase) {
+          payload.input.srtListenPassphrase = "REDACTED";
         }
         payload.input.noAudio = !!this.networkNoAudio;
       }
@@ -993,8 +1020,10 @@ document.addEventListener("alpine:init", () => {
     },
     onNetworkNoAudioToggle() {
       this._dirtyVideo = true;
-      // NoAudio is only meaningful once a URL exists.
-      if (!(this.networkUrl || "").trim()) return;
+      // For network sources NoAudio is only meaningful once a URL
+      // exists (otherwise the backend rejects the save). For SRT-
+      // listener sources there's no URL, so the gate doesn't apply.
+      if (this.isNetworkSource && !(this.networkUrl || "").trim()) return;
       this.saveConfig();
     },
     onHDRToggle() {

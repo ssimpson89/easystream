@@ -289,11 +289,21 @@ func TestArgsSRTListenerInput(t *testing.T) {
 }
 
 func TestSRTListenerValidateRejectsEasyStreamPorts(t *testing.T) {
-	for _, port := range []int{8080, 8888, 52001, 52002} {
+	// Only ports EasyStream binds at fixed values are reserved. The
+	// HTTP listen address is operator-configurable, so a collision
+	// with the (default) :8080 surfaces at receiver bind time rather
+	// than here.
+	for _, port := range []int{52001, 52002} {
 		cfg := srtListenerCfg(port, "")
 		if err := cfg.Validate(); err == nil {
 			t.Errorf("expected validation to reject reserved port %d", port)
 		}
+	}
+	// And conversely: 8080 is no longer reserved (it's a configurable
+	// default, not an internal port). The validator must accept it.
+	cfg := srtListenerCfg(8080, "")
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("8080 should validate (configurable HTTP default), got %v", err)
 	}
 }
 

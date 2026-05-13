@@ -253,6 +253,15 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			strings.Contains(in.URL, ffmpeg.RedactedCredentialSentinel) {
 			in.URL = s.config.Input.URL
 		}
+		// Same round-trip preservation for the SRT listener passphrase.
+		// configResponse renders an existing passphrase as the
+		// sentinel; if the operator saves the form without touching
+		// that field, we must keep the stored value rather than
+		// overwriting it with the literal sentinel.
+		if in.Kind == ffmpeg.InputSRTListener &&
+			in.SRTListenPassphrase == ffmpeg.RedactedCredentialSentinel {
+			in.SRTListenPassphrase = s.config.Input.SRTListenPassphrase
+		}
 		s.config.Input = in
 	}
 	if patch.Encoder != nil {
@@ -425,6 +434,16 @@ func (s *Server) configResponse(config ffmpeg.Config) map[string]any {
 	input := config.Input
 	if input.URL != "" {
 		input.URL = ffmpeg.RedactURLCredentials(input.URL)
+	}
+	// SRTListenPassphrase is symmetric with URL credentials: write-only
+	// over the wire. Returning it in /api/config and SSE state would
+	// expose the SRT encryption key to anyone with a tab open. Send
+	// the sentinel instead so the UI can still know "a passphrase is
+	// set" (e.g. to surface the credential-warning hint) without ever
+	// learning the value. configUpdate detects the sentinel on save
+	// and preserves the stored value.
+	if input.SRTListenPassphrase != "" {
+		input.SRTListenPassphrase = ffmpeg.RedactedCredentialSentinel
 	}
 	result := map[string]any{
 		"ffmpegBinary": config.Binary,
