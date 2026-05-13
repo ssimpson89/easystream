@@ -243,9 +243,16 @@ func (r *Receiver) runLoop(ctx context.Context, cfg DesiredConfig, done chan str
 			return
 		}
 
-		// Process exited unexpectedly. Record + back off.
-		errMsg := ""
-		if err != nil {
+		// Process exited unexpectedly. Prefer the libsrt/ffmpeg stderr
+		// line scanStderr captured (e.g. "Address already in use",
+		// "Connection setup failure: Connection rejected, error: ...")
+		// over cmd.Wait()'s less-useful "exit status N" string. Only
+		// fall back to the exit-status form if stderr told us nothing.
+		r.mu.Lock()
+		stderrLast := r.status.LastError
+		r.mu.Unlock()
+		errMsg := stderrLast
+		if errMsg == "" && err != nil {
 			errMsg = err.Error()
 		}
 		r.logger.Printf("ingest/srt: receiver exited (%v) — retry in %s", err, backoff)
@@ -306,6 +313,31 @@ func (r *Receiver) runOnce(ctx context.Context, cfg DesiredConfig, startedAt tim
 		r.parseProgress(stdout, cfg.Port, startedAt, restarts)
 	}()
 
+	// Peer-stale watchdog. ffmpeg may not emit a progress block
+	// when the SRT peer disconnects without ffmpeg also exiting
+	// (e.g. libsrt holds the listener open between connections).
+	// Without this ticker, PeerConnected would stay true on the UI
+	// indefinitely — Status() recomputes staleness on read, but no
+	// SSE push is ever fired because setStatus is only invoked from
+	// the progress-block boundary. The ticker drives an explicit
+	// re-publish so the operator sees "waiting for your encoder to
+	// connect" again within a few seconds of OBS dropping out.
+	watchdogCtx, watchdogCancel := context.WithCancel(ctx)
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		ticker := time.NewTicker(peerStaleAfter / 2)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-watchdogCtx.Done():
+				return
+			case <-ticker.C:
+				r.republishIfPeerStale(cfg.Port, startedAt, restarts)
+			}
+		}
+	}()
+
 	// Capture stderr for the last error line. libsrt prints
 	// connection failures (passphrase mismatch, port-in-use, etc.)
 	// here. We don't log every line — too noisy — but the most
@@ -318,16 +350,56 @@ func (r *Receiver) runOnce(ctx context.Context, cfg DesiredConfig, startedAt tim
 	}()
 
 	err = cmd.Wait()
+	watchdogCancel()
 	<-progressDone
 	<-stderrDone
+	<-watchdogDone
 	_ = stdout.Close()
 	_ = stderr.Close()
 	return err
 }
 
+// republishIfPeerStale checks whether the last frame is older than
+// peerStaleAfter while the receiver believes it's still connected,
+// and if so emits a fresh setStatus to drive an SSE push so the UI
+// flips from "Encoder connected" back to "waiting for your encoder
+// to connect". ffmpeg holds the SRT listener open between encoder
+// sessions, so progress-block boundaries can't be relied on for
+// disconnect detection.
+func (r *Receiver) republishIfPeerStale(port int, startedAt time.Time, restarts int) {
+	r.mu.Lock()
+	cur := r.status
+	stale := cur.PeerConnected && !cur.LastFrameAt.IsZero() && time.Since(cur.LastFrameAt) > peerStaleAfter
+	r.mu.Unlock()
+	if !stale {
+		return
+	}
+	r.setStatus(Status{
+		State:         StateRunning,
+		Port:          port,
+		PeerConnected: false,
+		FPS:           0,
+		BitrateKbps:   0,
+		StartedAt:     startedAt,
+		RestartCount:  restarts,
+	})
+}
+
 // buildReceiverArgs constructs the ffmpeg command line. Kept in a
 // standalone function so tests can verify it without spawning a
 // process.
+//
+// Threat-model note: the SRT passphrase is embedded in the ffmpeg
+// URL argv, which means any local user on the host can read it via
+// `ps`, /proc/<pid>/cmdline, or similar. EasyStream's primary
+// deployment is a single-operator desktop / Pi running this daemon
+// under one account, where that exposure is acceptable. Hardening
+// would require either replacing the ffmpeg-based receiver with a
+// direct libsrt binding in Go (so the passphrase stays in process
+// memory), or having ffmpeg consume the passphrase from an env
+// var / file — neither of which libsrt currently accepts via its
+// URL options. Documented here so a future maintainer doesn't
+// quietly inherit the assumption.
 func buildReceiverArgs(cfg DesiredConfig) []string {
 	srtURL := ffmpeg.SRTListenerURL(cfg.Port, cfg.Passphrase)
 	relayURL := fmt.Sprintf("udp://127.0.0.1:%d?pkt_size=1316", cfg.RelayPort)
@@ -407,6 +479,14 @@ func (r *Receiver) parseProgress(rc io.Reader, port int, startedAt time.Time, re
 			})
 		}
 	}
+	// A scanner error stops the loop silently, which means the receiver
+	// would no longer update fps / peer state — surface it in the log
+	// so the failure mode is debuggable. Common cases: progress line
+	// exceeded the 64 KiB buffer (shouldn't happen), or the stdout
+	// pipe got an I/O error.
+	if err := scanner.Err(); err != nil {
+		r.logger.Printf("ingest/srt: progress parser stopped: %v", err)
+	}
 }
 
 // scanStderr keeps the most recent stderr line in Status.LastError so
@@ -428,14 +508,27 @@ func (r *Receiver) scanStderr(rc io.Reader) {
 		r.status.LastError = clean
 		r.mu.Unlock()
 	}
+	if err := scanner.Err(); err != nil {
+		r.logger.Printf("ingest/srt: stderr scanner stopped: %v", err)
+	}
 }
 
 // setStatus replaces the entire status snapshot and fires the
 // onChange callback when state or peer-connectedness flipped. We
 // don't fire on every progress tick — that would flood the SSE hub.
+//
+// LastError is a sticky field: parseProgress writes a fresh Status
+// every ~0.5 s with LastError="", and scanStderr writes the field
+// directly in a separate goroutine. Without preservation, every
+// progress tick would wipe the most recent stderr line — so we
+// carry it over unless the caller is explicitly clearing it (next
+// transitions to Idle/Starting, which want a fresh LastError).
 func (r *Receiver) setStatus(next Status) {
 	r.mu.Lock()
 	prev := r.status
+	if next.LastError == "" && next.State == StateRunning {
+		next.LastError = prev.LastError
+	}
 	r.status = next
 	cb := r.onChange
 	r.mu.Unlock()

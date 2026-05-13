@@ -112,6 +112,31 @@ func TestStatusPeerGoesStaleOnRead(t *testing.T) {
 	}
 }
 
+func TestSetStatusPreservesLastErrorOnProgressTick(t *testing.T) {
+	// Regression: parseProgress writes Status with LastError="" on
+	// every tick. If setStatus blindly overwrites, scanStderr's
+	// captured libsrt error vanishes the moment the next progress
+	// block arrives. The fix preserves LastError across StateRunning
+	// transitions.
+	r := NewReceiver(nil)
+	defer r.Stop()
+	// Simulate scanStderr writing a captured error.
+	r.mu.Lock()
+	r.status.LastError = "Address already in use"
+	r.mu.Unlock()
+	// Simulate parseProgress's snapshot — no LastError set.
+	r.setStatus(Status{State: StateRunning, Port: 9999, FPS: 30, PeerConnected: true})
+	if got := r.Status().LastError; got != "Address already in use" {
+		t.Errorf("expected LastError preserved across progress tick, got %q", got)
+	}
+	// But a fresh Starting transition should clear the field —
+	// otherwise stale errors linger into the next attempt's UI.
+	r.setStatus(Status{State: StateStarting, Port: 9999})
+	if got := r.Status().LastError; got != "" {
+		t.Errorf("expected LastError cleared on StateStarting transition, got %q", got)
+	}
+}
+
 func TestApplyIdleStopsReceiver(t *testing.T) {
 	// Apply with Port=0 must transition the receiver to idle even if
 	// it was previously configured. Without this, switching the

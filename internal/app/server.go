@@ -45,7 +45,11 @@ type Server struct {
 	supervisor  *ffmpeg.Supervisor
 	adaptive    *ffmpeg.AdaptiveController
 	preview     *preview.Server
-	srtReceiver *ingest.Receiver // always-on SRT listener; nil when not configured
+	// srtReceiver supervises the always-on SRT listener ffmpeg. Always
+	// constructed at NewServer time; idle (no child process) until
+	// reconcileSRTReceiver applies a config whose Input.Kind is
+	// InputSRTListener.
+	srtReceiver *ingest.Receiver
 	hlsServer   *hls.Server
 	devScanner *devices.Scanner
 	ytAuth     *youtube.Auth
