@@ -41,6 +41,14 @@ const (
 	tickInterval = 1 * time.Second
 )
 
+// maxPrepLeadMinutes is the upper bound in minute units, derived from
+// the canonical MaxPrepLead Duration so the validators and their
+// error messages stay in lockstep with the constant. Co-located with
+// MaxPrepLead so the duration ↔ int conversion is one read away.
+func maxPrepLeadMinutes() int {
+	return int(MaxPrepLead / time.Minute)
+}
+
 // StreamController is the interface the scheduler uses to start/stop FFmpeg.
 type StreamController interface {
 	// StartWithIngest starts FFmpeg pushing to the given destination.
@@ -296,14 +304,14 @@ func (s *Scheduler) tick(ctx context.Context) {
 //     immediately. That's the authoritative gate.
 //  2. This function clamps anything that slipped past the normalizer
 //     (a hand-edited schedules.json, a config produced by a future
-//     version with a wider bound, etc.) to [0, MaxPrepLead]. The
-//     scheduler should never create a broadcast hours in advance
-//     just because someone fat-fingered a JSON edit; this is the
-//     defense-in-depth backstop.
+//     version with a wider bound, a future code path that builds an
+//     Event without going through the normalizer) to [0, MaxPrepLead].
+//     The scheduler should never create a broadcast hours in advance
+//     just because the upstream gate failed.
 //
-// In normal operation no path can reach this clamp because the
-// normalizer rejected the value upstream — leaving it in costs
-// nothing and saves a real foot-gun.
+// Treat this clamp as the real safety net, not as redundancy. Even if
+// every current code path is normalized today, the clamp is what
+// makes that guarantee robust against future drift.
 func eventPrepLead(event Event) time.Duration {
 	if event.PrepLeadMinutes <= 0 {
 		return 0

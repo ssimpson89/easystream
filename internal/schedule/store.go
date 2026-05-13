@@ -79,14 +79,6 @@ type Event struct {
 	StreamID        string    `json:"streamId,omitempty"`
 }
 
-// maxPrepLeadMinutes is the upper bound for PrepLeadMinutes in
-// minute units, derived from the canonical MaxPrepLead Duration so a
-// future change to that constant flows through the validators and
-// their error messages without a second edit.
-func maxPrepLeadMinutes() int {
-	return int(MaxPrepLead / time.Minute)
-}
-
 // storeData is the JSON file format.
 type storeData struct {
 	Schedules  []Schedule           `json:"schedules"`
