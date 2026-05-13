@@ -291,10 +291,11 @@
                  the upstream encoder the publish URL we render below. -->
             <div class="sub-form" x-show="isSRTListenerSource">
               <p class="hint">
-                This computer waits for OBS, vMix, or a hardware encoder to
-                send video to it. The listener is open as soon as you save
-                this source — you'll see the encoder's feed in the preview
-                before you press Go Live.
+                Useful when you want to keep your existing switcher (OBS,
+                vMix, a hardware encoder) and let EasyStream handle the
+                schedule and the YouTube broadcast. The listener is open
+                as soon as you save this source — you'll see the encoder's
+                feed in the preview before you press Go Live.
               </p>
               <label>Port number
                 <input type="number" min="1024" max="65535"
@@ -354,9 +355,9 @@
               </p>
               <p class="hint">
                 If the Video status stays yellow ("waiting for your encoder")
-                after you start streaming in OBS, double-check that the URL
-                pasted into OBS matches the one above exactly, and that the
-                passphrase (if any) matches.
+                after the encoder starts streaming, double-check that the URL
+                pasted into the encoder matches the one above exactly, and
+                that the passphrase (if any) matches.
               </p>
               <label class="checkbox-row">
                 <input type="checkbox" x-model="networkNoAudio" @change="onNetworkNoAudioToggle()">

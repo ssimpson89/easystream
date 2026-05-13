@@ -623,7 +623,7 @@ document.addEventListener("alpine:init", () => {
         const lastErr = this.ingest?.lastError || "";
         if (ingestState === "running" && peer) {
           v = { icon: "video", label: "Video", status: "green",
-                detail: `OBS connected — receiving ${fps.toFixed(0)} fps on port ${port}` };
+                detail: `Encoder connected — receiving ${fps.toFixed(0)} fps on port ${port}` };
         } else if (ingestState === "running") {
           v = { icon: "video", label: "Video", status: "yellow",
                 detail: `Listening on port ${port} — waiting for your encoder to connect` };
