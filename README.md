@@ -168,3 +168,7 @@ internal/
   ui/                   Embedded web UI (HTML/CSS/JS)
   youtube/              OAuth 2.0, YouTube Data API v3 client
 ```
+
+## License
+
+EasyStream is released under the [MIT License](LICENSE).
