@@ -120,8 +120,8 @@ document.addEventListener("alpine:init", () => {
     // (in applyState) so the baseline never drifts.
     _lastVideoSourceValue: "",
 
-    schedForm: { id: "", name: "", days: [], time: "09:00", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted", enabled: true },
-    ovrForm:   { id: "", name: "", wallClock: "", timezone: "America/Chicago", durationMin: 120, title: "", description: "", privacy: "unlisted" },
+    schedForm: { id: "", name: "", days: [], time: "09:00", timezone: "America/Chicago", durationMin: 120, prepLeadMinutes: 0, title: "", description: "", privacy: "unlisted", enabled: true },
+    ovrForm:   { id: "", name: "", wallClock: "", timezone: "America/Chicago", durationMin: 120, prepLeadMinutes: 0, title: "", description: "", privacy: "unlisted" },
 
     // Internal
     _eventSource:   null,
@@ -1094,11 +1094,11 @@ document.addEventListener("alpine:init", () => {
     // ============================================================
     _blankSchedForm() {
       return { id: "", name: "", days: [], time: "09:00", timezone: this.schedForm.timezone || "America/Chicago",
-               durationMin: 120, title: "", description: "", privacy: "unlisted", enabled: true };
+               durationMin: 120, prepLeadMinutes: 0, title: "", description: "", privacy: "unlisted", enabled: true };
     },
     _blankOvrForm() {
       return { id: "", name: "", wallClock: "", timezone: this.ovrForm.timezone || "America/Chicago",
-               durationMin: 120, title: "", description: "", privacy: "unlisted" };
+               durationMin: 120, prepLeadMinutes: 0, title: "", description: "", privacy: "unlisted" };
     },
     openSchedForm() { this.schedForm = this._blankSchedForm(); this.ovrFormOpen = false; this.schedFormOpen = true; },
     openOvrForm()   { this.ovrForm = this._blankOvrForm();     this.schedFormOpen = false; this.ovrFormOpen = true; },
@@ -1106,7 +1106,12 @@ document.addEventListener("alpine:init", () => {
       this.schedForm = {
         id: s.id, name: s.name || "", days: [...(s.days || [])],
         time: s.time || "09:00", timezone: s.timezone || "America/Chicago",
-        durationMin: s.durationMin || 120, title: s.title || "",
+        durationMin: s.durationMin || 120,
+        // Use ?? so a saved 0 (JIT — the common case) doesn't fall
+        // through to a falsy-coercion default. The whole point of the
+        // field is that 0 is a real, intentional value.
+        prepLeadMinutes: s.prepLeadMinutes ?? 0,
+        title: s.title || "",
         description: s.description || "", privacy: s.privacy || "unlisted",
         enabled: s.enabled !== false,
       };
@@ -1118,7 +1123,9 @@ document.addEventListener("alpine:init", () => {
       this.ovrForm = {
         id: o.id, name: o.name || "", wallClock: this.toDateTimeLocal(o.startTime),
         timezone: o.timezone || this.ovrForm.timezone || "America/Chicago",
-        durationMin: o.durationMin || 120, title: o.title || "",
+        durationMin: o.durationMin || 120,
+        prepLeadMinutes: o.prepLeadMinutes ?? 0,
+        title: o.title || "",
         description: o.description || "", privacy: o.privacy || "unlisted",
       };
       if (o.presetId) this.selectedPreset = o.presetId;
@@ -1139,6 +1146,16 @@ document.addEventListener("alpine:init", () => {
     },
     async saveSchedule() {
       if (this.schedForm.days.length === 0) { this.showToast("Select at least one day."); return; }
+      // Coerce to a whole number — Go's JSON decode into int rejects
+      // a fractional value (the backend would 400). Round on the way
+      // in and write the rounded value back so the form reflects what
+      // we're about to save.
+      const pl = Math.round(Number(this.schedForm.prepLeadMinutes));
+      if (!Number.isFinite(pl) || pl < 0 || pl > 60) {
+        this.showToast("Pre-create minutes must be a whole number between 0 and 60.");
+        return;
+      }
+      this.schedForm.prepLeadMinutes = pl;
       const sched = {
         ...this.schedForm,
         presetId: this.selectedPreset,
@@ -1169,6 +1186,14 @@ document.addEventListener("alpine:init", () => {
     },
     async saveOverride() {
       if (!this.ovrForm.wallClock) { this.showToast("Pick a date and time."); return; }
+      // Same integer-coercion as saveSchedule — Go's JSON decode into
+      // int rejects fractional values. Round + write back.
+      const pl = Math.round(Number(this.ovrForm.prepLeadMinutes));
+      if (!Number.isFinite(pl) || pl < 0 || pl > 60) {
+        this.showToast("Pre-create minutes must be a whole number between 0 and 60.");
+        return;
+      }
+      this.ovrForm.prepLeadMinutes = pl;
       const override = {
         ...this.ovrForm,
         presetId: this.selectedPreset,

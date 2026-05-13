@@ -523,6 +523,17 @@
                   </select>
                 </label>
               </div>
+              <label>Pre-create broadcast (minutes ahead)
+                <input type="number" min="0" max="60" step="1"
+                       x-model.number="schedForm.prepLeadMinutes"
+                       placeholder="0">
+                <span class="row-hint">
+                  Leave at <code>0</code> so the broadcast appears on
+                  YouTube only when the stream starts. Increase if you
+                  want to share the watch link in advance (e.g.
+                  <code>15</code> to post the URL in your bulletin).
+                </span>
+              </label>
               <label>YouTube title <input x-model="schedForm.title" placeholder="Sunday Morning Service - Live"></label>
               <label>Description <textarea rows="2" x-model="schedForm.description" placeholder="Join us for worship"></textarea></label>
               <div class="form-actions">
@@ -574,6 +585,15 @@
                   </select>
                 </label>
               </div>
+              <label>Pre-create broadcast (minutes ahead)
+                <input type="number" min="0" max="60" step="1"
+                       x-model.number="ovrForm.prepLeadMinutes"
+                       placeholder="0">
+                <span class="row-hint">
+                  <code>0</code> means the broadcast appears when the
+                  stream starts. Increase to share the watch link early.
+                </span>
+              </label>
               <label>YouTube title <input x-model="ovrForm.title" placeholder="Easter Sunday Service - Live"></label>
               <label>Description <textarea rows="2" x-model="ovrForm.description"></textarea></label>
               <div class="form-actions">

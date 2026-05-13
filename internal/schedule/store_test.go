@@ -71,6 +71,62 @@ func TestDeleteScheduleClearsBroadcastMappings(t *testing.T) {
 	}
 }
 
+// TestLoadOldScheduleFileTreatsMissingPrepLeadAsJIT locks in the
+// migration contract: schedules.json files written before
+// PrepLeadMinutes existed must decode with PrepLeadMinutes=0 (JIT),
+// NOT inherit the old 15-minute global default. Without this guard,
+// dropping the global default to 0 would have no effect on persisted
+// schedules and the scheduled-broadcast-appears-early bug would
+// silently survive an upgrade.
+func TestLoadOldScheduleFileTreatsMissingPrepLeadAsJIT(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "schedules.json")
+	old := `{
+		"schedules": [{
+			"id": "legacy-1",
+			"name": "Sunday service",
+			"days": ["sunday"],
+			"time": "10:00",
+			"timezone": "America/Chicago",
+			"durationMin": 120,
+			"presetId": "recommended",
+			"title": "Sunday service",
+			"privacy": "unlisted",
+			"enabled": true
+		}],
+		"overrides": [{
+			"id": "legacy-2",
+			"name": "Christmas",
+			"startTime": "2026-12-24T16:00:00Z",
+			"durationMin": 90,
+			"presetId": "recommended",
+			"title": "Christmas Eve",
+			"privacy": "unlisted"
+		}]
+	}`
+	if err := os.WriteFile(path, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store, _, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("expected clean load, got %v", err)
+	}
+	scheds := store.Schedules()
+	if len(scheds) != 1 {
+		t.Fatalf("expected 1 schedule, got %d", len(scheds))
+	}
+	if scheds[0].PrepLeadMinutes != 0 {
+		t.Errorf("legacy schedule must decode as PrepLeadMinutes=0 (JIT), got %d", scheds[0].PrepLeadMinutes)
+	}
+	overrides := store.Overrides()
+	if len(overrides) != 1 {
+		t.Fatalf("expected 1 override, got %d", len(overrides))
+	}
+	if overrides[0].PrepLeadMinutes != 0 {
+		t.Errorf("legacy override must decode as PrepLeadMinutes=0 (JIT), got %d", overrides[0].PrepLeadMinutes)
+	}
+}
+
 func TestDeleteOverrideClearsBroadcastMappings(t *testing.T) {
 	store, _, err := NewStore(t.TempDir() + "/schedules.json")
 	if err != nil {
