@@ -95,6 +95,25 @@ type Input struct {
 // the Haivision examples and most upstream encoder docs.
 const defaultSRTListenPort = 9999
 
+// SRTRelayPort is the loopback UDP port the always-on SRT receiver
+// (internal/ingest) writes MPEG-TS to. The main encoder pipeline and
+// the preview both read from this port instead of binding the SRT
+// listener themselves, so a single OBS connection survives the
+// transition from "preview" to "live" without renegotiating.
+const SRTRelayPort = 52003
+
+// SRTRelayURL is the URL the main pipeline / preview read to consume
+// what the SRT receiver buffered. Loopback only; the receiver and
+// reader are always co-resident in this process tree.
+//
+// fifo_size + overrun_nonfatal absorb brief bursts (a slow consumer
+// momentarily, or ffmpeg's startup warm-up) without killing the
+// pipeline. Sized at 50 MiB (50000000 bytes / 1316-byte packets), enough
+// for several seconds of high-bitrate 1080p at a normal SRT framerate.
+func SRTRelayURL() string {
+	return fmt.Sprintf("udp://127.0.0.1:%d?fifo_size=50000000&overrun_nonfatal=1", SRTRelayPort)
+}
+
 // reservedListenerPort reports whether the operator-picked SRT
 // listener port collides with a port EasyStream itself holds at a
 // hard-coded value. Catching these in Validate produces a clearer
@@ -111,6 +130,8 @@ func reservedListenerPort(port int) (bool, string) {
 	switch port {
 	case 52001, 52002:
 		return true, "the preview RTP pipeline"
+	case SRTRelayPort:
+		return true, "EasyStream's internal SRT relay"
 	}
 	return false, ""
 }
@@ -1105,10 +1126,13 @@ func (c Config) buildInputs() (inputBuild, error) {
 		return c.buildNetworkInput(), nil
 	}
 	if c.Input.Kind == InputSRTListener {
-		args, audioMap := NetworkInputArgs(
-			SRTListenerURL(c.Input.SRTListenPort, c.Input.SRTListenPassphrase),
-			c.Input.NoAudio,
-		)
+		// The main pipeline doesn't bind the SRT port directly — the
+		// always-on internal/ingest receiver does, and relays the
+		// MPEG-TS to a loopback UDP socket. We just read that. Means
+		// going-live doesn't drop the upstream encoder's connection,
+		// and the preview can show the OBS feed before the operator
+		// presses Go Live.
+		args, audioMap := NetworkInputArgs(SRTRelayURL(), c.Input.NoAudio)
 		return inputBuild{args: args, videoMap: "0:v", audioMap: audioMap}, nil
 	}
 

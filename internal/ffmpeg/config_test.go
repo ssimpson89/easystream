@@ -1,6 +1,7 @@
 package ffmpeg
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -268,17 +269,21 @@ func TestSRTListenerURLConstruction(t *testing.T) {
 }
 
 func TestArgsSRTListenerInput(t *testing.T) {
+	// The main pipeline reads from the loopback UDP relay, not the
+	// SRT URL directly — internal/ingest binds the SRT port and
+	// copies MPEG-TS to SRTRelayPort. Asserting on the relay URL
+	// here keeps the contract between the two layers explicit:
+	// changing one without the other breaks this test.
 	cfg := srtListenerCfg(9000, "")
 	args, err := cfg.Args()
 	if err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(args, " ")
+	relayHost := fmt.Sprintf("udp://127.0.0.1:%d", SRTRelayPort)
 	for _, expected := range []string{
 		"-fflags discardcorrupt+genpts",
-		"-i srt://0.0.0.0:9000?mode=listener",
-		"transtype=live",
-		"tlpktdrop=1",
+		"-i " + relayHost,
 		"-map [v]",
 		"-map [a_enc]",
 	} {
@@ -286,14 +291,21 @@ func TestArgsSRTListenerInput(t *testing.T) {
 			t.Errorf("expected %q in SRT listener args: %s", expected, joined)
 		}
 	}
+	// And just as critically: the raw SRT URL must NOT appear. If it
+	// did, the main pipeline would compete with the ingest receiver
+	// for the same SRT port and one of the two would fail to bind.
+	if strings.Contains(joined, "srt://0.0.0.0:9000") {
+		t.Errorf("main pipeline must not bind SRT directly — that's the ingest receiver's job: %s", joined)
+	}
 }
 
 func TestSRTListenerValidateRejectsEasyStreamPorts(t *testing.T) {
 	// Only ports EasyStream binds at fixed values are reserved. The
 	// HTTP listen address is operator-configurable, so a collision
 	// with the (default) :8080 surfaces at receiver bind time rather
-	// than here.
-	for _, port := range []int{52001, 52002} {
+	// than here. The internal SRT relay (SRTRelayPort) introduced by
+	// the always-on receiver IS fixed, so it's reserved.
+	for _, port := range []int{52001, 52002, SRTRelayPort} {
 		cfg := srtListenerCfg(port, "")
 		if err := cfg.Validate(); err == nil {
 			t.Errorf("expected validation to reject reserved port %d", port)

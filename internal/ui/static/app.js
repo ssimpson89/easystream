@@ -36,6 +36,11 @@ document.addEventListener("alpine:init", () => {
     overrides:         [],
     encoders:          [],
     capabilities:      { srt: true }, // assume yes until /api/status disabuses us
+    // Always-on SRT receiver state. Populated when the saved source
+    // is srt-listener; the pre-flight Video pill keys off this
+    // independently of the main stream supervisor so the operator
+    // sees "OBS connected — receiving 30 fps" before pressing Go Live.
+    ingest:            { state: "idle", peerConnected: false, fps: 0, port: 0 },
 
     // -------- UI state --------
     view:            "dashboard",    // "dashboard" | "settings"
@@ -288,6 +293,7 @@ document.addEventListener("alpine:init", () => {
       this.capabilities      = data.capabilities || this.capabilities;
       this.activeBroadcastId = data.activeBroadcastId || "";
       this.localIPs          = data.localIPs || [];
+      this.ingest            = data.ingest || { state: "idle", peerConnected: false, fps: 0, port: 0 };
       this.syncFormFromConfig(data.config);
     },
 
@@ -601,34 +607,35 @@ document.addEventListener("alpine:init", () => {
                 detail: `${liveUrl} — not verified (start stream to check)` };
         }
       } else if (this.isSRTListenerSource) {
-        // SRT listener mode flips the connection direction: we bind a
-        // port and wait for the upstream encoder to push to us. There
-        // is no remote URL to redact and no local device to check —
-        // status is purely a function of "did frames arrive yet?".
-        // Wording mirrors the network branch's "Connecting / connected
-        // / waiting" shape, but in terms the audience (volunteers
-        // running OBS/vMix) actually maps to: "Opening port", "waiting
-        // for the encoder", "receiving N fps".
-        const port = Number(this.config?.input?.srtListenPort) || this.srtListenPort || 9999;
-        const fpsRaw = this.stream?.lastProgress?.fps;
+        // SRT listener mode is fed by the always-on ingest receiver
+        // (binds the SRT port as soon as the source is saved), not
+        // by the main supervisor. So the pre-flight pill keys off
+        // ingest state — that's the only signal that proves an
+        // upstream encoder is actually connected. Frames flow into
+        // the local UDP relay BEFORE the operator presses Go Live,
+        // and the preview shows them: by the time they press Start,
+        // they've already verified the feed.
+        const port = this.ingest?.port || Number(this.config?.input?.srtListenPort) || this.srtListenPort || 9999;
+        const fpsRaw = this.ingest?.fps;
         const fps = Number(fpsRaw) || 0;
-        if (this.stream?.state === "running") {
-          if (fps > 0) {
-            v = { icon: "video", label: "Video", status: "green",
-                  detail: `Receiving ${fps.toFixed(0)} fps on port ${port}` };
-          } else {
-            v = { icon: "video", label: "Video", status: "yellow",
-                  detail: `Listening on port ${port} — start your encoder to begin` };
-          }
-        } else if (this.stream?.state === "starting" || this.stream?.state === "restarting") {
+        const ingestState = this.ingest?.state || "idle";
+        const peer = !!this.ingest?.peerConnected;
+        const lastErr = this.ingest?.lastError || "";
+        if (ingestState === "running" && peer) {
+          v = { icon: "video", label: "Video", status: "green",
+                detail: `Encoder connected — receiving ${fps.toFixed(0)} fps on port ${port}` };
+        } else if (ingestState === "running") {
+          v = { icon: "video", label: "Video", status: "yellow",
+                detail: `Listening on port ${port} — waiting for your encoder to connect` };
+        } else if (ingestState === "starting") {
           v = { icon: "video", label: "Video", status: "yellow",
                 detail: `Opening port ${port}…` };
-        } else if (this.stream?.state === "failed") {
+        } else if (ingestState === "failed") {
           v = { icon: "video", label: "Video", status: "red",
-                detail: this.stream?.lastError || `Could not open port ${port}` };
+                detail: lastErr || `Could not open port ${port}` };
         } else {
           v = { icon: "video", label: "Video", status: "yellow",
-                detail: `Port ${port} — start the stream to begin listening` };
+                detail: `Receiver idle — save the source to bind port ${port}` };
         }
       } else {
         const presence = this.devicePresence("video");

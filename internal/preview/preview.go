@@ -552,23 +552,17 @@ func previewInputs(config ffmpeg.Config) previewInputBuild {
 		netArgs, audioMap := ffmpeg.NetworkInputArgs(config.Input.URL, config.Input.NoAudio)
 		return previewInputBuild{args: netArgs, videoMap: "0:v", audioMap: audioMap}
 	case ffmpeg.InputSRTListener:
-		// SRT listener mode binds a port locally. The preview's own
-		// ffmpeg can't bind the same port (collision), so show a
-		// black placeholder until the main stream starts — then the
-		// main stream's [v_preview] RTP feed takes over via the
-		// shared 127.0.0.1:52001 UDP listener. Audio uses the same
-		// silent-track helper as every other placeholder branch; the
-		// previous `sine=...:beep_factor=0` was inconsistent and
-		// (without beep_factor's intended periodic-beep behavior)
-		// would emit a continuous 1 kHz tone into the preview.
-		return previewInputBuild{
-			args: []string{
-				"-re",
-				"-f", "lavfi", "-i", "color=size=640x360:rate=15:color=0x111418",
-				"-f", "lavfi", "-i", previewSilentAudio,
-			},
-			videoMap: "0:v", audioMap: "1:a",
-		}
+		// SRT listener mode is fed by the always-on internal/ingest
+		// receiver, which binds the SRT port and relays MPEG-TS to
+		// 127.0.0.1:SRTRelayPort. The preview just reads that — same
+		// UDP relay the main pipeline reads — so the operator sees
+		// the actual encoder feed BEFORE going live. If no peer is
+		// currently pushing, ffmpeg blocks on the read and the
+		// preview shows no signal, which matches the pre-flight
+		// pill state. (The PR #7 placeholder branch using
+		// previewSilentAudio is obsolete in this branch.)
+		netArgs, audioMap := ffmpeg.NetworkInputArgs(ffmpeg.SRTRelayURL(), config.Input.NoAudio)
+		return previewInputBuild{args: netArgs, videoMap: "0:v", audioMap: audioMap}
 	default:
 		backend := config.Input.Backend
 		if backend == "" {
