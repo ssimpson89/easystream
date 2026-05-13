@@ -8,22 +8,19 @@ import (
 	"time"
 )
 
-// Default lead times. Tuned for church-service streaming where the
+// Lead times. Tuned for church-service streaming where the
 // scheduled-broadcast indicator must NOT appear on the channel ahead
 // of the actual service, and we need a brief warmup so YouTube sees
 // ingest before transitioning to live.
+//
+// Prep lead is per-event (Event.PrepLeadMinutes), zero = JIT. There
+// is no global DefaultPrepLead constant — an earlier global default
+// would surface a "premiering soon" indicator on the channel before
+// the service, which the operator never wanted. Per-schedule opt-in
+// via Schedule / Override .PrepLeadMinutes lets a specific event
+// (e.g. a Christmas Eve service whose watch URL goes in a bulletin)
+// carry its own lead time.
 const (
-	// DefaultPrepLead: JIT — when the per-event PrepLeadMinutes is
-	// zero (the common case), the broadcast is created at StartTime
-	// itself. An earlier default would surface a "premiering soon"
-	// indicator on the YouTube channel before the service, which the
-	// operator never wanted. Per-schedule opt-in via Schedule /
-	// Override .PrepLeadMinutes lets a specific event (e.g. a
-	// Christmas Eve service whose watch URL goes in a bulletin) carry
-	// its own lead time. This constant is kept as the floor / API
-	// default; tests reference it.
-	DefaultPrepLead = 0 * time.Minute
-
 	// DefaultPreroll: how far before StartTime to start FFmpeg pushing.
 	// 10 s is enough for YouTube's ingest to register and report
 	// streamStatus="active" before the scheduled start time, so the

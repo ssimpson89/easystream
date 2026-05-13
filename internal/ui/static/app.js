@@ -1146,11 +1146,16 @@ document.addEventListener("alpine:init", () => {
     },
     async saveSchedule() {
       if (this.schedForm.days.length === 0) { this.showToast("Select at least one day."); return; }
-      const pl = Number(this.schedForm.prepLeadMinutes);
+      // Coerce to a whole number — Go's JSON decode into int rejects
+      // a fractional value (the backend would 400). Round on the way
+      // in and write the rounded value back so the form reflects what
+      // we're about to save.
+      const pl = Math.round(Number(this.schedForm.prepLeadMinutes));
       if (!Number.isFinite(pl) || pl < 0 || pl > 60) {
-        this.showToast("Pre-create minutes must be between 0 and 60.");
+        this.showToast("Pre-create minutes must be a whole number between 0 and 60.");
         return;
       }
+      this.schedForm.prepLeadMinutes = pl;
       const sched = {
         ...this.schedForm,
         presetId: this.selectedPreset,
@@ -1181,11 +1186,14 @@ document.addEventListener("alpine:init", () => {
     },
     async saveOverride() {
       if (!this.ovrForm.wallClock) { this.showToast("Pick a date and time."); return; }
-      const pl = Number(this.ovrForm.prepLeadMinutes);
+      // Same integer-coercion as saveSchedule — Go's JSON decode into
+      // int rejects fractional values. Round + write back.
+      const pl = Math.round(Number(this.ovrForm.prepLeadMinutes));
       if (!Number.isFinite(pl) || pl < 0 || pl > 60) {
-        this.showToast("Pre-create minutes must be between 0 and 60.");
+        this.showToast("Pre-create minutes must be a whole number between 0 and 60.");
         return;
       }
+      this.ovrForm.prepLeadMinutes = pl;
       const override = {
         ...this.ovrForm,
         presetId: this.selectedPreset,
