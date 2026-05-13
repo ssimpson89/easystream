@@ -449,7 +449,15 @@ func DefaultConfig() Config {
 		IngestURL:  "rtmps://a.rtmps.youtube.com/live2",
 		StreamName: "",
 		Network: Network{
-			RWTimeout:    15 * time.Second,
+			// 30 s gives consumer asymmetric uplinks enough headroom
+			// to recover from brief TCP retransmit storms without
+			// FFmpeg tripping a reconnect every time the link burps.
+			// The previous 15 s value triggered reconnect cycles on
+			// hiccupping cable/DSL during high-bitrate moments;
+			// 30 s still detects real failures quickly enough that
+			// the supervisor's restart-on-exit kicks in within an
+			// acceptable window.
+			RWTimeout:    30 * time.Second,
 			TCPKeepalive: true,
 		},
 		LogLevel: "warning",
@@ -605,10 +613,16 @@ func (c Config) primaryOutputArgs() []string {
 
 // hlsOutputArgs returns the direct-output args for the HLS sidecar
 // when there's no primary destination configured.
+//
+// hls_time=2 matches the encoder's 2-second GOP (every keyframe is
+// also a segment boundary), which drops the lower bound on a typical
+// 3-segment HLS player buffer from ~18 s to ~6 s. The local-monitor
+// use case (phone on the sanctuary LAN watching from VLC or Safari)
+// benefits directly; HLS keeps independent_segments for compatibility.
 func (c Config) hlsOutputArgs() []string {
 	return []string{
 		"-f", "hls",
-		"-hls_time", "6",
+		"-hls_time", "2",
 		"-hls_list_size", "10",
 		"-hls_flags", "delete_segments+append_list+independent_segments",
 		"-hls_segment_filename", fmt.Sprintf("%s/seg%%d.ts", c.HLSDir),
@@ -644,9 +658,12 @@ func (c Config) primaryTeeSlave() (string, error) {
 }
 
 // hlsTeeSlave returns the tee-muxer slave spec for the HLS sidecar.
+// hls_time mirrors hlsOutputArgs (2 s, matches GOP) for consistent
+// monitoring latency whether HLS runs alongside a primary destination
+// (tee path) or alone (direct-output path).
 func (c Config) hlsTeeSlave() string {
 	return fmt.Sprintf(
-		"[f=hls:hls_time=6:hls_list_size=10:hls_flags=delete_segments+append_list+independent_segments:hls_segment_filename=%s/seg%%d.ts]%s/stream.m3u8",
+		"[f=hls:hls_time=2:hls_list_size=10:hls_flags=delete_segments+append_list+independent_segments:hls_segment_filename=%s/seg%%d.ts]%s/stream.m3u8",
 		c.HLSDir, c.HLSDir,
 	)
 }
@@ -735,11 +752,21 @@ func (c Config) argsWithInputs(inputs inputBuild) ([]string, error) {
 			"zscale=p=bt709,tonemap=tonemap=hable:desat=0," +
 			"zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
 	}
+	// videoColorPrefix declares input color metadata for sources that
+	// arrive without it (SDI/Decklink). Empty for inputs that carry
+	// valid metadata; either way prepended before deint/tonemap/scale.
+	colorPrefix := inputs.videoColorPrefix
+	// in_range=auto:out_range=tv on the main scale: many USB webcams
+	// deliver yuvj420p (full-range) which downstream code tags as
+	// -color_range tv. Without the scale filter being told to
+	// remap, blacks crush and whites blow when YouTube transcodes.
+	// The auto-detected input range respects the camera; the
+	// explicit limited output matches the VUI we'll write later.
 	videoChain := fmt.Sprintf(
-		"[%s]%s%sscale=%d:%d:force_original_aspect_ratio=decrease,"+
+		"[%s]%s%s%sscale=%d:%d:force_original_aspect_ratio=decrease:in_range=auto:out_range=tv,"+
 			"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,split=2[v][v_pre_src];"+
 			"[v_pre_src]fps=%d,scale=640:360:force_original_aspect_ratio=decrease[v_preview]",
-		inputs.videoMap, deint, tonemap, w, h, w, h, previewFPS,
+		inputs.videoMap, colorPrefix, deint, tonemap, w, h, w, h, previewFPS,
 	)
 	audioChain := fmt.Sprintf(
 		"[%s]aresample=async=1:min_hard_comp=0.100000:osr=48000,asplit=3[a_enc][a_preview][a_stats];"+
@@ -773,11 +800,19 @@ func (c Config) argsWithInputs(inputs inputBuild) ([]string, error) {
 		"-color_range", "tv",
 	)
 	args = append(args, c.encoderArgs(encoder, gop)...)
+	// -fps_mode cfr explicitly locks output to constant frame rate.
+	// -r alone forces the target rate but doesn't pin CFR semantics;
+	// fps_mode is the modern replacement for the deprecated -vsync
+	// flag (per ffmpeg docs, -vsync will be removed). Without an
+	// explicit fps_mode the muxer can fall back to auto, which on
+	// SRT-listener and HLS paths sometimes lets duplicate-PTS frames
+	// through and ruins downstream segment cadence.
 	args = append(args,
 		"-b:v", c.Preset.VideoBitrate(),
 		"-maxrate", c.Preset.VideoBitrate(),
 		"-bufsize", c.Preset.BufferSize(),
 		"-g", gop,
+		"-fps_mode", "cfr",
 		"-r", fmt.Sprintf("%d", c.Preset.FPS),
 		"-pix_fmt", "yuv420p",
 	)
@@ -925,8 +960,12 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 
 	default: // libx264 (software)
 		// Industry-standard live H.264 CBR settings:
-		//   filler=1     VBV filler NALs to maintain hard-CBR without
-		//                emitting HRD parameters in the SPS VUI.
+		//   nal-hrd=cbr  declare CBR HRD parameters in the SPS VUI so
+		//                strict CDNs (and some downstream re-muxers)
+		//                read a consistent rate model and stop flagging
+		//                the stream as VBR-with-filler.
+		//   filler=1     VBV filler NALs to maintain hard-CBR by padding
+		//                under-budget frames up to the rate.
 		//   open-gop=0   closed GOP — every keyframe is IDR, no frames
 		//                reference across keyframe boundaries.
 		//   scenecut=0   no scene-change keyframes; keyframes only at
@@ -944,7 +983,7 @@ func (c Config) encoderArgs(encoder Encoder, gop string) []string {
 			"-level:v", "4.1",
 			"-sc_threshold", "0",
 			"-bf", "2",
-			"-x264-params", "filler=1:open-gop=0:scenecut=0:keyint=" + gop + ":min-keyint=" + gop,
+			"-x264-params", "nal-hrd=cbr:filler=1:open-gop=0:scenecut=0:keyint=" + gop + ":min-keyint=" + gop,
 		}
 	}
 }
@@ -1023,6 +1062,15 @@ type inputBuild struct {
 	args     []string // -f / -i / etc. for each input
 	videoMap string   // e.g. "0:v" or "0:v:0"
 	audioMap string   // e.g. "0:a" or "1:a"
+	// videoColorPrefix is prepended to the main filter chain (before
+	// yadif/tonemap/scale) for inputs that arrive with undeclared
+	// color metadata. SDI/Decklink in particular: the demuxer doesn't
+	// always set primaries/transfer/matrix, so any downstream
+	// -color_* tag we write would be lying. A setparams filter
+	// declares what we know the cable carries (Rec.709, limited
+	// range) so the filter graph operates on correctly-tagged frames.
+	// Empty for inputs that already carry valid color metadata.
+	videoColorPrefix string
 	// audioFallbackDevice is set when buildInputs substituted silent
 	// audio because the configured audio device couldn't be resolved.
 	// Names the missing device so the supervisor can watch for it to
@@ -1246,6 +1294,11 @@ func (c Config) buildInputs() (inputBuild, error) {
 		return inputBuild{
 			args:     []string{"-f", "decklink", "-audio_input", "embedded", "-i", device},
 			videoMap: "0:v", audioMap: "0:a",
+			// The decklink demuxer doesn't set primaries/transfer/
+			// matrix even though SDI carries Rec.709 limited-range
+			// per SMPTE 274M / 296M. Declare it so the filter chain
+			// and the -color_* tags we emit aren't lying.
+			videoColorPrefix: "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,",
 		}, nil
 
 	default:
