@@ -98,12 +98,13 @@ func (f *fakeBroadcastController) CompleteBroadcast(broadcastID, streamID string
 	f.completeCalls++
 }
 
-// newTestScheduler builds a Scheduler with zero prep lead and zero preroll
-// so tests can fire the lifecycle in a single tick.
+// newTestScheduler builds a Scheduler with zero preroll so tests fire
+// the lifecycle in a single tick. Prep lead is now per-event (set on
+// the Schedule/Override), so it doesn't pass through here.
 func newTestScheduler(t *testing.T, store *Store, stream StreamController, broadcast BroadcastController) *Scheduler {
 	t.Helper()
-	return NewSchedulerWithLeads(store, stream, broadcast,
-		log.New(testWriter{t}, "", 0), 0, 0)
+	return NewSchedulerWithPreroll(store, stream, broadcast,
+		log.New(testWriter{t}, "", 0), 0)
 }
 
 func TestSchedulerStartsDueEvent(t *testing.T) {
@@ -145,48 +146,16 @@ func TestSchedulerStartsDueEvent(t *testing.T) {
 	}
 }
 
-func TestSchedulerDoesNotPrepareFutureEventEarly(t *testing.T) {
+// TestSchedulerJITDefaultDoesNotPrepareEarly locks in the contract
+// that the default (PrepLeadMinutes=0) creates the YouTube broadcast
+// only at StartTime — no scheduled-broadcast indicator appearing on
+// the channel ahead of the service.
+func TestSchedulerJITDefaultDoesNotPrepareEarly(t *testing.T) {
 	store, _, err := NewStore(t.TempDir() + "/schedules.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = store.CreateOverride(Override{
-		Name:        "Soon",
-		StartTime:   time.Now().UTC().Add(1 * time.Hour),
-		DurationMin: 30,
-		PresetID:    "recommended",
-		Title:       "Soon",
-		Privacy:     "unlisted",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	stream := &fakeStreamController{}
-	yt := &fakeBroadcastController{}
-	// Use real default prep lead so 1 hour out really is "before prep".
-	s := NewScheduler(store, stream, yt, log.New(testWriter{t}, "", 0))
-	s.tick(context.Background())
-
-	if stream.IsStreaming() {
-		t.Fatal("did not expect future event to start before scheduled time")
-	}
-	yt.mu.Lock()
-	defer yt.mu.Unlock()
-	if yt.createBroadcastCalls != 0 {
-		t.Fatalf("did not expect future event to be prepared early, got %d creates", yt.createBroadcastCalls)
-	}
-}
-
-// TestSchedulerPrepCreatesBroadcastAhead verifies that an event inside
-// the prep window but before its start time gets the broadcast created
-// without starting FFmpeg.
-func TestSchedulerPrepCreatesBroadcastAhead(t *testing.T) {
-	store, _, err := NewStore(t.TempDir() + "/schedules.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Event starts in 30 seconds, with a 1-minute prep lead.
+	// No PrepLeadMinutes set → JIT default.
 	_, err = store.CreateOverride(Override{
 		Name:        "Soon",
 		StartTime:   time.Now().UTC().Add(30 * time.Second),
@@ -198,12 +167,48 @@ func TestSchedulerPrepCreatesBroadcastAhead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	stream := &fakeStreamController{}
 	yt := &fakeBroadcastController{}
-	// prepLead=1m so the event is in prep window; preroll=0 so it does
-	// NOT yet start FFmpeg (still 30s before start).
-	s := NewSchedulerWithLeads(store, stream, yt,
-		log.New(testWriter{t}, "", 0), time.Minute, 0)
+	s := NewScheduler(store, stream, yt, log.New(testWriter{t}, "", 0))
+	s.tick(context.Background())
+
+	if stream.IsStreaming() {
+		t.Fatal("did not expect future event to start before scheduled time")
+	}
+	yt.mu.Lock()
+	defer yt.mu.Unlock()
+	if yt.createBroadcastCalls != 0 {
+		t.Fatalf("JIT default: did not expect broadcast to be pre-created, got %d creates", yt.createBroadcastCalls)
+	}
+}
+
+// TestSchedulerHonorsPerEventPrepLead is the opt-in case: an operator
+// who set PrepLeadMinutes on the override gets the broadcast created
+// inside that window. FFmpeg still does not start until preroll.
+func TestSchedulerHonorsPerEventPrepLead(t *testing.T) {
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Event starts in 30 seconds; per-event prep lead is 1 minute, so
+	// "now" is inside the prep window.
+	_, err = store.CreateOverride(Override{
+		Name:            "Soon",
+		StartTime:       time.Now().UTC().Add(30 * time.Second),
+		DurationMin:     30,
+		PrepLeadMinutes: 1,
+		PresetID:        "recommended",
+		Title:           "Soon",
+		Privacy:         "unlisted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &fakeStreamController{}
+	yt := &fakeBroadcastController{}
+	// Preroll=0 so the test doesn't have to wait for the normal warm-up.
+	s := newTestScheduler(t, store, stream, yt)
 	s.tick(context.Background())
 
 	if stream.IsStreaming() {
@@ -212,10 +217,47 @@ func TestSchedulerPrepCreatesBroadcastAhead(t *testing.T) {
 	yt.mu.Lock()
 	defer yt.mu.Unlock()
 	if yt.createBroadcastCalls != 1 {
-		t.Fatalf("expected broadcast to be pre-created, got %d", yt.createBroadcastCalls)
+		t.Fatalf("expected broadcast to be pre-created from per-event lead, got %d", yt.createBroadcastCalls)
 	}
 	if yt.transitionCalls != 0 {
 		t.Fatalf("transition should not start until preroll: got %d", yt.transitionCalls)
+	}
+}
+
+// TestSchedulerEventsWithIndependentPrepLeads verifies one event with a
+// lead and one without (both due "in the prep window of the leaded one")
+// behave independently — only the leaded event pre-creates.
+func TestSchedulerEventsWithIndependentPrepLeads(t *testing.T) {
+	store, _, err := NewStore(t.TempDir() + "/schedules.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	soon := time.Now().UTC().Add(30 * time.Second)
+	// Override A: has a 1-min lead → inside prep window now.
+	_, err = store.CreateOverride(Override{
+		Name: "With lead", StartTime: soon, DurationMin: 30,
+		PrepLeadMinutes: 1, PresetID: "recommended", Title: "A", Privacy: "unlisted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Override B: no lead → JIT, not yet due.
+	_, err = store.CreateOverride(Override{
+		Name: "JIT", StartTime: soon, DurationMin: 30,
+		PresetID: "recommended", Title: "B", Privacy: "unlisted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &fakeStreamController{}
+	yt := &fakeBroadcastController{}
+	s := newTestScheduler(t, store, stream, yt)
+	s.tick(context.Background())
+
+	yt.mu.Lock()
+	defer yt.mu.Unlock()
+	if yt.createBroadcastCalls != 1 {
+		t.Fatalf("expected exactly one pre-create (the leaded event), got %d", yt.createBroadcastCalls)
 	}
 }
 

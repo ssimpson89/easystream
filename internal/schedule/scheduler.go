@@ -9,13 +9,20 @@ import (
 )
 
 // Default lead times. Tuned for church-service streaming where the
-// watch URL must be available before the service starts, and we need
-// a brief warmup so YouTube sees ingest before transitioning to live.
+// scheduled-broadcast indicator must NOT appear on the channel ahead
+// of the actual service, and we need a brief warmup so YouTube sees
+// ingest before transitioning to live.
 const (
-	// DefaultPrepLead: how far before StartTime to create the YouTube
-	// broadcast + stream resources. 15 min gives the host time to share
-	// the watch URL with the congregation before service starts.
-	DefaultPrepLead = 15 * time.Minute
+	// DefaultPrepLead: JIT — when the per-event PrepLeadMinutes is
+	// zero (the common case), the broadcast is created at StartTime
+	// itself. An earlier default would surface a "premiering soon"
+	// indicator on the YouTube channel before the service, which the
+	// operator never wanted. Per-schedule opt-in via Schedule /
+	// Override .PrepLeadMinutes lets a specific event (e.g. a
+	// Christmas Eve service whose watch URL goes in a bulletin) carry
+	// its own lead time. This constant is kept as the floor / API
+	// default; tests reference it.
+	DefaultPrepLead = 0 * time.Minute
 
 	// DefaultPreroll: how far before StartTime to start FFmpeg pushing.
 	// 10 s is enough for YouTube's ingest to register and report
@@ -23,6 +30,11 @@ const (
 	// transition to "live" can happen at (or very close to) StartTime.
 	// Note: viewers don't see anything until we transition to "live".
 	DefaultPreroll = 10 * time.Second
+
+	// MaxPrepLead is the upper bound for the operator-configurable
+	// per-event prep lead. Anything longer than an hour is almost
+	// certainly a typo; reject at validate time with a clear error.
+	MaxPrepLead = 60 * time.Minute
 
 	// Scheduler tick interval. Small enough to start within tickInterval
 	// of preroll/prep boundaries; large enough not to hammer the store.
@@ -74,9 +86,10 @@ type Scheduler struct {
 	broadcast BroadcastController
 	logger    *log.Logger
 
-	// Lead times — overridable for tests.
-	prepLead time.Duration
-	preroll  time.Duration
+	// preroll is overridable for tests; the prep lead is per-event
+	// (Event.PrepLeadMinutes), not a global, so there's no prepLead
+	// field on the Scheduler anymore.
+	preroll time.Duration
 
 	mu              sync.Mutex
 	activeEvent     *Event // currently live event
@@ -106,23 +119,25 @@ type backoffState struct {
 	nextTry time.Time
 }
 
-// NewScheduler creates a scheduler with the default prep lead
-// (DefaultPrepLead) and preroll (DefaultPreroll). The scheduler checks
-// events every tickInterval (1s) so it can hit the preroll boundary
-// within one tick.
+// NewScheduler creates a scheduler with the default preroll
+// (DefaultPreroll). Prep lead is per-event (Event.PrepLeadMinutes,
+// 0 = JIT) so the scheduler itself doesn't carry a global default.
+// The scheduler checks events every tickInterval (1s) so it can hit
+// the preroll boundary within one tick.
 func NewScheduler(store *Store, stream StreamController, broadcast BroadcastController, logger *log.Logger) *Scheduler {
-	return NewSchedulerWithLeads(store, stream, broadcast, logger, DefaultPrepLead, DefaultPreroll)
+	return NewSchedulerWithPreroll(store, stream, broadcast, logger, DefaultPreroll)
 }
 
-// NewSchedulerWithLeads is like NewScheduler but takes custom lead times.
-// Use this from tests so you don't have to wait minutes for real prep lead.
-func NewSchedulerWithLeads(store *Store, stream StreamController, broadcast BroadcastController, logger *log.Logger, prepLead, preroll time.Duration) *Scheduler {
+// NewSchedulerWithPreroll is like NewScheduler but takes a custom
+// preroll. Use this from tests so you don't have to wait the full 10 s
+// for real ingest warm-up. Per-event prep lead is set on the Schedule /
+// Override structs and doesn't pass through here.
+func NewSchedulerWithPreroll(store *Store, stream StreamController, broadcast BroadcastController, logger *log.Logger, preroll time.Duration) *Scheduler {
 	return &Scheduler{
 		store:        store,
 		stream:       stream,
 		broadcast:    broadcast,
 		logger:       logger,
-		prepLead:     prepLead,
 		preroll:      preroll,
 		prepFailures: make(map[string]*backoffState),
 		ingestCache:  make(map[string]ingestDetails),
@@ -269,9 +284,24 @@ func (s *Scheduler) tick(ctx context.Context) {
 	}
 }
 
+// eventPrepLead returns the per-event prep lead as a Duration. Bounded
+// to [0, MaxPrepLead] so a hand-edited schedules.json with an absurd
+// value can't make the scheduler create a broadcast hours in advance.
+// Zero means "create the broadcast at StartTime" (JIT — the default).
+func eventPrepLead(event Event) time.Duration {
+	if event.PrepLeadMinutes <= 0 {
+		return 0
+	}
+	d := time.Duration(event.PrepLeadMinutes) * time.Minute
+	if d > MaxPrepLead {
+		d = MaxPrepLead
+	}
+	return d
+}
+
 // advanceEvent moves a single event through its lifecycle phases.
 func (s *Scheduler) advanceEvent(ctx context.Context, event Event, now time.Time) {
-	prepAt := event.StartTime.Add(-s.prepLead)
+	prepAt := event.StartTime.Add(-eventPrepLead(event))
 	prerollAt := event.StartTime.Add(-s.preroll)
 	endAt := event.StartTime.Add(time.Duration(event.DurationMin) * time.Minute)
 

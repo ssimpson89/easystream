@@ -25,11 +25,18 @@ type Schedule struct {
 	Time        string   `json:"time"`        // "08:45" (24-hour)
 	Timezone    string   `json:"timezone"`    // "America/Chicago"
 	DurationMin int      `json:"durationMin"` // default 120
-	PresetID    string   `json:"presetId"`
-	Title       string   `json:"title"`       // YouTube broadcast title
-	Description string   `json:"description"` // YouTube broadcast description
-	Privacy     string   `json:"privacy"`     // "public", "unlisted", "private"
-	Enabled     bool     `json:"enabled"`
+	// PrepLeadMinutes is how many minutes before StartTime the
+	// YouTube broadcast should be created. Zero (the default) means
+	// "create the broadcast at StartTime" — no scheduled-broadcast
+	// indicator on the channel before the service. Operators who
+	// need the watch URL in advance (e.g. to print in a bulletin)
+	// can opt in to a lead of up to MaxPrepLead minutes per schedule.
+	PrepLeadMinutes int    `json:"prepLeadMinutes"`
+	PresetID        string `json:"presetId"`
+	Title           string `json:"title"`       // YouTube broadcast title
+	Description     string `json:"description"` // YouTube broadcast description
+	Privacy         string `json:"privacy"`     // "public", "unlisted", "private"
+	Enabled         bool   `json:"enabled"`
 }
 
 // Override defines a one-time special event.
@@ -46,25 +53,30 @@ type Override struct {
 	WallClock   string    `json:"wallClock,omitempty"`
 	Timezone    string    `json:"timezone,omitempty"`
 	DurationMin int       `json:"durationMin"`
-	PresetID    string    `json:"presetId"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	Privacy     string    `json:"privacy"`
+	// PrepLeadMinutes: same semantics as Schedule.PrepLeadMinutes.
+	// Defaults to 0 (JIT) — set per-event if you need the watch URL
+	// before the start time.
+	PrepLeadMinutes int    `json:"prepLeadMinutes"`
+	PresetID        string `json:"presetId"`
+	Title           string `json:"title"`
+	Description     string `json:"description"`
+	Privacy         string `json:"privacy"`
 }
 
 // Event is a computed upcoming event from a schedule or override.
 type Event struct {
-	ScheduleID  string    `json:"scheduleId,omitempty"`
-	OverrideID  string    `json:"overrideId,omitempty"`
-	Name        string    `json:"name"`
-	StartTime   time.Time `json:"startTime"`
-	DurationMin int       `json:"durationMin"`
-	PresetID    string    `json:"presetId"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	Privacy     string    `json:"privacy"`
-	BroadcastID string    `json:"broadcastId,omitempty"`
-	StreamID    string    `json:"streamId,omitempty"`
+	ScheduleID      string    `json:"scheduleId,omitempty"`
+	OverrideID      string    `json:"overrideId,omitempty"`
+	Name            string    `json:"name"`
+	StartTime       time.Time `json:"startTime"`
+	DurationMin     int       `json:"durationMin"`
+	PrepLeadMinutes int       `json:"prepLeadMinutes"`
+	PresetID        string    `json:"presetId"`
+	Title           string    `json:"title"`
+	Description     string    `json:"description"`
+	Privacy         string    `json:"privacy"`
+	BroadcastID     string    `json:"broadcastId,omitempty"`
+	StreamID        string    `json:"streamId,omitempty"`
 }
 
 // storeData is the JSON file format.
@@ -168,6 +180,12 @@ func normalizeSchedule(sched Schedule) (Schedule, error) {
 	}
 	if sched.DurationMin <= 0 {
 		sched.DurationMin = 120
+	}
+	if sched.PrepLeadMinutes < 0 {
+		return Schedule{}, fmt.Errorf("prep lead must be 0 or more")
+	}
+	if sched.PrepLeadMinutes > 60 {
+		return Schedule{}, fmt.Errorf("prep lead cannot exceed 60 minutes")
 	}
 	if sched.Privacy == "" {
 		sched.Privacy = "unlisted"
@@ -279,6 +297,12 @@ func normalizeOverride(o Override) (Override, error) {
 	}
 	if o.DurationMin <= 0 {
 		o.DurationMin = 120
+	}
+	if o.PrepLeadMinutes < 0 {
+		return Override{}, fmt.Errorf("prep lead must be 0 or more")
+	}
+	if o.PrepLeadMinutes > 60 {
+		return Override{}, fmt.Errorf("prep lead cannot exceed 60 minutes")
 	}
 	if o.Privacy == "" {
 		o.Privacy = "unlisted"
@@ -403,16 +427,17 @@ func (s *Store) NextEvents(count int, after time.Time) []Event {
 				continue
 			}
 			ev := Event{
-				ScheduleID:  sched.ID,
-				Name:        sched.Name,
-				StartTime:   t,
-				DurationMin: sched.DurationMin,
-				PresetID:    sched.PresetID,
-				Title:       sched.Title,
-				Description: sched.Description,
-				Privacy:     sched.Privacy,
-				BroadcastID: broadcasts[key],
-				StreamID:    streams[key],
+				ScheduleID:      sched.ID,
+				Name:            sched.Name,
+				StartTime:       t,
+				DurationMin:     sched.DurationMin,
+				PrepLeadMinutes: sched.PrepLeadMinutes,
+				PresetID:        sched.PresetID,
+				Title:           sched.Title,
+				Description:     sched.Description,
+				Privacy:         sched.Privacy,
+				BroadcastID:     broadcasts[key],
+				StreamID:        streams[key],
 			}
 			events = append(events, ev)
 		}
@@ -429,16 +454,17 @@ func (s *Store) NextEvents(count int, after time.Time) []Event {
 			continue
 		}
 		events = append(events, Event{
-			OverrideID:  o.ID,
-			Name:        o.Name,
-			StartTime:   o.StartTime,
-			DurationMin: o.DurationMin,
-			PresetID:    o.PresetID,
-			Title:       o.Title,
-			Description: o.Description,
-			Privacy:     o.Privacy,
-			BroadcastID: broadcasts[key],
-			StreamID:    streams[key],
+			OverrideID:      o.ID,
+			Name:            o.Name,
+			StartTime:       o.StartTime,
+			DurationMin:     o.DurationMin,
+			PrepLeadMinutes: o.PrepLeadMinutes,
+			PresetID:        o.PresetID,
+			Title:           o.Title,
+			Description:     o.Description,
+			Privacy:         o.Privacy,
+			BroadcastID:     broadcasts[key],
+			StreamID:        streams[key],
 		})
 	}
 
